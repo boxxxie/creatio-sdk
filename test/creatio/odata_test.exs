@@ -1,0 +1,465 @@
+defmodule Creatio.ODataTest do
+  use ExUnit.Case, async: true
+  import Plug.Conn
+
+  alias Creatio.{Client, Error, OData}
+  alias Creatio.OData.Query
+
+  describe "list/3" do
+    test "lists entity collection and maps query parameters" do
+      plug = fn conn ->
+        assert conn.request_path == "/0/odata/Contact"
+        assert conn.method == "GET"
+
+        query = URI.decode_query(conn.query_string)
+        assert query["$select"] == "Id,Name,Email"
+        assert query["$filter"] == "Age gt 18"
+        assert query["$orderby"] == "Name asc"
+        assert query["$top"] == "10"
+        assert query["$skip"] == "20"
+        assert query["$expand"] == "Account"
+
+        records = [
+          %{"Id" => "1", "Name" => "Alice", "Email" => "alice@example.com"},
+          %{"Id" => "2", "Name" => "Bob", "Email" => "bob@example.com"}
+        ]
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{"value" => records}))
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      assert {:ok, records} =
+               OData.list(client, "Contact",
+                 select: ["Id", "Name", "Email"],
+                 filter: "Age gt 18",
+                 orderby: "Name asc",
+                 top: 10,
+                 skip: 20,
+                 expand: "Account"
+               )
+
+      assert length(records) == 2
+      assert hd(records)["Name"] == "Alice"
+    end
+
+    test "returns count when count: true is requested" do
+      plug = fn conn ->
+        query = URI.decode_query(conn.query_string)
+        assert query["$count"] == "true"
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          200,
+          Jason.encode!(%{
+            "@odata.count" => 42,
+            "value" => [%{"Id" => "1", "Name" => "Alice"}]
+          })
+        )
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      assert {:ok, result} = OData.list(client, "Contact", count: true)
+      assert result.count == 42
+      assert length(result.records) == 1
+    end
+
+    test "supports %Creatio.OData.Query{} struct" do
+      plug = fn conn ->
+        query = URI.decode_query(conn.query_string)
+        assert query["$select"] == "Id,Name"
+        assert query["$filter"] == "contains(Name,'Smith')"
+        assert query["$top"] == "5"
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{"value" => [%{"Id" => "uuid-1", "Name" => "Smith"}]}))
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      query =
+        Query.new("Contact")
+        |> Query.select(["Id", "Name"])
+        |> Query.filter("contains(Name,'Smith')")
+        |> Query.top(5)
+
+      assert {:ok, [rec]} = OData.list(client, query)
+      assert rec["Name"] == "Smith"
+    end
+
+    test "supports order_by snake_case and keyword list without crashing" do
+      plug = fn conn ->
+        query = URI.decode_query(conn.query_string)
+        assert query["$orderby"] == "Name asc,CreatedOn desc"
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{"value" => []}))
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      assert {:ok, []} = OData.list(client, "Contact", order_by: [Name: :asc, CreatedOn: :desc])
+    end
+
+    test "supports execute/2 and execute!/2" do
+      plug = fn conn ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{"value" => [%{"Id" => "1", "Name" => "Exec"}]}))
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+      q = Query.new("Contact")
+
+      assert {:ok, [rec]} = OData.execute(client, q)
+      assert rec["Name"] == "Exec"
+
+      assert [rec_bang] = OData.execute!(client, q)
+      assert rec_bang["Name"] == "Exec"
+    end
+
+    test "handles direct JSON array response body in do_list" do
+      plug = fn conn ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!([%{"Id" => "arr-1", "Name" => "Direct Array"}]))
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+      assert {:ok, [item]} = OData.list(client, "Contact")
+      assert item["Name"] == "Direct Array"
+    end
+  end
+
+  describe "get/4" do
+    test "retrieves an entity by ID" do
+      plug = fn conn ->
+        assert conn.request_path == "/0/odata/Contact(1234-uuid)"
+        assert conn.method == "GET"
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          200,
+          Jason.encode!(%{"Id" => "1234-uuid", "Name" => "John Doe", "Phone" => "555-1234"})
+        )
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      assert {:ok, record} = OData.get(client, "Contact", "1234-uuid")
+      assert record["Id"] == "1234-uuid"
+      assert record["Name"] == "John Doe"
+    end
+
+    test "handles 404 not found" do
+      plug = fn conn ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          404,
+          Jason.encode!(%{"error" => %{"message" => "Entity not found", "code" => "404"}})
+        )
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      assert {:error, %Error{status: 404, message: "Entity not found"}} =
+               OData.get(client, "Contact", "nonexistent")
+    end
+  end
+
+  describe "get_navigation/5" do
+    test "retrieves related entities through navigation property" do
+      plug = fn conn ->
+        assert conn.request_path == "/0/odata/Contact(1234-uuid)/Account"
+        assert conn.method == "GET"
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          200,
+          Jason.encode!(%{"value" => [%{"Id" => "acc-1", "Name" => "Acme Corp"}]})
+        )
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      assert {:ok, [acc]} = OData.get_navigation(client, "Contact", "1234-uuid", "Account")
+      assert acc["Name"] == "Acme Corp"
+    end
+  end
+
+  describe "get_field/5 and get_field_value/4" do
+    test "retrieves field object" do
+      plug = fn conn ->
+        assert conn.request_path == "/0/odata/Contact(1234-uuid)/JobTitle"
+        assert conn.method == "GET"
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{"value" => "Managing Director"}))
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      assert {:ok, "Managing Director"} =
+               OData.get_field(client, "Contact", "1234-uuid", "JobTitle")
+    end
+
+    test "retrieves raw scalar field value ($value)" do
+      plug = fn conn ->
+        assert conn.request_path == "/0/odata/Contact(1234-uuid)/Name/$value"
+        assert conn.method == "GET"
+
+        conn
+        |> put_resp_content_type("text/plain")
+        |> send_resp(200, "William Walker")
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      assert {:ok, "William Walker"} =
+               OData.get_field_value(client, "Contact", "1234-uuid", "Name")
+    end
+  end
+
+  describe "count/3" do
+    test "retrieves total count of entity collection" do
+      plug = fn conn ->
+        assert conn.request_path == "/0/odata/Contact/$count"
+        assert conn.method == "GET"
+
+        conn
+        |> put_resp_content_type("text/plain")
+        |> send_resp(200, "1542")
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      assert {:ok, 1542} = OData.count(client, "Contact")
+      assert OData.count!(client, "Contact") == 1542
+    end
+
+    test "handles count response as JSON map with @odata.count" do
+      plug = fn conn ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{"@odata.count" => 99}))
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+      assert {:ok, 99} = OData.count(client, "Contact")
+    end
+  end
+
+  describe "create/4" do
+    test "creates record and returns created entity" do
+      plug = fn conn ->
+        assert conn.request_path == "/0/odata/Contact"
+        assert conn.method == "POST"
+        assert get_req_header(conn, "forceusesession") == ["true"]
+
+        {:ok, body, conn} = read_body(conn)
+        attrs = Jason.decode!(body)
+        assert attrs["Name"] == "New Contact"
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          201,
+          Jason.encode!(%{"Id" => "new-uuid-1", "Name" => "New Contact"})
+        )
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      assert {:ok, created} = OData.create(client, "Contact", %{"Name" => "New Contact"})
+      assert created["Id"] == "new-uuid-1"
+      assert created["Name"] == "New Contact"
+
+      assert %{"Id" => "new-uuid-1"} =
+               OData.create!(client, "Contact", %{"Name" => "New Contact"})
+    end
+  end
+
+  describe "update/5" do
+    test "updates existing entity via PATCH" do
+      plug = fn conn ->
+        assert conn.request_path == "/0/odata/Contact(uuid-123)"
+        assert conn.method == "PATCH"
+        assert get_req_header(conn, "forceusesession") == ["true"]
+
+        {:ok, body, conn} = read_body(conn)
+        attrs = Jason.decode!(body)
+        assert attrs["JobTitle"] == "Senior Partner"
+
+        conn
+        |> send_resp(204, "")
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      assert :ok = OData.update(client, "Contact", "uuid-123", %{"JobTitle" => "Senior Partner"})
+      assert :ok = OData.update!(client, "Contact", "uuid-123", %{"JobTitle" => "Senior Partner"})
+    end
+  end
+
+  describe "delete/4" do
+    test "deletes entity via DELETE" do
+      plug = fn conn ->
+        assert conn.request_path == "/0/odata/Contact(uuid-123)"
+        assert conn.method == "DELETE"
+        assert get_req_header(conn, "forceusesession") == ["true"]
+
+        conn
+        |> send_resp(204, "")
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      assert :ok = OData.delete(client, "Contact", "uuid-123")
+      assert :ok = OData.delete!(client, "Contact", "uuid-123")
+    end
+  end
+
+  describe "update_field/6 and delete_field/5" do
+    test "updates octet-stream binary field" do
+      plug = fn conn ->
+        assert conn.request_path == "/0/odata/Contact(uuid-123)/Photo"
+        assert conn.method == "PUT"
+
+        assert get_req_header(conn, "content-type") == [
+                 "application/octet-stream; IEEE754Compatible=true"
+               ]
+
+        {:ok, body, conn} = read_body(conn)
+        assert body == <<1, 2, 3, 4, 5>>
+
+        conn
+        |> send_resp(204, "")
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      assert :ok =
+               OData.update_field(client, "Contact", "uuid-123", "Photo", <<1, 2, 3, 4, 5>>)
+
+      assert :ok =
+               OData.update_field!(client, "Contact", "uuid-123", "Photo", <<1, 2, 3, 4, 5>>)
+    end
+
+    test "deletes a field with proper stream headers" do
+      plug = fn conn ->
+        assert conn.request_path == "/0/odata/Contact(uuid-123)/Photo"
+        assert conn.method == "DELETE"
+
+        assert get_req_header(conn, "accept") == ["application/json; text/plain; */*"]
+
+        assert get_req_header(conn, "content-type") == [
+                 "application/octet-stream; IEEE754Compatible=true"
+               ]
+
+        conn
+        |> send_resp(204, "")
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      assert :ok = OData.delete_field(client, "Contact", "uuid-123", "Photo")
+      assert :ok = OData.delete_field!(client, "Contact", "uuid-123", "Photo")
+    end
+  end
+
+  describe "stream/3" do
+    test "auto-paginates across multiple pages" do
+      plug = fn conn ->
+        query = URI.decode_query(conn.query_string)
+        top = String.to_integer(query["$top"])
+        skip = String.to_integer(query["$skip"])
+
+        # Simulate 5 items total with page_size = 2
+        items =
+          Enum.map((skip + 1)..(skip + top), fn idx ->
+            %{"Id" => "id-#{idx}", "Name" => "Item #{idx}"}
+          end)
+          |> Enum.filter(fn %{"Id" => "id-" <> n} -> String.to_integer(n) <= 5 end)
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{"value" => items}))
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      results =
+        OData.stream(client, "Contact", page_size: 2)
+        |> Enum.to_list()
+
+      assert length(results) == 5
+      assert hd(results)["Name"] == "Item 1"
+      assert List.last(results)["Name"] == "Item 5"
+    end
+
+    test "auto-paginates without crashing when count: true is passed" do
+      plug = fn conn ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{"value" => [%{"Id" => "1"}]}))
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+      items = OData.stream(client, "Contact", count: true, page_size: 10) |> Enum.to_list()
+      assert length(items) == 1
+    end
+
+    test "streams query builder structs and Req requests directly" do
+      plug = fn conn ->
+        query = URI.decode_query(conn.query_string)
+        assert query["$select"] == "Id,Name"
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{"value" => [%{"Id" => "q1", "Name" => "Item"}]}))
+      end
+
+      req = Req.new(base_url: "https://mycreatio.com", plug: plug)
+      q = Query.new("Contact") |> Query.select(["Id", "Name"])
+
+      items = OData.stream(req, q, page_size: 10) |> Enum.to_list()
+      assert length(items) == 1
+      assert hd(items)["Name"] == "Item"
+    end
+  end
+
+  describe "Query builder enhancements" do
+    test "supports atoms, keyword order_by, where, filter_in, and query string" do
+      q =
+        Query.new("Contact")
+        |> Query.select(:Id)
+        |> Query.select([:Name, :Email])
+        |> Query.expand(:Account)
+        |> Query.where("Age gt 20")
+        |> Query.where("City/Name eq 'Toronto'")
+        |> Query.filter_in("Status", ["Active", "Pending"])
+        |> Query.order_by(Name: :asc, CreatedOn: :desc)
+
+      params = Query.to_params(q)
+      assert params["$select"] == "Id,Name,Email"
+      assert params["$expand"] == "Account"
+      assert params["$orderby"] == "Name asc,CreatedOn desc"
+      assert String.contains?(params["$filter"], "Age gt 20")
+      assert String.contains?(params["$filter"], "City/Name eq 'Toronto'")
+      assert String.contains?(params["$filter"], "Status eq 'Active' or Status eq 'Pending'")
+
+      qs = Query.to_query_string(q)
+      assert String.contains?(qs, "%24select=Id%2CName%2CEmail")
+    end
+  end
+end
