@@ -109,6 +109,23 @@ defmodule Creatio.AuthTest do
       assert {:error, %Error{status: 500, message: "Internal server error"}} =
                Auth.login_forms(client, "user", "pass")
     end
+
+    test "handles raw binary string response body and lowercase bpmcsrf cookie" do
+      plug = fn conn ->
+        cookies = [
+          {"set-cookie", ".ASPXAUTH=Auth1; path=/"},
+          {"set-cookie", "bpmcsrf=lowercase_csrf_token; path=/"}
+        ]
+
+        %{conn | resp_headers: cookies ++ conn.resp_headers}
+        |> put_resp_content_type("text/plain")
+        |> send_resp(200, "{\"code\": 0, \"message\": \"ok\"}")
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+      assert {:ok, %Client{} = authed} = Auth.login_forms(client, "User", "Pass")
+      assert authed.bpmcsrf == "lowercase_csrf_token"
+    end
   end
 
   describe "login_oauth/2" do

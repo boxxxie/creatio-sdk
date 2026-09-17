@@ -461,5 +461,207 @@ defmodule Creatio.ODataTest do
       qs = Query.to_query_string(q)
       assert String.contains?(qs, "%24select=Id%2CName%2CEmail")
     end
+
+    test "supports all Postman collection filtration functions and operators" do
+      # eq, ne, contains, startswith, endswith
+      q1 =
+        Query.new("Collection1")
+        |> Query.filter_eq("Field2", "Field2Value")
+        |> Query.filter_ne("Field3", "OtherVal")
+        |> Query.filter_contains("Field4", "needle")
+        |> Query.filter_startswith("Field5", "prefix")
+        |> Query.filter_endswith("Field6", "suffix")
+
+      params1 = Query.to_params(q1)
+      assert params1["$filter"] =~ "Field2 eq 'Field2Value'"
+      assert params1["$filter"] =~ "Field3 ne 'OtherVal'"
+      assert params1["$filter"] =~ "contains(Field4,'needle')"
+      assert params1["$filter"] =~ "startswith(Field5,'prefix')"
+      assert params1["$filter"] =~ "endswith(Field6,'suffix')"
+
+      # Unquoted GUID eq (Postman Collection3?$filter=Collection6/Field6 eq Id)
+      q2 =
+        Query.new("Collection3")
+        |> Query.filter_eq("Collection6/Field6", "e9621f72-42bd-47c1", quoted: false)
+
+      assert Query.to_params(q2)["$filter"] == "Collection6/Field6 eq e9621f72-42bd-47c1"
+
+      # Boolean, number, null literal formatting
+      q3 =
+        Query.new("Contact")
+        |> Query.filter_eq("Active", true)
+        |> Query.filter_eq("Age", 30)
+        |> Query.filter_eq("MiddleName", nil)
+
+      params3 = Query.to_params(q3)
+      assert params3["$filter"] =~ "Active eq true"
+      assert params3["$filter"] =~ "Age eq 30"
+      assert params3["$filter"] =~ "MiddleName eq null"
+
+      # Comparison operators: gt, ge, lt, le
+      q4 =
+        Query.new("Product")
+        |> Query.filter_gt("Price", 100)
+        |> Query.filter_ge("Rating", 4.5)
+        |> Query.filter_lt("Stock", 10)
+        |> Query.filter_le("Discount", 0.5)
+
+      params4 = Query.to_params(q4)
+      assert params4["$filter"] =~ "Price gt 100"
+      assert params4["$filter"] =~ "Rating ge 4.5"
+      assert params4["$filter"] =~ "Stock lt 10"
+      assert params4["$filter"] =~ "Discount le 0.5"
+
+      # Date and string functions: day, length
+      q5 =
+        Query.new("Collection1")
+        |> Query.filter_day("Field3", "Field3Value")
+        |> Query.filter_length("Field2", "Field2Value", "gt")
+
+      params5 = Query.to_params(q5)
+      assert params5["$filter"] =~ "day(Field3) eq Field3Value"
+      assert params5["$filter"] =~ "length(Field2) gt Field2Value"
+
+      # not operator
+      q6 =
+        Query.new("Collection1")
+        |> Query.filter_endswith("Field2", "Field2Value")
+        |> Query.filter_not()
+
+      assert Query.to_params(q6)["$filter"] == "not (endswith(Field2,'Field2Value'))"
+
+      # filter_in_ids for GUIDs without quotes
+      q7 =
+        Query.new("Contact")
+        |> Query.filter_in_ids("Id", ["uuid-1", "uuid-2"])
+
+      assert Query.to_params(q7)["$filter"] == "(Id eq uuid-1 or Id eq uuid-2)"
+
+      # OR combinators
+      q8 =
+        Query.new("Contact")
+        |> Query.filter_eq("City", "Toronto")
+        |> Query.or_filter_eq("City", "Montreal")
+        |> Query.or_filter_contains("Name", "Smith")
+
+      params8 = Query.to_params(q8)
+      assert params8["$filter"] =~ "or (City eq 'Montreal')"
+      assert params8["$filter"] =~ "or (contains(Name,'Smith'))"
+    end
+
+    test "count/3 handles string count inside @odata.count and value" do
+      plug1 = fn conn ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{"@odata.count" => "25"}))
+      end
+
+      client1 = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug1])
+      assert {:ok, 25} = OData.count(client1, "Contact")
+
+      plug2 = fn conn ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{"value" => "50"}))
+      end
+
+      client2 = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug2])
+      assert {:ok, 50} = OData.count(client2, "Contact")
+
+      # Raw text/plain response with UTF-8 BOM (\uFEFF) as sent by Creatio IIS servers
+      plug3 = fn conn ->
+        conn
+        |> put_resp_content_type("text/plain")
+        |> send_resp(200, "\uFEFF22345")
+      end
+
+      client3 = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug3])
+      assert {:ok, 22_345} = OData.count(client3, "Contact")
+    end
+
+    test "normalize_params accepts keyword list params" do
+      plug = fn conn ->
+        assert conn.query_string =~ "custom_key=custom_val"
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{"value" => []}))
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+      assert {:ok, []} = OData.list(client, "Contact", params: [custom_key: "custom_val"])
+    end
+
+    test "clean_id strips braces, quotes, and guid prefixes across CRUD operations" do
+      plug = fn conn ->
+        assert conn.request_path == "/0/odata/Contact(1111-2222-3333)"
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{"Id" => "1111-2222-3333"}))
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      assert {:ok, _} = OData.get(client, "Contact", "{1111-2222-3333}")
+      assert {:ok, _} = OData.get(client, "Contact", "'1111-2222-3333'")
+      assert {:ok, _} = OData.get(client, "Contact", "guid'1111-2222-3333'")
+    end
+
+    test "Query builder supports filter_guid, or_filter_guid, or_filter_in, and additional OR functions" do
+      # filter_guid OData 4 (unquoted) vs OData 3 (guid'...')
+      q1 =
+        Query.new("Contact")
+        |> Query.filter_guid("AccountId", "{4c63c8fa-467b-48a6-973f-b2069298404f}")
+        |> Query.or_filter_guid("OwnerId", "1111-2222-3333-4444")
+
+      params1 = Query.to_params(q1)
+      assert params1["$filter"] =~ "AccountId eq 4c63c8fa-467b-48a6-973f-b2069298404f"
+      assert params1["$filter"] =~ "OwnerId eq 1111-2222-3333-4444"
+
+      q2 =
+        Query.new("Contact")
+        |> Query.filter_guid("AccountId", "4c63c8fa-467b-48a6-973f-b2069298404f",
+          protocol: :odata3
+        )
+
+      assert Query.to_params(q2)["$filter"] ==
+               "AccountId eq guid'4c63c8fa-467b-48a6-973f-b2069298404f'"
+
+      # or_filter_gt, or_filter_ge, or_filter_lt, or_filter_le, or_filter_day, or_filter_length
+      q3 =
+        Query.new("Product")
+        |> Query.filter_gt("Price", 50)
+        |> Query.or_filter_gt("Price", 100)
+        |> Query.or_filter_ge("Rating", 4.0)
+        |> Query.or_filter_lt("Stock", 5)
+        |> Query.or_filter_le("Discount", 0.1)
+        |> Query.or_filter_day("CreatedOn", 15)
+        |> Query.or_filter_length("Name", 20, "lt")
+
+      params3 = Query.to_params(q3)
+      assert params3["$filter"] =~ "or (Price gt 100)"
+      assert params3["$filter"] =~ "or (Rating ge 4.0)"
+      assert params3["$filter"] =~ "or (Stock lt 5)"
+      assert params3["$filter"] =~ "or (Discount le 0.1)"
+      assert params3["$filter"] =~ "or (day(CreatedOn) eq 15)"
+      assert params3["$filter"] =~ "or (length(Name) lt 20)"
+
+      # or_filter_in
+      q4 =
+        Query.new("Contact")
+        |> Query.filter_eq("Active", true)
+        |> Query.or_filter_in("Department", ["Sales", "Marketing", "Sales"])
+
+      params4 = Query.to_params(q4)
+      assert params4["$filter"] =~ "or ((Department eq 'Sales' or Department eq 'Marketing'))"
+
+      # Preformatted guid'...' not double quoted in filter_eq
+      q5 =
+        Query.new("Contact")
+        |> Query.filter_eq("Id", "guid'4c63c8fa-467b-48a6-973f-b2069298404f'")
+
+      assert Query.to_params(q5)["$filter"] == "Id eq guid'4c63c8fa-467b-48a6-973f-b2069298404f'"
+    end
   end
 end

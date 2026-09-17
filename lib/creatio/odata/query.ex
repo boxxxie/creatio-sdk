@@ -3,13 +3,16 @@ defmodule Creatio.OData.Query do
   Composable query builder for Creatio OData 4 requests.
 
   Supports `$select`, `$filter`, `$orderby`, `$top`, `$skip`, `$expand`, and `$count`.
+  Provides chainable filter helpers for standard OData functions and operators
+  (`eq`, `ne`, `gt`, `ge`, `lt`, `le`, `contains`, `startswith`, `endswith`, `day`, `length`, `not`, `in`).
 
   ## Examples
 
       query =
         Creatio.OData.Query.new("Contact")
         |> Creatio.OData.Query.select(["Id", "Name", "Email"])
-        |> Creatio.OData.Query.filter("Age gt 21 and City/Name eq 'Toronto'")
+        |> Creatio.OData.Query.filter_eq("Active", true)
+        |> Creatio.OData.Query.filter_contains("Name", "Smith")
         |> Creatio.OData.Query.order_by("Name asc")
         |> Creatio.OData.Query.top(25)
         |> Creatio.OData.Query.skip(50)
@@ -114,6 +117,222 @@ defmodule Creatio.OData.Query do
   end
 
   @doc """
+  Combines an additional filter expression with `or`. Alias for `or_filter/2`.
+  """
+  @spec or_where(t(), String.t()) :: t()
+  def or_where(%__MODULE__{} = query, filter_expr) when is_binary(filter_expr) do
+    or_filter(query, filter_expr)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Filter Builder Helpers (Operators & Functions)
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Adds an equality condition (`{field} eq {value}`).
+  Literals (numbers, booleans, null) are formatted automatically without quotes.
+  Pass `quoted: false` for unquoted GUIDs / IDs.
+  """
+  @spec filter_eq(t(), String.t() | atom(), any(), keyword()) :: t()
+  def filter_eq(%__MODULE__{} = query, field, value, opts \\ []) do
+    and_filter(query, "#{field} eq #{format_literal(value, opts)}")
+  end
+
+  @doc """
+  Alias for `filter_eq/4`.
+  """
+  def where_eq(query, field, value, opts \\ []), do: filter_eq(query, field, value, opts)
+
+  @doc """
+  Adds an equality condition combined with `or` (`{field} eq {value}`).
+  """
+  @spec or_filter_eq(t(), String.t() | atom(), any(), keyword()) :: t()
+  def or_filter_eq(%__MODULE__{} = query, field, value, opts \\ []) do
+    or_filter(query, "#{field} eq #{format_literal(value, opts)}")
+  end
+
+  @doc """
+  Adds an inequality condition (`{field} ne {value}`).
+  """
+  @spec filter_ne(t(), String.t() | atom(), any(), keyword()) :: t()
+  def filter_ne(%__MODULE__{} = query, field, value, opts \\ []) do
+    and_filter(query, "#{field} ne #{format_literal(value, opts)}")
+  end
+
+  @doc """
+  Adds an inequality condition combined with `or` (`{field} ne {value}`).
+  """
+  @spec or_filter_ne(t(), String.t() | atom(), any(), keyword()) :: t()
+  def or_filter_ne(%__MODULE__{} = query, field, value, opts \\ []) do
+    or_filter(query, "#{field} ne #{format_literal(value, opts)}")
+  end
+
+  @doc """
+  Adds a greater-than condition (`{field} gt {value}`).
+  """
+  @spec filter_gt(t(), String.t() | atom(), any(), keyword()) :: t()
+  def filter_gt(%__MODULE__{} = query, field, value, opts \\ []) do
+    and_filter(query, "#{field} gt #{format_literal(value, opts)}")
+  end
+
+  @doc """
+  Adds a greater-than condition combined with `or` (`{field} gt {value}`).
+  """
+  @spec or_filter_gt(t(), String.t() | atom(), any(), keyword()) :: t()
+  def or_filter_gt(%__MODULE__{} = query, field, value, opts \\ []) do
+    or_filter(query, "#{field} gt #{format_literal(value, opts)}")
+  end
+
+  @doc """
+  Adds a greater-than-or-equal condition (`{field} ge {value}`).
+  """
+  @spec filter_ge(t(), String.t() | atom(), any(), keyword()) :: t()
+  def filter_ge(%__MODULE__{} = query, field, value, opts \\ []) do
+    and_filter(query, "#{field} ge #{format_literal(value, opts)}")
+  end
+
+  @doc """
+  Adds a greater-than-or-equal condition combined with `or` (`{field} ge {value}`).
+  """
+  @spec or_filter_ge(t(), String.t() | atom(), any(), keyword()) :: t()
+  def or_filter_ge(%__MODULE__{} = query, field, value, opts \\ []) do
+    or_filter(query, "#{field} ge #{format_literal(value, opts)}")
+  end
+
+  @doc """
+  Adds a less-than condition (`{field} lt {value}`).
+  """
+  @spec filter_lt(t(), String.t() | atom(), any(), keyword()) :: t()
+  def filter_lt(%__MODULE__{} = query, field, value, opts \\ []) do
+    and_filter(query, "#{field} lt #{format_literal(value, opts)}")
+  end
+
+  @doc """
+  Adds a less-than-or-equal condition combined with `or` (`{field} lt {value}`).
+  """
+  @spec or_filter_lt(t(), String.t() | atom(), any(), keyword()) :: t()
+  def or_filter_lt(%__MODULE__{} = query, field, value, opts \\ []) do
+    or_filter(query, "#{field} lt #{format_literal(value, opts)}")
+  end
+
+  @doc """
+  Adds a less-than-or-equal condition (`{field} le {value}`).
+  """
+  @spec filter_le(t(), String.t() | atom(), any(), keyword()) :: t()
+  def filter_le(%__MODULE__{} = query, field, value, opts \\ []) do
+    and_filter(query, "#{field} le #{format_literal(value, opts)}")
+  end
+
+  @doc """
+  Adds a less-than-or-equal condition combined with `or` (`{field} le {value}`).
+  """
+  @spec or_filter_le(t(), String.t() | atom(), any(), keyword()) :: t()
+  def or_filter_le(%__MODULE__{} = query, field, value, opts \\ []) do
+    or_filter(query, "#{field} le #{format_literal(value, opts)}")
+  end
+
+  @doc """
+  Adds an OData 4 string `contains` condition (`contains({field}, '{value}')`).
+  """
+  @spec filter_contains(t(), String.t() | atom(), any()) :: t()
+  def filter_contains(%__MODULE__{} = query, field, value) do
+    escaped = String.replace(to_string(value), "'", "''")
+    and_filter(query, "contains(#{field},'#{escaped}')")
+  end
+
+  @doc """
+  Adds an OData 4 string `contains` condition combined with `or`.
+  """
+  @spec or_filter_contains(t(), String.t() | atom(), any()) :: t()
+  def or_filter_contains(%__MODULE__{} = query, field, value) do
+    escaped = String.replace(to_string(value), "'", "''")
+    or_filter(query, "contains(#{field},'#{escaped}')")
+  end
+
+  @doc """
+  Adds an OData string `startswith` condition (`startswith({field}, '{value}')`).
+  """
+  @spec filter_startswith(t(), String.t() | atom(), any()) :: t()
+  def filter_startswith(%__MODULE__{} = query, field, value) do
+    escaped = String.replace(to_string(value), "'", "''")
+    and_filter(query, "startswith(#{field},'#{escaped}')")
+  end
+
+  @doc """
+  Adds an OData string `startswith` condition combined with `or`.
+  """
+  @spec or_filter_startswith(t(), String.t() | atom(), any()) :: t()
+  def or_filter_startswith(%__MODULE__{} = query, field, value) do
+    escaped = String.replace(to_string(value), "'", "''")
+    or_filter(query, "startswith(#{field},'#{escaped}')")
+  end
+
+  @doc """
+  Adds an OData string `endswith` condition (`endswith({field}, '{value}')`).
+  """
+  @spec filter_endswith(t(), String.t() | atom(), any()) :: t()
+  def filter_endswith(%__MODULE__{} = query, field, value) do
+    escaped = String.replace(to_string(value), "'", "''")
+    and_filter(query, "endswith(#{field},'#{escaped}')")
+  end
+
+  @doc """
+  Adds an OData string `endswith` condition combined with `or`.
+  """
+  @spec or_filter_endswith(t(), String.t() | atom(), any()) :: t()
+  def or_filter_endswith(%__MODULE__{} = query, field, value) do
+    escaped = String.replace(to_string(value), "'", "''")
+    or_filter(query, "endswith(#{field},'#{escaped}')")
+  end
+
+  @doc """
+  Adds an OData `day` date function condition (`day({field}) {op} {value}`).
+  """
+  @spec filter_day(t(), String.t() | atom(), any(), String.t()) :: t()
+  def filter_day(%__MODULE__{} = query, field, day_value, op \\ "eq") do
+    and_filter(query, "day(#{field}) #{op} #{day_value}")
+  end
+
+  @doc """
+  Adds an OData `day` date function condition combined with `or` (`day({field}) {op} {value}`).
+  """
+  @spec or_filter_day(t(), String.t() | atom(), any(), String.t()) :: t()
+  def or_filter_day(%__MODULE__{} = query, field, day_value, op \\ "eq") do
+    or_filter(query, "day(#{field}) #{op} #{day_value}")
+  end
+
+  @doc """
+  Adds an OData `length` string function condition (`length({field}) {op} {value}`).
+  """
+  @spec filter_length(t(), String.t() | atom(), any(), String.t()) :: t()
+  def filter_length(%__MODULE__{} = query, field, len_value, op \\ "eq") do
+    and_filter(query, "length(#{field}) #{op} #{len_value}")
+  end
+
+  @doc """
+  Adds an OData `length` string function condition combined with `or` (`length({field}) {op} {value}`).
+  """
+  @spec or_filter_length(t(), String.t() | atom(), any(), String.t()) :: t()
+  def or_filter_length(%__MODULE__{} = query, field, len_value, op \\ "eq") do
+    or_filter(query, "length(#{field}) #{op} #{len_value}")
+  end
+
+  @doc """
+  Negates the current filter (`not ({current})`) or an explicitly provided expression.
+  """
+  @spec filter_not(t(), String.t() | nil) :: t()
+  def filter_not(query, expr \\ nil)
+  def filter_not(%__MODULE__{filter: nil} = query, nil), do: query
+
+  def filter_not(%__MODULE__{filter: current} = query, nil) do
+    %{query | filter: "not (#{current})"}
+  end
+
+  def filter_not(%__MODULE__{} = query, expr) when is_binary(expr) do
+    and_filter(query, "not (#{expr})")
+  end
+
+  @doc """
   Builds an OData filter condition checking if a field equals any of a list of values.
   Since Creatio OData 4 does not support the `in` operator, this constructs
   `(Field eq 'v1' or Field eq 'v2')`.
@@ -127,7 +346,9 @@ defmodule Creatio.OData.Query do
     quoted? = Keyword.get(opts, :quoted, true)
 
     conditions =
-      Enum.map(values, fn
+      values
+      |> Enum.uniq()
+      |> Enum.map(fn
         nil ->
           "#{field} eq null"
 
@@ -152,9 +373,80 @@ defmodule Creatio.OData.Query do
         and_filter(query, single)
 
       multiple ->
-        and_filter(query, Enum.join(multiple, " or "))
+        and_filter(query, "(#{Enum.join(multiple, " or ")})")
     end
   end
+
+  @doc """
+  Builds an OData filter condition checking if a field equals any of a list of values, combined with `or`.
+  """
+  @spec or_filter_in(t(), String.t() | atom(), [any()], keyword()) :: t()
+  def or_filter_in(%__MODULE__{} = query, field, values, opts \\ []) do
+    quoted? = Keyword.get(opts, :quoted, true)
+
+    conditions =
+      values
+      |> Enum.uniq()
+      |> Enum.map(fn
+        nil ->
+          "#{field} eq null"
+
+        val ->
+          formatted =
+            if quoted? do
+              escaped = String.replace(to_string(val), "'", "''")
+              "'#{escaped}'"
+            else
+              to_string(val)
+            end
+
+          "#{field} eq #{formatted}"
+      end)
+
+    case conditions do
+      [] ->
+        query
+
+      [single] ->
+        or_filter(query, single)
+
+      multiple ->
+        or_filter(query, "(#{Enum.join(multiple, " or ")})")
+    end
+  end
+
+  @doc """
+  Builds an OData filter condition for a list of UUID / GUID primary keys.
+  Since GUIDs in OData 4 are unquoted literals, this formats as `(Id eq uuid1 or Id eq uuid2)`.
+  """
+  @spec filter_in_ids(t(), String.t() | atom(), [any()]) :: t()
+  def filter_in_ids(%__MODULE__{} = query, field, ids) when is_list(ids) do
+    filter_in(query, field, ids, quoted: false)
+  end
+
+  @doc """
+  Adds a GUID equality condition (`{field} eq {guid}`).
+  In OData 4, GUIDs are unquoted literals.
+  In OData 3 (pass `protocol: :odata3` or `odata3: true`), GUIDs are formatted as `guid'{guid}'`.
+  """
+  @spec filter_guid(t(), String.t() | atom(), any(), keyword()) :: t()
+  def filter_guid(%__MODULE__{} = query, field, guid, opts \\ []) do
+    formatted = format_guid_literal(guid, opts)
+    and_filter(query, "#{field} eq #{formatted}")
+  end
+
+  @doc """
+  Adds a GUID equality condition combined with `or` (`{field} eq {guid}`).
+  """
+  @spec or_filter_guid(t(), String.t() | atom(), any(), keyword()) :: t()
+  def or_filter_guid(%__MODULE__{} = query, field, guid, opts \\ []) do
+    formatted = format_guid_literal(guid, opts)
+    or_filter(query, "#{field} eq #{formatted}")
+  end
+
+  # ---------------------------------------------------------------------------
+  # OrderBy, Top, Skip, Expand, Count & Serialization
+  # ---------------------------------------------------------------------------
 
   @doc """
   Specifies the ordering clause (`$orderby`).
@@ -305,5 +597,56 @@ defmodule Creatio.OData.Query do
       if query.count, do: Map.put(params, "$count", "true"), else: params
 
     Map.merge(params, query.custom_params)
+  end
+
+  defp format_literal(nil, _opts), do: "null"
+  defp format_literal(true, _opts), do: "true"
+  defp format_literal(false, _opts), do: "false"
+
+  defp format_literal(val, opts) when is_integer(val) or is_float(val) do
+    if Keyword.get(opts, :quoted, false) do
+      "'#{val}'"
+    else
+      to_string(val)
+    end
+  end
+
+  defp format_literal(val, opts) do
+    str = to_string(val)
+
+    cond do
+      Keyword.get(opts, :guid, false) or Keyword.get(opts, :type) == :guid ->
+        format_guid_literal(val, opts)
+
+      String.starts_with?(str, "guid'") and String.ends_with?(str, "'") ->
+        str
+
+      Keyword.get(opts, :quoted, true) ->
+        escaped = String.replace(str, "'", "''")
+        "'#{escaped}'"
+
+      true ->
+        str
+    end
+  end
+
+  defp format_guid_literal(guid, opts) do
+    clean =
+      guid
+      |> to_string()
+      |> String.trim()
+      |> String.replace_prefix("guid'", "")
+      |> String.replace_suffix("'", "")
+      |> String.replace_prefix("{", "")
+      |> String.replace_suffix("}", "")
+      |> String.replace_prefix("'", "")
+      |> String.replace_suffix("'", "")
+      |> String.trim()
+
+    if Keyword.get(opts, :protocol) == :odata3 or Keyword.get(opts, :odata3, false) do
+      "guid'#{clean}'"
+    else
+      clean
+    end
   end
 end

@@ -116,7 +116,8 @@ defmodule Creatio.OData do
           {:ok, map()} | {:error, Error.t()}
   def get(client_or_req, entity, id, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    url = "/0/odata/#{entity}(#{id})"
+    clean = clean_id(id)
+    url = "/0/odata/#{entity}(#{clean})"
     params = normalize_params(opts)
 
     case Req.get(client.req, url: url, params: params) do
@@ -154,7 +155,8 @@ defmodule Creatio.OData do
           {:ok, any()} | {:error, Error.t()}
   def get_navigation(client_or_req, entity, id, nav_property, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    url = "/0/odata/#{entity}(#{id})/#{nav_property}"
+    clean = clean_id(id)
+    url = "/0/odata/#{entity}(#{clean})/#{nav_property}"
     params = normalize_params(opts)
 
     case Req.get(client.req, url: url, params: params) do
@@ -189,7 +191,8 @@ defmodule Creatio.OData do
           {:ok, any()} | {:error, Error.t()}
   def get_field(client_or_req, entity, id, field_name, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    url = "/0/odata/#{entity}(#{id})/#{field_name}"
+    clean = clean_id(id)
+    url = "/0/odata/#{entity}(#{clean})/#{field_name}"
 
     case Req.get(client.req, url: url, params: normalize_params(opts)) do
       {:ok, %{status: 200, body: %{"value" => val}}} ->
@@ -223,7 +226,8 @@ defmodule Creatio.OData do
           {:ok, binary()} | {:error, Error.t()}
   def get_field_value(client_or_req, entity, id, field_name) do
     client = Client.ensure_client(client_or_req)
-    url = "/0/odata/#{entity}(#{id})/#{field_name}/$value"
+    clean = clean_id(id)
+    url = "/0/odata/#{entity}(#{clean})/#{field_name}/$value"
 
     case Req.get(client.req, url: url) do
       {:ok, %{status: 200, body: body}} ->
@@ -248,7 +252,11 @@ defmodule Creatio.OData do
   end
 
   @doc """
-  Gets the total count of an entity collection (`GET /0/odata/{Entity}/$count`).
+  Gets the total count of an entity collection.
+
+  Supports:
+  - Option 1 (default): `GET /0/odata/{Entity}/$count`
+  - Option 2: `GET /0/odata/{Entity}?$count=true&$top=0` (when `:strategy` is `:top_zero`)
 
   Accepts optional `:filter`.
   """
@@ -256,31 +264,75 @@ defmodule Creatio.OData do
           {:ok, integer()} | {:error, Error.t()}
   def count(client_or_req, entity, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    url = "/0/odata/#{entity}/$count"
-    params = normalize_params(opts)
+    strategy = Keyword.get(opts, :strategy, :path)
 
-    case Req.get(client.req, url: url, params: params) do
-      {:ok, %{status: 200, body: body}} when is_integer(body) ->
-        {:ok, body}
+    case strategy do
+      :top_zero ->
+        params =
+          opts
+          |> Keyword.delete(:strategy)
+          |> Keyword.put(:count, true)
+          |> Keyword.put(:top, 0)
+          |> normalize_params()
 
-      {:ok, %{status: 200, body: %{"@odata.count" => count}}} when is_integer(count) ->
-        {:ok, count}
+        url = "/0/odata/#{entity}"
 
-      {:ok, %{status: 200, body: %{"value" => count}}} when is_integer(count) ->
-        {:ok, count}
+        case Req.get(client.req, url: url, params: params) do
+          {:ok, %{status: 200, body: %{"@odata.count" => count}}} ->
+            parse_integer_count(count)
 
-      {:ok, %{status: 200, body: body}} when is_binary(body) ->
-        case Integer.parse(String.trim(body)) do
-          {int, _} -> {:ok, int}
-          :error -> {:error, Error.new(message: "Failed to parse count response: #{body}")}
+          {:ok, %{status: 200, body: %{"value" => _}} = resp} ->
+            case resp.body["@odata.count"] do
+              nil -> {:error, Error.new(message: "No @odata.count found in response")}
+              count -> parse_integer_count(count)
+            end
+
+          {:ok, %Req.Response{} = resp} ->
+            {:error, Error.from_response(resp)}
+
+          {:error, exception} ->
+            {:error, Error.new(message: Exception.message(exception), details: exception)}
         end
 
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
+      _ ->
+        url = "/0/odata/#{entity}/$count"
+        params = normalize_params(Keyword.delete(opts, :strategy))
 
-      {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        case Req.get(client.req, url: url, params: params) do
+          {:ok, %{status: 200, body: body}} when is_integer(body) ->
+            {:ok, body}
+
+          {:ok, %{status: 200, body: %{"@odata.count" => count}}} ->
+            parse_integer_count(count)
+
+          {:ok, %{status: 200, body: %{"value" => count}}} ->
+            parse_integer_count(count)
+
+          {:ok, %{status: 200, body: body}} when is_binary(body) ->
+            parse_integer_count(body)
+
+          {:ok, %Req.Response{} = resp} ->
+            {:error, Error.from_response(resp)}
+
+          {:error, exception} ->
+            {:error, Error.new(message: Exception.message(exception), details: exception)}
+        end
     end
+  end
+
+  defp parse_integer_count(count) when is_integer(count), do: {:ok, count}
+
+  defp parse_integer_count(count) when is_binary(count) do
+    cleaned = count |> String.trim() |> String.trim_leading("\uFEFF") |> String.trim()
+
+    case Integer.parse(cleaned) do
+      {int, _} -> {:ok, int}
+      :error -> {:error, Error.new(message: "Failed to parse count response: #{count}")}
+    end
+  end
+
+  defp parse_integer_count(other) do
+    {:error, Error.new(message: "Failed to parse count response: #{inspect(other)}")}
   end
 
   @doc """
@@ -339,7 +391,8 @@ defmodule Creatio.OData do
           :ok | {:ok, map()} | {:error, Error.t()}
   def update(client_or_req, entity, id, attrs, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    url = "/0/odata/#{entity}(#{id})"
+    clean = clean_id(id)
+    url = "/0/odata/#{entity}(#{clean})"
 
     req =
       client.req
@@ -379,7 +432,8 @@ defmodule Creatio.OData do
           :ok | {:error, Error.t()}
   def delete(client_or_req, entity, id, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    url = "/0/odata/#{entity}(#{id})"
+    clean = clean_id(id)
+    url = "/0/odata/#{entity}(#{clean})"
 
     req =
       client.req
@@ -418,27 +472,34 @@ defmodule Creatio.OData do
           String.t(),
           String.t(),
           String.t(),
-          binary(),
+          any(),
           keyword()
         ) ::
           :ok | {:error, Error.t()}
   def update_field(client_or_req, entity, id, field_name, value, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    url = "/0/odata/#{entity}(#{id})/#{field_name}"
+    clean = clean_id(id)
+    url = "/0/odata/#{entity}(#{clean})/#{field_name}"
 
-    content_type =
-      Keyword.get(opts, :content_type, "application/octet-stream; IEEE754Compatible=true")
+    {body_payload, default_ct} =
+      cond do
+        is_map(value) or (is_list(value) and not is_nil(value)) ->
+          {Jason.encode!(value), "application/json; IEEE754Compatible=true"}
+
+        true ->
+          {value, "application/octet-stream; IEEE754Compatible=true"}
+      end
+
+    content_type = Keyword.get(opts, :content_type, default_ct)
 
     req =
       client.req
+      |> Req.Request.put_header("accept", "application/json; text/plain; */*")
       |> Req.Request.put_header("content-type", content_type)
       |> Req.Request.put_header("forceusesession", "true")
 
-    case Req.put(req, url: url, body: value) do
-      {:ok, %{status: 204}} ->
-        :ok
-
-      {:ok, %{status: 200}} ->
+    case Req.put(req, url: url, body: body_payload) do
+      {:ok, %{status: status}} when status in [200, 201, 204] ->
         :ok
 
       {:ok, %Req.Response{} = resp} ->
@@ -466,7 +527,8 @@ defmodule Creatio.OData do
           :ok | {:error, Error.t()}
   def delete_field(client_or_req, entity, id, field_name, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    url = "/0/odata/#{entity}(#{id})/#{field_name}"
+    clean = clean_id(id)
+    url = "/0/odata/#{entity}(#{clean})/#{field_name}"
 
     req =
       client.req
@@ -635,6 +697,9 @@ defmodule Creatio.OData do
       {:params, map}, acc when is_map(map) ->
         Map.merge(acc, map)
 
+      {:params, list}, acc when is_list(list) ->
+        Enum.reduce(list, acc, fn {k, v}, a -> Map.put(a, to_string(k), to_string(v)) end)
+
       {key, val}, acc when is_binary(key) ->
         Map.put(acc, key, to_string(val))
 
@@ -644,4 +709,17 @@ defmodule Creatio.OData do
   end
 
   defp normalize_params(map) when is_map(map), do: map
+
+  defp clean_id(id) do
+    id
+    |> to_string()
+    |> String.trim()
+    |> String.replace_prefix("guid'", "")
+    |> String.replace_suffix("'", "")
+    |> String.replace_prefix("{", "")
+    |> String.replace_suffix("}", "")
+    |> String.replace_prefix("'", "")
+    |> String.replace_suffix("'", "")
+    |> String.trim()
+  end
 end

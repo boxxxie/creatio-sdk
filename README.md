@@ -132,7 +132,9 @@ Verify OAuth functionality at any time:
 query =
   Creatio.query("Contact")
   |> Creatio.OData.Query.select(["Id", "Name", "MobilePhone"])
-  |> Creatio.OData.Query.filter("Age gt 21 and City/Name eq 'Toronto'")
+  |> Creatio.OData.Query.filter_gt("Age", 21)
+  |> Creatio.OData.Query.filter_contains("Name", "Smith")
+  |> Creatio.OData.Query.filter_eq("City/Name", "Toronto")
   |> Creatio.OData.Query.order_by("CreatedOn desc")
   |> Creatio.OData.Query.top(25)
   |> Creatio.OData.Query.skip(50)
@@ -140,6 +142,13 @@ query =
 
 {:ok, contacts} = Creatio.list(client, query)
 ```
+
+The query builder supports all standard OData 4 filtration operators and functions:
+- `filter_eq/3`, `filter_ne/3`, `filter_gt/3`, `filter_ge/3`, `filter_lt/3`, `filter_le/3`
+- `filter_contains/3`, `filter_startswith/3`, `filter_endswith/3`
+- `filter_day/3`, `filter_length/3`, `filter_not/1`
+- `filter_in/3`, `filter_in_ids/3` (formats unquoted GUID ORs for Creatio)
+- `or_filter_eq/3`, `or_filter_contains/3`, `or_filter_startswith/3`, `or_filter_endswith/3`
 
 ### Automatic Streaming / Pagination
 
@@ -190,7 +199,7 @@ binary_content = File.read!("avatar.png")
 
 ## Batch Requests
 
-Execute multiple operations in a single HTTP request using the OData 4 JSON batch format:
+Execute multiple operations in a single HTTP request using either the OData 4 JSON batch format or multipart/mixed MIME format:
 
 ```elixir
 batch =
@@ -199,11 +208,57 @@ batch =
   |> Creatio.Batch.add_update("Contact", contact_id, %{"JobTitle" => "VP"}, atomicity_group: "group1")
   |> Creatio.Batch.add_delete("Contact", old_contact_id)
 
+# Execute via JSON batch (default)
 {:ok, responses} = Creatio.batch(client, batch)
+
+# Execute via multipart/mixed MIME batch
+{:ok, responses} = Creatio.batch(client, batch, format: :multipart)
 
 Enum.each(responses, fn resp ->
   IO.puts("Request #{resp.id}: status #{resp.status}")
 end)
+```
+
+---
+
+## DataService & Custom Services
+
+Direct execution of Creatio DataService JSON SyncReply endpoints:
+
+```elixir
+# SelectQuery
+{:ok, res} = Creatio.select_query(client, %{"RootSchemaName" => "Account"})
+
+# InsertQuery, UpdateQuery, DeleteQuery, BatchQuery
+{:ok, res} = Creatio.insert_query(client, %{"RootSchemaName" => "Contact", ...})
+{:ok, res} = Creatio.update_query(client, %{"RootSchemaName" => "Contact", ...})
+{:ok, res} = Creatio.delete_query(client, %{"RootSchemaName" => "Contact", ...})
+{:ok, res} = Creatio.batch_query(client, %{"items" => [...]})
+
+# Custom REST Web Service
+{:ok, res} = Creatio.custom_service(client, "CustomService", "Endpoint", %{"param" => "value"})
+```
+
+---
+
+## Legacy OData 3 Support
+
+Full compatibility with legacy Creatio `EntityDataService.svc` endpoints:
+
+```elixir
+{:ok, contacts} = Creatio.odata3_list(client, "Contact", top: 10, count: true)
+{:ok, contact}  = Creatio.odata3_get(client, "Contact", contact_id)
+{:ok, account}  = Creatio.odata3_get_navigation(client, "Contact", contact_id, "Account")
+{:ok, name}     = Creatio.odata3_get_field(client, "Contact", contact_id, "Name")
+{:ok, raw_name} = Creatio.odata3_get_field_value(client, "Contact", contact_id, "Name")
+{:ok, count}    = Creatio.odata3_count(client, "Contact")
+{:ok, created}  = Creatio.odata3_create(client, "Contact", %{"Name" => "Legacy"})
+:ok             = Creatio.odata3_update(client, "Contact", contact_id, %{"Name" => "Updated"})
+:ok             = Creatio.odata3_delete(client, "Contact", contact_id)
+
+# Legacy OData 3 streaming / auto-pagination
+Creatio.odata3_stream(client, "Contact", page_size: 100)
+|> Enum.take(250)
 ```
 
 ---

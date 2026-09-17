@@ -34,7 +34,35 @@ defmodule Creatio.Auth do
       |> Req.Request.put_header("content-type", "application/json; charset=utf-8")
 
     case Req.post(req, url: url, json: body) do
-      {:ok, %{status: 200, body: %{"Code" => 0}} = resp} ->
+      {:ok, %Req.Response{} = resp} ->
+        handle_forms_login_result(resp, client)
+
+      {:error, exception} ->
+        {:error, Error.new(message: Exception.message(exception), details: exception)}
+    end
+  end
+
+  def login_forms(%Req.Request{} = req, username, password, opts) do
+    client = Client.from_req(req)
+    login_forms(client, username, password, opts)
+  end
+
+  defp handle_forms_login_result(%{status: 200, body: body_str} = resp, client)
+       when is_binary(body_str) do
+    case Jason.decode(body_str) do
+      {:ok, %{} = decoded} ->
+        handle_forms_login_result(%{resp | body: decoded}, client)
+
+      _ ->
+        {:error, Error.from_response(resp)}
+    end
+  end
+
+  defp handle_forms_login_result(%{status: 200, body: %{} = body} = resp, client) do
+    code = body["Code"] || body["code"]
+
+    cond do
+      code in [0, "0"] ->
         cookies = extract_cookies(resp.headers)
         bpmcsrf = extract_bpmcsrf(cookies, resp.headers)
         cookie_header = Enum.join(cookies, "; ")
@@ -45,8 +73,8 @@ defmodule Creatio.Auth do
 
         {:ok, updated_client}
 
-      {:ok, %{status: 200, body: %{"Code" => code} = body} = resp} when code != 0 ->
-        msg = body["Message"] || "Invalid credentials"
+      code != nil ->
+        msg = body["Message"] || body["message"] || "Invalid credentials"
 
         {:error,
          Error.new(
@@ -56,17 +84,13 @@ defmodule Creatio.Auth do
            response: resp
          )}
 
-      {:ok, %Req.Response{} = resp} ->
+      true ->
         {:error, Error.from_response(resp)}
-
-      {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
     end
   end
 
-  def login_forms(%Req.Request{} = req, username, password, opts) do
-    client = Client.from_req(req)
-    login_forms(client, username, password, opts)
+  defp handle_forms_login_result(%Req.Response{} = resp, _client) do
+    {:error, Error.from_response(resp)}
   end
 
   @doc """
@@ -228,9 +252,9 @@ defmodule Creatio.Auth do
       Enum.find_value(cookies, fn cookie ->
         cookie = String.trim(cookie)
 
-        if String.starts_with?(cookie, "BPMCSRF=") do
-          raw_val = String.replace_prefix(cookie, "BPMCSRF=", "")
-          URI.decode_www_form(raw_val)
+        case Regex.run(~r/^bpmcsrf=(.*)$/i, cookie) do
+          [_, val] -> URI.decode_www_form(val)
+          _ -> nil
         end
       end)
 

@@ -109,4 +109,40 @@ defmodule Creatio.ErrorTest do
     assert err.status == 404
     assert err.message == "HTTP 404"
   end
+
+  test "from_response with DataService errorInfo payload" do
+    resp = %Req.Response{
+      status: 200,
+      body: %{
+        "success" => false,
+        "errorInfo" => %{
+          "errorCode" => "1002",
+          "message" => "Database exception in SelectQuery"
+        }
+      }
+    }
+
+    err = Error.from_response(resp)
+    assert err.status == 200
+    assert err.code == "1002"
+    assert err.message == "Database exception in SelectQuery"
+    assert is_map(err.details)
+  end
+
+  test "from_response with ServiceStack responseStatus payload" do
+    resp = %Req.Response{
+      status: 400,
+      body: %{
+        "responseStatus" => %{
+          "ErrorCode" => "ValidationError",
+          "Message" => "Field is required"
+        }
+      }
+    }
+
+    err = Error.from_response(resp)
+    assert err.status == 400
+    assert err.code == "ValidationError"
+    assert err.message == "Field is required"
+  end
 end

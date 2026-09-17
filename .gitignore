@@ -7,3 +7,14 @@ erl_crash.dump
 *.ez
 *.beam
 /creatio-*.tar
+
+# Environment files and credentials for testing
+.env
+.env.*
+!.env.example
+.envrc
+.envrc.*
+!.envrc.example
+.direnv/
+*.secret.exs
+config/*.secret.exs

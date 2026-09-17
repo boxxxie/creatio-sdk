@@ -59,19 +59,35 @@ defmodule Creatio.Client do
       (Keyword.get(opts, :base_url) ||
          Application.get_env(:creatio, :base_url) ||
          Application.get_env(:connect, :creatio)[:base_url] ||
+         System.get_env("CREATIO_BASE_URL") ||
          "")
       |> String.trim_trailing("/")
 
     auth_token =
       Keyword.get(opts, :auth_token) ||
         Application.get_env(:creatio, :auth_token) ||
-        Application.get_env(:connect, :creatio)[:auth_token]
+        Application.get_env(:connect, :creatio)[:auth_token] ||
+        System.get_env("CREATIO_AUTH_TOKEN")
 
     cookie = Keyword.get(opts, :cookie)
     bpmcsrf = Keyword.get(opts, :bpmcsrf)
-    identity_service_url = Keyword.get(opts, :identity_service_url)
-    client_id = Keyword.get(opts, :client_id)
-    client_secret = Keyword.get(opts, :client_secret)
+
+    identity_service_url =
+      Keyword.get(opts, :identity_service_url) ||
+        Application.get_env(:creatio, :identity_service_url) ||
+        System.get_env("CREATIO_IDENTITY_URL") ||
+        System.get_env("CREATIO_IDENTITY_SERVICE_URL")
+
+    client_id =
+      Keyword.get(opts, :client_id) ||
+        Application.get_env(:creatio, :client_id) ||
+        System.get_env("CREATIO_CLIENT_ID")
+
+    client_secret =
+      Keyword.get(opts, :client_secret) ||
+        Application.get_env(:creatio, :client_secret) ||
+        System.get_env("CREATIO_CLIENT_SECRET")
+
     req_options = Keyword.get(opts, :req_options, [])
 
     auth_mode =
@@ -81,8 +97,10 @@ defmodule Creatio.Client do
         true -> :none
       end
 
+    base_opts = if base_url != "", do: [base_url: base_url], else: []
+
     req =
-      [base_url: base_url]
+      base_opts
       |> Keyword.merge(req_options)
       |> Req.new()
       |> Req.Request.put_header("accept", "application/json; odata.metadata=minimal")
@@ -110,7 +128,10 @@ defmodule Creatio.Client do
   @spec from_req(Req.Request.t(), keyword() | map()) :: t()
   def from_req(%Req.Request{} = req, opts \\ []) do
     opts_list = if is_map(opts), do: Map.to_list(opts), else: opts
-    base_url = Keyword.get(opts_list, :base_url) || req.options[:base_url] || ""
+
+    base_url =
+      Keyword.get(opts_list, :base_url) || req.options[:base_url] ||
+        System.get_env("CREATIO_BASE_URL") || ""
 
     configured_req =
       req

@@ -35,9 +35,24 @@ defmodule Creatio.BatchTest do
       assert req3["url"] == "Contact(uuid-2)"
       assert is_nil(req3["atomicityGroup"])
     end
+
+    test "to_multipart/2 builds valid multipart/mixed body with changesets" do
+      batch =
+        Batch.new()
+        |> Batch.add_create("Contact", %{"Name" => "Alice"}, atomicity_group: "g1")
+        |> Batch.add_get("Contact", "uuid-1")
+
+      {boundary, body} = Batch.to_multipart(batch, boundary: "test_batch_123")
+      assert boundary == "test_batch_123"
+      assert String.contains?(body, "--test_batch_123")
+      assert String.contains?(body, "Content-Type: multipart/mixed; boundary=changeset_g1_")
+      assert String.contains?(body, "POST Contact HTTP/1.1")
+      assert String.contains?(body, "GET Contact(uuid-1) HTTP/1.1")
+      assert String.ends_with?(body, "--test_batch_123--\r\n")
+    end
   end
 
-  describe "Batch.execute/3" do
+  describe "Batch.execute/3 (JSON format)" do
     test "executes batch request and parses response objects" do
       plug = fn conn ->
         assert conn.request_path == "/0/odata/$batch"
@@ -144,6 +159,152 @@ defmodule Creatio.BatchTest do
       err = Batch.Response.to_error(r2)
       assert err.status == 404
       assert err.message == "Not found"
+    end
+  end
+
+  describe "Batch.execute/3 (Multipart format)" do
+    test "executes multipart/mixed batch request and parses JSON response" do
+      plug = fn conn ->
+        assert conn.request_path == "/0/odata/$batch"
+        assert conn.method == "POST"
+
+        content_type = get_req_header(conn, "content-type") |> List.first()
+        assert String.starts_with?(content_type, "multipart/mixed; boundary=")
+
+        {:ok, body, conn} = read_body(conn)
+        assert String.contains?(body, "POST Contact HTTP/1.1")
+
+        responses = [
+          %{"id" => "1", "status" => 201, "body" => %{"Id" => "m1"}}
+        ]
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{"responses" => responses}))
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      batch =
+        Batch.new()
+        |> Batch.add_create("Contact", %{"Name" => "Multi Alice"}, id: "1")
+
+      assert {:ok, [r]} = Batch.execute(client, batch, format: :multipart)
+      assert r.id == "1"
+      assert r.status == 201
+      assert r.body["Id"] == "m1"
+    end
+
+    test "parses multipart/mixed MIME response body" do
+      raw_multipart_response = """
+      --batch_response_123
+      Content-Type: multipart/mixed; boundary=changeset_response_456
+
+      --changeset_response_456
+      Content-Type: application/http
+      Content-Transfer-Encoding: binary
+
+      HTTP/1.1 201 Created
+      Content-Type: application/json; odata=verbose
+      Content-ID: req_1
+
+      {"Id": "new-guid", "Name": "Created"}
+      --changeset_response_456
+      Content-Type: application/http
+      Content-Transfer-Encoding: binary
+
+      HTTP/1.1 204 No Content
+      Content-ID: req_2
+
+
+      --changeset_response_456--
+      --batch_response_123
+      Content-Type: application/http
+      Content-Transfer-Encoding: binary
+
+      HTTP/1.1 200 OK
+      Content-Type: application/json; odata=verbose
+      Content-ID: req_3
+
+      {"Name": "Found"}
+      --batch_response_123--
+      """
+
+      assert {:ok, responses} = Batch.parse_multipart_response(raw_multipart_response)
+      assert length(responses) == 3
+
+      [r1, r2, r3] = responses
+      assert r1.id == "req_1"
+      assert r1.status == 201
+      assert r1.body["Id"] == "new-guid"
+
+      assert r2.id == "req_2"
+      assert r2.status == 204
+
+      assert r3.id == "req_3"
+      assert r3.status == 200
+      assert r3.body["Name"] == "Found"
+    end
+
+    test "executes raw multipart string body against endpoint" do
+      raw_body =
+        "--batch_999\r\nContent-Type: application/http\r\n\r\nGET Contact HTTP/1.1\r\n\r\n--batch_999--\r\n"
+
+      plug = fn conn ->
+        content_type = get_req_header(conn, "content-type") |> List.first()
+        assert String.contains?(content_type, "boundary=batch_999")
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          200,
+          Jason.encode!(%{"responses" => [%{"id" => "1", "status" => 200, "body" => []}]})
+        )
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+      assert {:ok, [r]} = Batch.execute(client, raw_body)
+      assert r.status == 200
+    end
+
+    test "handles single entity response in batch execution (Postman collection format)" do
+      plug = fn conn ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          200,
+          Jason.encode!(%{
+            "@odata.context" => "https://mycreatio.com/0/odata/$metadata#City/$entity",
+            "Id" => "fbd0565f-fa8a-4214-ae89-c976c5f3acb4",
+            "Name" => "San Francisco"
+          })
+        )
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+      batch = Batch.new() |> Batch.add_create("City", %{"Name" => "San Francisco"})
+
+      assert {:ok, [resp]} = Batch.execute(client, batch)
+      assert resp.status == 200
+      assert resp.body["Id"] == "fbd0565f-fa8a-4214-ae89-c976c5f3acb4"
+      assert resp.body["Name"] == "San Francisco"
+    end
+
+    test "sends prefer continue-on-error header when continue_on_error: true" do
+      plug = fn conn ->
+        prefer = get_req_header(conn, "prefer") |> List.first()
+        assert prefer == "continue-on-error"
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{"responses" => []}))
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+      batch = Batch.new(continue_on_error: true) |> Batch.add_get("Contact", "123")
+
+      assert {:ok, []} = Batch.execute(client, batch)
+      assert {:ok, []} = Batch.execute(client, batch, format: :multipart)
     end
   end
 end

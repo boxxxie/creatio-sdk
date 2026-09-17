@@ -31,7 +31,8 @@ defmodule Creatio do
       {:ok, results} =
         Creatio.query("Contact")
         |> Creatio.OData.Query.select(["Id", "Name", "MobilePhone"])
-        |> Creatio.OData.Query.filter("Age gt 25 and City/Name eq 'Toronto'")
+        |> Creatio.OData.Query.filter_contains("Name", "Smith")
+        |> Creatio.OData.Query.filter_eq("Active", true)
         |> Creatio.OData.Query.order_by("CreatedOn desc")
         |> Creatio.OData.Query.top(20)
         |> Creatio.list(client)
@@ -105,6 +106,18 @@ defmodule Creatio do
   Initializes a new `Creatio.Batch` request.
   """
   def batch_new(opts \\ []), do: Batch.new(opts)
+
+  @doc """
+  Serializes a batch to a multipart/mixed MIME body string. Returns `{boundary, body}`.
+  """
+  defdelegate batch_to_multipart(batch, opts \\ []), to: Batch, as: :to_multipart
+
+  @doc """
+  Parses a multipart/mixed batch response body.
+  """
+  defdelegate batch_parse_multipart(body, boundary \\ nil),
+    to: Batch,
+    as: :parse_multipart_response
 
   @doc """
   Queries an entity collection (`GET /0/odata/{Entity}`).
@@ -256,6 +269,60 @@ defmodule Creatio do
   defdelegate select_query!(client, query_payload, opts \\ []), to: DataService
 
   @doc """
+  Executes an InsertQuery against `/0/DataService/json/SyncReply/InsertQuery`.
+  """
+  defdelegate insert_query(client, query_payload, opts \\ []), to: DataService
+
+  @doc """
+  Same as `insert_query/3`, raising `Creatio.Error` on failure.
+  """
+  defdelegate insert_query!(client, query_payload, opts \\ []), to: DataService
+
+  @doc """
+  Executes an UpdateQuery against `/0/DataService/json/SyncReply/UpdateQuery`.
+  """
+  defdelegate update_query(client, query_payload, opts \\ []), to: DataService
+
+  @doc """
+  Same as `update_query/3`, raising `Creatio.Error` on failure.
+  """
+  defdelegate update_query!(client, query_payload, opts \\ []), to: DataService
+
+  @doc """
+  Executes a DeleteQuery against `/0/DataService/json/SyncReply/DeleteQuery`.
+  """
+  defdelegate delete_query(client, query_payload, opts \\ []), to: DataService
+
+  @doc """
+  Same as `delete_query/3`, raising `Creatio.Error` on failure.
+  """
+  defdelegate delete_query!(client, query_payload, opts \\ []), to: DataService
+
+  @doc """
+  Executes a BatchQuery against `/0/DataService/json/SyncReply/BatchQuery`.
+  """
+  defdelegate batch_query(client, query_payload, opts \\ []), to: DataService
+
+  @doc """
+  Same as `batch_query/3`, raising `Creatio.Error` on failure.
+  """
+  defdelegate batch_query!(client, query_payload, opts \\ []), to: DataService
+
+  @doc """
+  Executes a generic DataService query against `/0/DataService/json/SyncReply/{action}`.
+  """
+  defdelegate data_service_query(client, action, query_payload, opts \\ []),
+    to: DataService,
+    as: :execute_query
+
+  @doc """
+  Same as `data_service_query/4`, raising `Creatio.Error` on failure.
+  """
+  defdelegate data_service_query!(client, action, query_payload, opts \\ []),
+    to: DataService,
+    as: :execute_query!
+
+  @doc """
   Calls a custom Creatio REST web service (`/0/rest/{service_name}/{endpoint}`).
   """
   defdelegate custom_service(client, service_name, endpoint, payload \\ %{}, opts \\ []),
@@ -292,6 +359,58 @@ defmodule Creatio do
   defdelegate odata3_get!(client, entity, id, opts \\ []), to: OData3, as: :get!
 
   @doc """
+  Retrieves related records via a navigation property in OData 3.
+  """
+  defdelegate odata3_get_navigation(client, entity, id, nav_property, opts \\ []),
+    to: OData3,
+    as: :get_navigation
+
+  @doc """
+  Same as `odata3_get_navigation/5`, raising `Creatio.Error` on failure.
+  """
+  defdelegate odata3_get_navigation!(client, entity, id, nav_property, opts \\ []),
+    to: OData3,
+    as: :get_navigation!
+
+  @doc """
+  Retrieves a field value of an entity in OData 3.
+  """
+  defdelegate odata3_get_field(client, entity, id, field_name, opts \\ []),
+    to: OData3,
+    as: :get_field
+
+  @doc """
+  Same as `odata3_get_field/5`, raising `Creatio.Error` on failure.
+  """
+  defdelegate odata3_get_field!(client, entity, id, field_name, opts \\ []),
+    to: OData3,
+    as: :get_field!
+
+  @doc """
+  Retrieves raw scalar/stream value in OData 3.
+  """
+  defdelegate odata3_get_field_value(client, entity, id, field_name),
+    to: OData3,
+    as: :get_field_value
+
+  @doc """
+  Same as `odata3_get_field_value/4`, raising `Creatio.Error` on failure.
+  """
+  defdelegate odata3_get_field_value!(client, entity, id, field_name),
+    to: OData3,
+    as: :get_field_value!
+
+  @doc """
+  Gets total count of an entity collection in OData 3.
+  """
+  defdelegate odata3_count(client, entity, opts \\ []), to: OData3, as: :count
+
+  @doc """
+  Same as `odata3_count/3`, raising `Creatio.Error` on failure.
+  """
+  defdelegate odata3_count!(client, entity, opts \\ []), to: OData3, as: :count!
+
+  @doc """
   Creates an entity via legacy OData 3.
   """
   defdelegate odata3_create(client, entity, attrs, opts \\ []), to: OData3, as: :create
@@ -320,4 +439,14 @@ defmodule Creatio do
   Same as `odata3_delete/4`, raising `Creatio.Error` on failure.
   """
   defdelegate odata3_delete!(client, entity, id, opts \\ []), to: OData3, as: :delete!
+
+  @doc """
+  Returns a lazy `Stream` that paginates through records of a legacy OData 3 entity collection.
+  """
+  defdelegate odata3_stream(client, entity_or_query, opts \\ []), to: OData3, as: :stream
+
+  @doc """
+  Same as `odata3_stream/3`.
+  """
+  defdelegate odata3_stream!(client, entity_or_query, opts \\ []), to: OData3, as: :stream!
 end

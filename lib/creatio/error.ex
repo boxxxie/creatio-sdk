@@ -70,30 +70,86 @@ defmodule Creatio.Error do
     {err, err, nil}
   end
 
+  defp parse_error_body(%{"errorInfo" => %{} = info}) do
+    msg = info["message"] || info["Message"]
+    code = info["errorCode"] || info["ErrorCode"]
+    {code, msg, info}
+  end
+
+  defp parse_error_body(%{"ErrorInfo" => %{} = info}) do
+    msg = info["message"] || info["Message"]
+    code = info["errorCode"] || info["ErrorCode"]
+    {code, msg, info}
+  end
+
+  defp parse_error_body(%{"responseStatus" => %{} = rs}) do
+    msg = rs["Message"] || rs["message"]
+    code = rs["ErrorCode"] || rs["errorCode"]
+    {code, msg, rs}
+  end
+
+  defp parse_error_body(%{"ResponseStatus" => %{} = rs}) do
+    msg = rs["Message"] || rs["message"]
+    code = rs["ErrorCode"] || rs["errorCode"]
+    {code, msg, rs}
+  end
+
+  defp parse_error_body(%{"success" => val} = body)
+       when is_map(body) and val in [false, "false"] do
+    msg =
+      body["message"] || body["Message"] ||
+        "DataService query execution failed (success: false)"
+
+    code = body["errorCode"] || body["ErrorCode"] || body["Code"] || body["code"]
+    {code, msg, body}
+  end
+
+  defp parse_error_body(%{"Success" => val} = body)
+       when is_map(body) and val in [false, "false"] do
+    msg =
+      body["message"] || body["Message"] ||
+        "DataService query execution failed (success: false)"
+
+    code = body["errorCode"] || body["ErrorCode"] || body["Code"] || body["code"]
+    {code, msg, body}
+  end
+
   defp parse_error_body(%{"Code" => code} = body) when is_map(body) do
     msg = body["Message"] || body["Exception"] || body["ExceptionMessage"]
     {code, msg, body["Exception"]}
   end
 
   defp parse_error_body(%{"Message" => msg} = body) when is_map(body) do
-    {body["Code"], msg, body["Exception"]}
+    code = body["Code"] || body["code"] || body["errorCode"] || body["ErrorCode"]
+    {code, msg, body["Exception"]}
   end
 
   defp parse_error_body(%{"ExceptionMessage" => msg} = body) when is_map(body) do
-    {body["Code"], msg, body["Exception"]}
+    code = body["Code"] || body["code"] || body["errorCode"] || body["ErrorCode"]
+    {code, msg, body["Exception"]}
   end
 
   defp parse_error_body(%{"message" => %{"value" => msg}} = body) when is_binary(msg) do
-    {body["code"], msg, nil}
+    code = body["code"] || body["Code"] || body["errorCode"] || body["ErrorCode"]
+    {code, msg, nil}
   end
 
   defp parse_error_body(%{"message" => msg} = body) when is_binary(msg) do
-    {body["code"], msg, nil}
+    code = body["code"] || body["Code"] || body["errorCode"] || body["ErrorCode"]
+    {code, msg, nil}
   end
 
   defp parse_error_body(body) when is_binary(body) do
     trimmed = String.trim(body)
-    if trimmed == "", do: {nil, nil, nil}, else: {nil, trimmed, nil}
+
+    if trimmed == "" do
+      {nil, nil, nil}
+    else
+      case Jason.decode(trimmed) do
+        {:ok, %{} = map} -> parse_error_body(map)
+        _ -> {nil, trimmed, nil}
+      end
+    end
   end
 
   defp parse_error_body(other) do

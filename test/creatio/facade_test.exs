@@ -161,9 +161,58 @@ defmodule CreatioTest do
 
       assert %{"status" => "pong"} =
                Creatio.custom_service!(client, "CustomSvc", "Ping", method: :get)
+
+      # DataService query operations
+      query_plug = fn conn ->
+        case conn.request_path do
+          "/0/DataService/json/SyncReply/InsertQuery" ->
+            conn
+            |> put_resp_content_type("application/json")
+            |> send_resp(200, Jason.encode!(%{"id" => "inserted-id"}))
+
+          "/0/DataService/json/SyncReply/UpdateQuery" ->
+            conn
+            |> put_resp_content_type("application/json")
+            |> send_resp(200, Jason.encode!(%{"rowsAffected" => 1}))
+
+          "/0/DataService/json/SyncReply/DeleteQuery" ->
+            conn
+            |> put_resp_content_type("application/json")
+            |> send_resp(200, Jason.encode!(%{"rowsAffected" => 1}))
+
+          "/0/DataService/json/SyncReply/BatchQuery" ->
+            conn
+            |> put_resp_content_type("application/json")
+            |> send_resp(200, Jason.encode!(%{"responses" => []}))
+
+          "/0/DataService/json/SyncReply/GenericAction" ->
+            conn
+            |> put_resp_content_type("application/json")
+            |> send_resp(200, Jason.encode!(%{"success" => true}))
+        end
+      end
+
+      client_ds = Creatio.new(base_url: "https://mycreatio.com", req_options: [plug: query_plug])
+
+      assert {:ok, %{"id" => "inserted-id"}} = Creatio.insert_query(client_ds, %{})
+      assert %{"id" => "inserted-id"} = Creatio.insert_query!(client_ds, %{})
+
+      assert {:ok, %{"rowsAffected" => 1}} = Creatio.update_query(client_ds, %{})
+      assert %{"rowsAffected" => 1} = Creatio.update_query!(client_ds, %{})
+
+      assert {:ok, %{"rowsAffected" => 1}} = Creatio.delete_query(client_ds, %{})
+      assert %{"rowsAffected" => 1} = Creatio.delete_query!(client_ds, %{})
+
+      assert {:ok, %{"responses" => []}} = Creatio.batch_query(client_ds, %{})
+      assert %{"responses" => []} = Creatio.batch_query!(client_ds, %{})
+
+      assert {:ok, %{"success" => true}} =
+               Creatio.data_service_query(client_ds, "GenericAction", %{})
+
+      assert %{"success" => true} = Creatio.data_service_query!(client_ds, "GenericAction", %{})
     end
 
-    test "delegates OData3 functions" do
+    test "delegates OData3 functions including navigation, fields, and count" do
       plug = fn conn ->
         case {conn.method, conn.request_path} do
           {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection"} ->
@@ -175,6 +224,24 @@ defmodule CreatioTest do
             conn
             |> put_resp_content_type("application/json")
             |> send_resp(200, Jason.encode!(%{"d" => %{"Name" => "Legacy"}}))
+
+          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'1')/Account"} ->
+            conn
+            |> put_resp_content_type("application/json")
+            |> send_resp(200, Jason.encode!(%{"d" => %{"Name" => "Legacy Org"}}))
+
+          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'1')/Name"} ->
+            conn
+            |> put_resp_content_type("application/json")
+            |> send_resp(200, Jason.encode!(%{"d" => %{"Name" => "Legacy Name"}}))
+
+          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'1')/Name/$value"} ->
+            send_resp(conn, 200, "Raw Legacy Name")
+
+          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection/$count"} ->
+            conn
+            |> put_resp_content_type("text/plain")
+            |> send_resp(200, "99")
 
           {"POST", "/0/ServiceModel/EntityDataService.svc/ContactCollection"} ->
             conn
@@ -197,6 +264,23 @@ defmodule CreatioTest do
       assert {:ok, %{"Name" => "Legacy"}} = Creatio.odata3_get(client, "Contact", "1")
       assert %{"Name" => "Legacy"} = Creatio.odata3_get!(client, "Contact", "1")
 
+      assert {:ok, %{"Name" => "Legacy Org"}} =
+               Creatio.odata3_get_navigation(client, "Contact", "1", "Account")
+
+      assert %{"Name" => "Legacy Org"} =
+               Creatio.odata3_get_navigation!(client, "Contact", "1", "Account")
+
+      assert {:ok, "Legacy Name"} = Creatio.odata3_get_field(client, "Contact", "1", "Name")
+      assert "Legacy Name" = Creatio.odata3_get_field!(client, "Contact", "1", "Name")
+
+      assert {:ok, "Raw Legacy Name"} =
+               Creatio.odata3_get_field_value(client, "Contact", "1", "Name")
+
+      assert "Raw Legacy Name" = Creatio.odata3_get_field_value!(client, "Contact", "1", "Name")
+
+      assert {:ok, 99} = Creatio.odata3_count(client, "Contact")
+      assert 99 = Creatio.odata3_count!(client, "Contact")
+
       assert {:ok, %{"Id" => "new-1"}} =
                Creatio.odata3_create(client, "Contact", %{"Name" => "Legacy"})
 
@@ -208,6 +292,36 @@ defmodule CreatioTest do
 
       assert :ok = Creatio.odata3_delete(client, "Contact", "1")
       assert :ok = Creatio.odata3_delete!(client, "Contact", "1")
+
+      # Batch multipart helpers
+      b = Creatio.batch_new() |> Creatio.Batch.add_get("Contact", "1")
+      {boundary, _body} = Creatio.batch_to_multipart(b)
+      assert is_binary(boundary)
+
+      raw =
+        "--b\r\nContent-Type: application/http\r\n\r\nHTTP/1.1 200 OK\r\nContent-ID: 1\r\n\r\nOK\r\n--b--\r\n"
+
+      assert {:ok, [res]} = Creatio.batch_parse_multipart(raw, "b")
+      assert res.status == 200
+
+      # OData3 Stream delegation
+      stream_plug = fn conn ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          200,
+          Jason.encode!(%{"d" => %{"results" => [%{"Name" => "Item1"}]}})
+        )
+      end
+
+      stream_client =
+        Creatio.new(base_url: "https://mycreatio.com", req_options: [plug: stream_plug])
+
+      assert [%{"Name" => "Item1"}] =
+               Creatio.odata3_stream(stream_client, "Contact", page_size: 5) |> Enum.to_list()
+
+      assert [%{"Name" => "Item1"}] =
+               Creatio.odata3_stream!(stream_client, "Contact", page_size: 5) |> Enum.to_list()
     end
   end
 end
