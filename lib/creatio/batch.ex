@@ -220,6 +220,10 @@ defmodule Creatio.Batch do
     * `:format` - `:json` (default) or `:multipart`.
     * `:continue_on_error` - boolean. If `true`, sets `Prefer: continue-on-error`.
     * `:url` - Overrides endpoint URL (defaults to `"/0/odata/$batch"`).
+
+  When the client is in read-only mode (`client.read_only == true`), batches containing
+  mutation requests (POST, PATCH, PUT, DELETE) or binary batch payloads are rejected with
+  `{:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}}`.
   """
   @spec execute(Client.t() | Req.Request.t(), t() | map() | list() | binary(), keyword()) ::
           {:ok, [Response.t()]} | {:error, Error.t()}

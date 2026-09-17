@@ -52,7 +52,12 @@ defmodule Creatio.MixProject do
   defp docs do
     [
       main: "readme",
-      extras: ["README.md"]
+      extras: [
+        "README.md",
+        "docs/CREATIO_API_INTEGRATION.md",
+        "docs/USE_CASES_SYNCING_USERS.md",
+        "LICENSE"
+      ]
     ]
   end
 end

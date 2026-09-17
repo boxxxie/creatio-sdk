@@ -359,6 +359,7 @@ defmodule Creatio.OData3 do
   ## Options
 
     * `:page_size` - Records per request (default `100`).
+    * `:skip` - Initial offset to begin streaming from (default: `0`).
     * `:select` - List or string of fields to retrieve.
     * `:filter` - Filter expression.
     * `:orderby` - Ordering expression.

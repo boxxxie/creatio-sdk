@@ -644,6 +644,7 @@ defmodule Creatio.OData do
   ## Options
 
     * `:page_size` - Number of records per page (default: 100).
+    * `:skip` - Initial offset to begin streaming from (default: 0).
     * `:select` - Fields to select.
     * `:filter` - Filter expression.
     * `:orderby` - Ordering expression.

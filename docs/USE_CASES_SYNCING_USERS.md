@@ -16,25 +16,33 @@ base_url = System.fetch_env!("CREATIO_BASE_URL")
 username = System.fetch_env!("CREATIO_USERNAME")
 password = System.fetch_env!("CREATIO_PASSWORD")
 
-# Initialize client
+# Initialize client (enable read_only: true as defense-in-depth for ingestion-only syncs)
 client = Creatio.Client.new(
   base_url: base_url,
-  auth_mode: :forms
+  auth_mode: :forms,
+  read_only: true
 )
 
 # Authenticate (This obtains the necessary auth cookies, like BPMCSRF)
 {:ok, client} = Creatio.Auth.login_forms(client, username, password)
 ```
 
+> **Defense-in-Depth Tip**: Setting `read_only: true` (or setting the `CREATIO_READ_ONLY=true` environment variable) ensures your worker process can never accidentally write, update, or delete data on the remote Creatio instance. Any inadvertent mutation will immediately return a structured `{:error, %Creatio.Error{code: "ReadOnlyMode", status: 403}}`.
+
 ## 2. Initial Full Backfill (Streaming)
 
 When pulling a large amount of data (e.g., thousands of Contacts), it's dangerous to fetch them all at once into memory. Creatio caps responses to limit overhead. To handle this, use the SDK's `Creatio.stream/3` which provides **OData lazy streaming pagination**.
 
-Using Elixir Streams, we can process pages of Contacts iteratively, inserting them into our DB as they arrive.
+Using Elixir Streams, we can process pages of Contacts iteratively, inserting them into our DB as they arrive. If an initial backfill is interrupted, you can pass `:skip` to resume streaming from the last synced record count.
 
 ```elixir
+# Resume from last checkpoint if needed
+last_processed_count = MyApp.SyncProgress.get_last_offset() || 0
+
 # Stream Contacts from Creatio in chunks (e.g., 100 per page)
 contacts_stream = Creatio.stream(client, "Contact",
+  page_size: 100,
+  skip: last_processed_count,
   select: "Id,Name,Email,ModifiedOn,AccountId",
   expand: "Account($select=Id,Name)" # Eager-load the related Account!
 )
@@ -100,7 +108,8 @@ defmodule MyApp.Workers.CreatioDeltaSync do
   defp get_authenticated_client() do
     client = Creatio.Client.new(
       base_url: System.get_env("CREATIO_BASE_URL"),
-      auth_mode: :forms
+      auth_mode: :forms,
+      read_only: true
     )
     {:ok, client} = Creatio.Auth.login_forms(
       client,

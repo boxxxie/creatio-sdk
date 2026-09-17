@@ -16,6 +16,12 @@ Creatio (formerly bpm'online) is used as an authoritative source of truth for:
 
 The integration with Creatio is typically read-heavy, pulling contact and account records into external client applications while maintaining local platform state.
 
+### Defense-in-Depth: Read-Only Client Mode
+When using Creatio strictly as a read-replica or data source, the SDK supports configuring `read_only: true` (or via environment variable `CREATIO_READ_ONLY=true`). In this mode:
+* Read queries (`list`, `get`, `count`, `select_query`) function normally.
+* Mutations (`create`, `update`, `delete`, field updates, mutating batches, DataService writes) are blocked locally, returning `{:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}}`.
+* Network requests for any mutation methods (`POST`, `PATCH`, `PUT`, `DELETE` outside of safe auth and `SelectQuery` paths) are rejected by a client-level HTTP middleware guard.
+
 ## API Protocol
 Creatio exposes data via the **OData 4** (Open Data Protocol) standard.
 *   **Base OData 4 Endpoint:** `{CreatioURL}/0/odata/{ObjectName}`
@@ -73,6 +79,8 @@ Creatio limits the number of records returned per request. Use `$top` and `$skip
 GET {{BaseURI}}/0/odata/Contact?$top=100&$skip=200
 ```
 *(Note: OData 4 in Creatio does not support the `in` operator; use multiple `or` conditions instead).*
+
+In the SDK, `Creatio.stream(client, "Contact", page_size: 100, skip: 200)` automates this with lazy Elixir streams and supports an initial `:skip` offset for resuming interrupted queries.
 
 **Batch Requests:**
 Creatio supports OData batching via `/0/odata/$batch` using multipart MIME bodies or JSON batch format.

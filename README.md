@@ -15,20 +15,23 @@ Built on top of [Req](https://github.com/wojtekmach/req), `Creatio` provides a c
   - **OAuth 2.0**: Client credentials grant against Creatio Identity Service (`/connect/token`).
   - **Forms Authentication**: Session cookies (`.ASPXAUTH`, `BPMLOADER`) with automatic `BPMCSRF` extraction and URI decoding.
   - **OAuth Health Checks**: Endpoint checking (`/0/api/OAuthHealthCheck`) and OpenID configuration discovery.
+- **Defense-in-Depth Read-Only Mode**:
+  - Enforce read-only safety at the client level (`read_only: true` or `CREATIO_READ_ONLY=true`).
+  - Locally blocks mutation operations (`create`, `update`, `delete`, field mutations, mutating batches, and DataService writes) with structured 403 `ReadOnlyMode` errors.
 - **OData 4 Support** (`/0/odata/`):
   - Collection listing with `$select`, `$filter`, `$orderby`, `$top`, `$skip`, `$expand`, and inline `$count`.
   - CRUD operations (`create`, `get`, `update`, `delete`).
   - Field-level operations and scalar `$value` access.
   - Binary stream / file uploads via `PUT` with `application/octet-stream`.
   - Composable **Query Builder** (`Creatio.OData.Query`).
-  - Lazy auto-paginated streaming (`Creatio.stream/3`).
+  - Lazy auto-paginated streaming (`Creatio.stream/3`) with configurable page sizes and initial `:skip` offsets.
 - **OData 4 Batch Operations** (`/0/odata/$batch`):
   - Full support for JSON batch requests, atomicity groups (changesets), and `Prefer: continue-on-error`.
 - **DataService API**:
   - Direct execution of Creatio `SelectQuery` payloads.
   - Calling custom REST services (`/0/rest/...`).
 - **OData 3 Support**:
-  - Legacy `EntityDataService.svc` endpoint compatibility.
+  - Legacy `EntityDataService.svc` endpoint compatibility with streaming support.
 - **Test-Ready**:
   - Easily mockable using standard `Req` plug options (`req_options: [plug: ...]`).
 
@@ -41,7 +44,7 @@ Add `creatio` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:creatio, "~> 0.1.0"}
+    {:creatio, "~> 0.3.1"}
   ]
 end
 ```
@@ -66,13 +69,62 @@ Initialize a client by specifying your Creatio base URL:
 client = Creatio.new(base_url: "https://myinstance.creatio.com")
 ```
 
-You can also configure global defaults in `config/config.exs`:
+You can also configure global defaults in `config/config.exs` or via environment variables:
 
 ```elixir
 config :creatio,
   base_url: "https://myinstance.creatio.com",
-  auth_token: System.get_env("CREATIO_BEARER_TOKEN")
+  auth_token: System.get_env("CREATIO_BEARER_TOKEN"),
+  read_only: System.get_env("CREATIO_READ_ONLY") in ["true", "1"]
 ```
+
+### Client Options
+
+| Option | Env Var | Description |
+| :--- | :--- | :--- |
+| `:base_url` | `CREATIO_BASE_URL` | Base URL of your Creatio CRM instance |
+| `:auth_token` | `CREATIO_AUTH_TOKEN` / `CREATIO_BEARER_TOKEN` | Bearer access token for OAuth 2.0 |
+| `:identity_service_url` | `CREATIO_IDENTITY_URL` / `CREATIO_IDENTITY_SERVICE_URL` | Identity Service URL |
+| `:client_id` | `CREATIO_CLIENT_ID` | OAuth 2.0 client ID |
+| `:client_secret` | `CREATIO_CLIENT_SECRET` | OAuth 2.0 client secret |
+| `:read_only` | `CREATIO_READ_ONLY` | Defense-in-depth read-only mode (`true` or `false`) |
+| `:cookie` | - | Session cookie string for Forms auth |
+| `:bpmcsrf` | - | CSRF token string for Forms auth |
+| `:req_options` | - | Custom options forwarded to `Req.new/1` (e.g., plugs, retries) |
+
+---
+
+## Defense-in-Depth Read-Only Mode
+
+When performing data migrations, read replicas, analytics pipelines, or background synchronization jobs, you can enforce strict read-only safety to mathematically guarantee that your application never mutates production CRM records:
+
+```elixir
+# Explicitly initialize in read-only mode:
+client = Creatio.new(
+  base_url: "https://myinstance.creatio.com",
+  read_only: true
+)
+
+# Queries and read operations succeed normally:
+{:ok, contacts} = Creatio.list(client, "Contact")
+{:ok, count} = Creatio.count(client, "Contact")
+{:ok, res} = Creatio.select_query(client, %{"RootSchemaName" => "Contact"})
+
+# Any mutation is intercepted locally before sending over the network:
+{:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}} =
+  Creatio.create(client, "Contact", %{"Name" => "Test"})
+
+{:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}} =
+  Creatio.update(client, "Contact", contact_id, %{"JobTitle" => "VP"})
+
+{:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}} =
+  Creatio.delete(client, "Contact", contact_id)
+```
+
+Read-only mode enforcement includes:
+- **SDK-level guards**: `create/4`, `update/5`, `delete/4`, `update_field/6`, `delete_field/5`, and DataService `insert_query/3`, `update_query/3`, `delete_query/3` fail immediately without dispatching HTTP requests.
+- **Batch validation**: Batches with mutation operations (`POST`, `PATCH`, `PUT`, `DELETE`) or binary batch requests are rejected.
+- **HTTP request-step middleware**: An appended Req request step blocks any raw mutation HTTP requests from leaving the client, while explicitly allowing safe paths (`/SelectQuery`, `/Login`, `/token`, `/AuthService.svc/Login`).
 
 ---
 
@@ -158,6 +210,24 @@ Stream records without loading all results into memory at once:
 Creatio.stream(client, "Contact", page_size: 100, select: ["Id", "Name"])
 |> Stream.filter(fn contact -> contact["Name"] != nil end)
 |> Enum.take(500)
+```
+
+#### Resuming Streams with Initial Skip Offset
+
+`Creatio.stream/3` and `Creatio.odata3_stream/3` accept an initial `:skip` offset, making it easy to resume interrupted background syncs or stream data in partition windows:
+
+```elixir
+# Resume streaming from offset 1,000
+Creatio.stream(client, "Contact", page_size: 100, skip: 1000, select: ["Id", "Name"])
+|> Enum.take(200)
+
+# Or combine directly with the Query builder
+query =
+  Creatio.query("Contact")
+  |> Creatio.OData.Query.select(["Id", "Name"])
+  |> Creatio.OData.Query.skip(500)
+
+Creatio.stream(client, query, page_size: 100)
 ```
 
 ### CRUD Operations
@@ -265,7 +335,7 @@ Creatio.odata3_stream(client, "Contact", page_size: 100)
 
 ## API Reference & Postman Collection
 
-Comprehensive API documentation and resources are available in the [`docs/`](docs/) directory:
+Comprehensive API documentation and resources are available in the `docs/` directory:
 
 - [Creatio API & Integration Guide](docs/CREATIO_API_INTEGRATION.md) — Authentication flows, OData 4 protocol endpoints, and entity mapping reference.
 - [Syncing Creatio Users Guide](docs/USE_CASES_SYNCING_USERS.md) — A step-by-step tutorial on building a resilient sync engine between Creatio and a local database.

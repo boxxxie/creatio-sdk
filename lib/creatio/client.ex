@@ -3,7 +3,7 @@ defmodule Creatio.Client do
   Client struct and configuration for communicating with Creatio CRM APIs.
 
   Wraps a `Req.Request` pre-configured with the base URL, authentication headers,
-  and content negotiation required by Creatio.
+  read-only safety guards, and content negotiation required by Creatio.
   """
 
   @enforce_keys [:base_url]
@@ -49,6 +49,7 @@ defmodule Creatio.Client do
     * `:identity_service_url` - Identity service base URL for OAuth 2.0.
     * `:client_id` - OAuth 2.0 client ID.
     * `:client_secret` - OAuth 2.0 client secret.
+    * `:read_only` - If `true`, enables defense-in-depth read-only mode to prevent mutation requests (defaults to `false`, or `Application.get_env(:creatio, :read_only)`, or `CREATIO_READ_ONLY` env var).
     * `:req_options` - Extra keyword options forwarded to `Req.new/1` (e.g. `:plug`, `:retry`, etc.).
   """
   @spec new(keyword() | map() | Req.Request.t()) :: t()

@@ -44,6 +44,8 @@ defmodule Creatio.DataService do
 
   @doc """
   Executes an InsertQuery against `/0/DataService/json/SyncReply/InsertQuery`.
+
+  Returns `{:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}}` if the client is in read-only mode.
   """
   @spec insert_query(Client.t() | Req.Request.t(), map(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
@@ -68,6 +70,8 @@ defmodule Creatio.DataService do
 
   @doc """
   Executes an UpdateQuery against `/0/DataService/json/SyncReply/UpdateQuery`.
+
+  Returns `{:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}}` if the client is in read-only mode.
   """
   @spec update_query(Client.t() | Req.Request.t(), map(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
@@ -92,6 +96,8 @@ defmodule Creatio.DataService do
 
   @doc """
   Executes a DeleteQuery against `/0/DataService/json/SyncReply/DeleteQuery`.
+
+  Returns `{:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}}` if the client is in read-only mode.
   """
   @spec delete_query(Client.t() | Req.Request.t(), map(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}

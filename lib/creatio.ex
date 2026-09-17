@@ -39,9 +39,21 @@ defmodule Creatio do
 
   ### Streaming / Auto-pagination
 
-      # Seamlessly iterates over pages of records using $top and $skip
-      Creatio.stream(client, "Contact", page_size: 100, select: ["Id", "Name"])
+      # Seamlessly iterates over pages of records using $top and $skip,
+      # with optional initial :skip offset for resuming syncs
+      Creatio.stream(client, "Contact", page_size: 100, skip: 500, select: ["Id", "Name"])
       |> Enum.take(250)
+
+  ### Read-Only Safety Mode
+
+      # Protect production CRM data by enforcing client-side read-only mode
+      client = Creatio.new(base_url: "https://myinstance.creatio.com", read_only: true)
+
+      # Queries succeed normally:
+      {:ok, contacts} = Creatio.list(client, "Contact")
+
+      # All mutation attempts are blocked locally with status 403 / "ReadOnlyMode":
+      {:error, %Creatio.Error{code: "ReadOnlyMode"}} = Creatio.create(client, "Contact", %{"Name" => "Jane"})
 
   ### Batch Operations
 
@@ -68,6 +80,7 @@ defmodule Creatio do
     * `:identity_service_url` - Base URL for Creatio Identity Service.
     * `:client_id` - OAuth 2.0 client ID.
     * `:client_secret` - OAuth 2.0 client secret.
+    * `:read_only` - If `true`, enables defense-in-depth read-only mode to prevent mutation requests (defaults to `false`, or `Application.get_env(:creatio, :read_only)`, or `CREATIO_READ_ONLY` env var).
     * `:req_options` - Extra options passed directly to `Req.new/1`.
   """
   defdelegate new(opts \\ []), to: Client
@@ -266,7 +279,16 @@ defmodule Creatio do
   defdelegate batch!(client, batch_or_requests, opts \\ []), to: OData
 
   @doc """
-  Returns a lazy `Stream` that paginates through records of an entity.
+  Returns a lazy `Stream` that paginates through records of an entity or query.
+
+  ## Options
+
+    * `:page_size` - Number of records per request (default: 100).
+    * `:skip` - Initial offset to begin streaming from (default: 0).
+    * `:select` - List of fields or comma-separated string to retrieve.
+    * `:filter` - OData filter expression string.
+    * `:orderby` - Ordering expression string.
+    * `:expand` - Relations to expand.
   """
   def stream(query_or_entity, client, opts \\ [])
   def stream(%Creatio.OData.Query{} = query, client, opts), do: OData.stream(client, query, opts)
@@ -472,6 +494,15 @@ defmodule Creatio do
 
   @doc """
   Returns a lazy `Stream` that paginates through records of a legacy OData 3 entity collection.
+
+  ## Options
+
+    * `:page_size` - Records per request (default: 100).
+    * `:skip` - Initial offset to begin streaming from (default: 0).
+    * `:select` - List or string of fields to retrieve.
+    * `:filter` - Filter expression.
+    * `:orderby` - Ordering expression.
+    * `:expand` - Relations to expand.
   """
   def odata3_stream(query_or_entity, client, opts \\ [])
 
