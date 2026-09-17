@@ -204,15 +204,6 @@ defmodule Creatio.Auth do
     parse_set_cookie_raw(set_cookie)
   end
 
-  defp extract_cookies(headers) when is_list(headers) do
-    set_cookie =
-      for {k, v} <- headers, String.downcase(to_string(k)) == "set-cookie", do: v
-
-    parse_set_cookie_raw(set_cookie)
-  end
-
-  defp extract_cookies(_), do: []
-
   defp parse_set_cookie_raw(raw) when is_binary(raw) do
     parse_set_cookie_raw([raw])
   end
@@ -254,20 +245,4 @@ defmodule Creatio.Auth do
       _ -> nil
     end
   end
-
-  defp extract_header_val(headers, name) when is_list(headers) do
-    target = String.downcase(name)
-
-    Enum.find_value(headers, fn
-      {k, val} ->
-        if String.downcase(to_string(k)) == target do
-          if is_list(val), do: List.first(val), else: val
-        end
-
-      _ ->
-        nil
-    end)
-  end
-
-  defp extract_header_val(_, _), do: nil
 end
