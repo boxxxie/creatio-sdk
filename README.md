@@ -208,23 +208,14 @@ end)
 
 ---
 
-## Moving into its own repository
+## API Reference & Postman Collection
 
-This SDK is fully self-contained in its own directory with independent `mix.exs`, documentation, test suite, and license.
+Comprehensive API documentation and resources are available in the [`docs/`](docs/) directory:
 
-To extract it into its own Git repository:
-
-```bash
-# Option A: Copy folder to a new repo
-cp -r creatio/ /path/to/new-creatio-repo
-cd /path/to/new-creatio-repo
-git init
-git add .
-git commit -m "feat: initial commit of Creatio Elixir SDK"
-
-# Option B: Git subtree split
-git subtree push --prefix=creatio git@gitlab.nvestiv.com:caasa/creatio.git master
-```
+- [Creatio API & Integration Guide](docs/CREATIO_API_INTEGRATION.md) — Authentication flows, OData 4 protocol endpoints, and entity mapping reference.
+- [Postman Collection v2.0](docs/creatio_api_collection.json) — Full 1.8 MB offline Postman collection covering all Creatio endpoints (OAuth 2.0, OData 4 CRUD, streaming, batching, and OData 3).
+- [Online Creatio Postman Documentation](https://documenter.getpostman.com/view/10204500/SztHX5Qb?version=latest)
+- [Official Postman Environment](https://academy.creatio.com/sites/default/files/documents/downloads/SDK/Creatio.postman_environment.zip)
 
 ---
 
