@@ -1,0 +1,39 @@
+image: elixir:1.15
+
+stages:
+  - test
+  - analyze
+
+variables:
+  MIX_ENV: test
+
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - deps/
+    - _build/
+
+before_script:
+  - mix local.hex --force
+  - mix local.rebar --force
+  - mix deps.get
+
+test:
+  stage: test
+  script:
+    - mix test
+
+format:
+  stage: analyze
+  script:
+    - mix format --check-formatted
+
+credo:
+  stage: analyze
+  script:
+    - mix credo --strict
+
+dialyzer:
+  stage: analyze
+  script:
+    - mix dialyzer

@@ -28,7 +28,9 @@ defmodule Creatio.MixProject do
       {:req, ">= 0.5.0"},
       {:jason, "~> 1.4"},
       {:plug, "~> 1.15", only: :test},
-      {:ex_doc, "~> 0.31", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.31", only: :dev, runtime: false},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
     ]
   end
 
