@@ -48,7 +48,12 @@ defmodule Creatio.DataService do
   @spec insert_query(Client.t() | Req.Request.t(), map(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def insert_query(client_or_req, query_payload, opts \\ []) do
-    execute_query(client_or_req, "InsertQuery", query_payload, opts)
+    client = Client.ensure_client(client_or_req)
+    if client.read_only do
+      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode")}
+    else
+      execute_query(client, "InsertQuery", query_payload, opts)
+    end
   end
 
   @doc """
@@ -67,7 +72,12 @@ defmodule Creatio.DataService do
   @spec update_query(Client.t() | Req.Request.t(), map(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def update_query(client_or_req, query_payload, opts \\ []) do
-    execute_query(client_or_req, "UpdateQuery", query_payload, opts)
+    client = Client.ensure_client(client_or_req)
+    if client.read_only do
+      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode")}
+    else
+      execute_query(client, "UpdateQuery", query_payload, opts)
+    end
   end
 
   @doc """
@@ -86,7 +96,12 @@ defmodule Creatio.DataService do
   @spec delete_query(Client.t() | Req.Request.t(), map(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def delete_query(client_or_req, query_payload, opts \\ []) do
-    execute_query(client_or_req, "DeleteQuery", query_payload, opts)
+    client = Client.ensure_client(client_or_req)
+    if client.read_only do
+      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode")}
+    else
+      execute_query(client, "DeleteQuery", query_payload, opts)
+    end
   end
 
   @doc """

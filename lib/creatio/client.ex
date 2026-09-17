@@ -17,6 +17,7 @@ defmodule Creatio.Client do
     :client_id,
     :client_secret,
     :req,
+    read_only: false,
     options: []
   ]
 
@@ -30,6 +31,7 @@ defmodule Creatio.Client do
           client_id: String.t() | nil,
           client_secret: String.t() | nil,
           req: Req.Request.t(),
+          read_only: boolean(),
           options: keyword()
         }
 
@@ -89,6 +91,18 @@ defmodule Creatio.Client do
 
     req_options = Keyword.get(opts, :req_options, [])
 
+    read_only =
+      Keyword.get(opts, :read_only)
+      |> case do
+        nil ->
+          Application.get_env(:creatio, :read_only)
+          |> case do
+            nil -> System.get_env("CREATIO_READ_ONLY") in ["true", "1"]
+            val -> val
+          end
+        val -> val
+      end
+
     auth_mode =
       cond do
         auth_token -> :bearer
@@ -114,6 +128,7 @@ defmodule Creatio.Client do
       identity_service_url: identity_service_url,
       client_id: client_id,
       client_secret: client_secret,
+      read_only: read_only,
       options: opts,
       req: req
     }
@@ -132,6 +147,18 @@ defmodule Creatio.Client do
       Keyword.get(opts_list, :base_url) || req.options[:base_url] ||
         System.get_env("CREATIO_BASE_URL") || ""
 
+    read_only =
+      Keyword.get(opts_list, :read_only)
+      |> case do
+        nil ->
+          Application.get_env(:creatio, :read_only)
+          |> case do
+            nil -> System.get_env("CREATIO_READ_ONLY") in ["true", "1"]
+            val -> val
+          end
+        val -> val
+      end
+
     configured_req =
       req
       |> Req.Request.put_header("accept", "application/json; odata.metadata=minimal")
@@ -146,6 +173,7 @@ defmodule Creatio.Client do
       identity_service_url: Keyword.get(opts_list, :identity_service_url),
       client_id: Keyword.get(opts_list, :client_id),
       client_secret: Keyword.get(opts_list, :client_secret),
+      read_only: read_only,
       req: configured_req,
       options: opts_list
     }
@@ -199,7 +227,39 @@ defmodule Creatio.Client do
       |> maybe_put_header("cookie", client.cookie)
       |> maybe_put_header("bpmcsrf", client.bpmcsrf)
 
+    req =
+      if client.read_only do
+        Req.Request.append_request_steps(req, read_only_guard: &read_only_guard/1)
+      else
+        req
+      end
+
     %{client | req: req}
+  end
+
+  defp read_only_guard(req) do
+    if req.method in [:get, :head, :options] do
+      req
+    else
+      path =
+        case URI.parse(req.url |> to_string()) do
+          %URI{path: nil} -> ""
+          %URI{path: p} -> p
+        end
+
+      allowed_paths = ["/SelectQuery", "/Login", "/token", "/$batch", "/AuthService.svc/Login"]
+
+      if Enum.any?(allowed_paths, &String.ends_with?(path, &1)) do
+        req
+      else
+        {req,
+         Creatio.Error.new(
+           status: 403,
+           code: "ReadOnlyMode",
+           message: "Client is in read-only mode. Mutation request to #{path} blocked."
+         )}
+      end
+    end
   end
 
   defp maybe_put_header(req, _name, nil), do: req

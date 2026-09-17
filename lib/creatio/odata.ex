@@ -380,25 +380,30 @@ defmodule Creatio.OData do
           {:ok, map()} | {:error, Error.t()}
   def create(client_or_req, entity, attrs, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    url = "/0/odata/#{entity}"
 
-    req =
-      client.req
-      |> Req.Request.put_header("content-type", @default_content_type)
-      |> Req.Request.put_header("forceusesession", "true")
+    if client.read_only do
+      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode")}
+    else
+      url = "/0/odata/#{entity}"
 
-    case Req.post(req, url: url, json: attrs, params: normalize_params(opts)) do
-      {:ok, %{status: 201, body: body}} ->
-        {:ok, body}
+      req =
+        client.req
+        |> Req.Request.put_header("content-type", @default_content_type)
+        |> Req.Request.put_header("forceusesession", "true")
 
-      {:ok, %{status: 200, body: body}} ->
-        {:ok, body}
+      case Req.post(req, url: url, json: attrs, params: normalize_params(opts)) do
+        {:ok, %{status: 201, body: body}} ->
+          {:ok, body}
 
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
+        {:ok, %{status: 200, body: body}} ->
+          {:ok, body}
 
-      {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        {:ok, %Req.Response{} = resp} ->
+          {:error, Error.from_response(resp)}
+
+        {:error, exception} ->
+          {:error, Error.new(message: Exception.message(exception), details: exception)}
+      end
     end
   end
 
@@ -419,26 +424,31 @@ defmodule Creatio.OData do
           :ok | {:ok, map()} | {:error, Error.t()}
   def update(client_or_req, entity, id, attrs, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    clean = clean_id(id)
-    url = "/0/odata/#{entity}(#{clean})"
 
-    req =
-      client.req
-      |> Req.Request.put_header("content-type", @default_content_type)
-      |> Req.Request.put_header("forceusesession", "true")
+    if client.read_only do
+      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode")}
+    else
+      clean = clean_id(id)
+      url = "/0/odata/#{entity}(#{clean})"
 
-    case Req.patch(req, url: url, json: attrs, params: normalize_params(opts)) do
-      {:ok, %{status: 204}} ->
-        :ok
+      req =
+        client.req
+        |> Req.Request.put_header("content-type", @default_content_type)
+        |> Req.Request.put_header("forceusesession", "true")
 
-      {:ok, %{status: 200, body: body}} ->
-        {:ok, body}
+      case Req.patch(req, url: url, json: attrs, params: normalize_params(opts)) do
+        {:ok, %{status: 204}} ->
+          :ok
 
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
+        {:ok, %{status: 200, body: body}} ->
+          {:ok, body}
 
-      {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        {:ok, %Req.Response{} = resp} ->
+          {:error, Error.from_response(resp)}
+
+        {:error, exception} ->
+          {:error, Error.new(message: Exception.message(exception), details: exception)}
+      end
     end
   end
 
@@ -460,25 +470,30 @@ defmodule Creatio.OData do
           :ok | {:error, Error.t()}
   def delete(client_or_req, entity, id, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    clean = clean_id(id)
-    url = "/0/odata/#{entity}(#{clean})"
 
-    req =
-      client.req
-      |> Req.Request.put_header("forceusesession", "true")
+    if client.read_only do
+      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode")}
+    else
+      clean = clean_id(id)
+      url = "/0/odata/#{entity}(#{clean})"
 
-    case Req.delete(req, url: url, params: normalize_params(opts)) do
-      {:ok, %{status: 204}} ->
-        :ok
+      req =
+        client.req
+        |> Req.Request.put_header("forceusesession", "true")
 
-      {:ok, %{status: 200}} ->
-        :ok
+      case Req.delete(req, url: url, params: normalize_params(opts)) do
+        {:ok, %{status: 204}} ->
+          :ok
 
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
+        {:ok, %{status: 200}} ->
+          :ok
 
-      {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        {:ok, %Req.Response{} = resp} ->
+          {:error, Error.from_response(resp)}
+
+        {:error, exception} ->
+          {:error, Error.new(message: Exception.message(exception), details: exception)}
+      end
     end
   end
 
@@ -506,38 +521,43 @@ defmodule Creatio.OData do
           :ok | {:error, Error.t()}
   def update_field(client_or_req, entity, id, field_name, value, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    clean = clean_id(id)
-    url = "/0/odata/#{entity}(#{clean})/#{field_name}"
 
-    {body_payload, default_ct} =
-      cond do
-        is_map(value) or (is_list(value) and not is_nil(value)) ->
-          {Jason.encode!(value), "application/json; IEEE754Compatible=true"}
+    if client.read_only do
+      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode")}
+    else
+      clean = clean_id(id)
+      url = "/0/odata/#{entity}(#{clean})/#{field_name}"
 
-        is_boolean(value) or is_number(value) or is_atom(value) ->
-          {Jason.encode!(%{"value" => value}), "application/json; IEEE754Compatible=true"}
+      {body_payload, default_ct} =
+        cond do
+          is_map(value) or (is_list(value) and not is_nil(value)) ->
+            {Jason.encode!(value), "application/json; IEEE754Compatible=true"}
 
-        true ->
-          {value, "application/octet-stream; IEEE754Compatible=true"}
+          is_boolean(value) or is_number(value) or is_atom(value) ->
+            {Jason.encode!(%{"value" => value}), "application/json; IEEE754Compatible=true"}
+
+          true ->
+            {value, "application/octet-stream; IEEE754Compatible=true"}
+        end
+
+      content_type = Keyword.get(opts, :content_type, default_ct)
+
+      req =
+        client.req
+        |> Req.Request.put_header("accept", "application/json; text/plain; */*")
+        |> Req.Request.put_header("content-type", content_type)
+        |> Req.Request.put_header("forceusesession", "true")
+
+      case Req.put(req, url: url, body: body_payload) do
+        {:ok, %{status: status}} when status in [200, 201, 204] ->
+          :ok
+
+        {:ok, %Req.Response{} = resp} ->
+          {:error, Error.from_response(resp)}
+
+        {:error, exception} ->
+          {:error, Error.new(message: Exception.message(exception), details: exception)}
       end
-
-    content_type = Keyword.get(opts, :content_type, default_ct)
-
-    req =
-      client.req
-      |> Req.Request.put_header("accept", "application/json; text/plain; */*")
-      |> Req.Request.put_header("content-type", content_type)
-      |> Req.Request.put_header("forceusesession", "true")
-
-    case Req.put(req, url: url, body: body_payload) do
-      {:ok, %{status: status}} when status in [200, 201, 204] ->
-        :ok
-
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
-
-      {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
     end
   end
 
@@ -558,30 +578,35 @@ defmodule Creatio.OData do
           :ok | {:error, Error.t()}
   def delete_field(client_or_req, entity, id, field_name, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    clean = clean_id(id)
-    url = "/0/odata/#{entity}(#{clean})/#{field_name}"
 
-    req =
-      client.req
-      |> Req.Request.put_header("accept", "application/json; text/plain; */*")
-      |> Req.Request.put_header(
-        "content-type",
-        "application/octet-stream; IEEE754Compatible=true"
-      )
-      |> Req.Request.put_header("forceusesession", "true")
+    if client.read_only do
+      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode")}
+    else
+      clean = clean_id(id)
+      url = "/0/odata/#{entity}(#{clean})/#{field_name}"
 
-    case Req.delete(req, url: url, params: normalize_params(opts)) do
-      {:ok, %{status: 204}} ->
-        :ok
+      req =
+        client.req
+        |> Req.Request.put_header("accept", "application/json; text/plain; */*")
+        |> Req.Request.put_header(
+          "content-type",
+          "application/octet-stream; IEEE754Compatible=true"
+        )
+        |> Req.Request.put_header("forceusesession", "true")
 
-      {:ok, %{status: 200}} ->
-        :ok
+      case Req.delete(req, url: url, params: normalize_params(opts)) do
+        {:ok, %{status: 204}} ->
+          :ok
 
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
+        {:ok, %{status: 200}} ->
+          :ok
 
-      {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        {:ok, %Req.Response{} = resp} ->
+          {:error, Error.from_response(resp)}
+
+        {:error, exception} ->
+          {:error, Error.new(message: Exception.message(exception), details: exception)}
+      end
     end
   end
 

@@ -227,18 +227,23 @@ defmodule Creatio.Batch do
 
   def execute(client_or_req, %__MODULE__{} = batch, opts) do
     client = Client.ensure_client(client_or_req)
-    url = Keyword.get(opts, :url, "/0/odata/$batch")
-    format = Keyword.get(opts, :format, :json)
 
-    continue_on_error =
-      batch.continue_on_error or Keyword.get(opts, :continue_on_error, false)
+    if client.read_only and Enum.any?(batch.requests, fn r -> String.upcase(r["method"] || "GET") not in ["GET", "HEAD", "OPTIONS"] end) do
+      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode. Batch contains mutation requests.")}
+    else
+      url = Keyword.get(opts, :url, "/0/odata/$batch")
+      format = Keyword.get(opts, :format, :json)
 
-    case format do
-      :multipart ->
-        execute_multipart(client, batch, url, continue_on_error, opts)
+      continue_on_error =
+        batch.continue_on_error or Keyword.get(opts, :continue_on_error, false)
 
-      _ ->
-        execute_json(client, batch, url, continue_on_error)
+      case format do
+        :multipart ->
+          execute_multipart(client, batch, url, continue_on_error, opts)
+
+        _ ->
+          execute_json(client, batch, url, continue_on_error)
+      end
     end
   end
 
@@ -262,45 +267,50 @@ defmodule Creatio.Batch do
 
   def execute(client_or_req, body, opts) when is_binary(body) do
     client = Client.ensure_client(client_or_req)
-    url = Keyword.get(opts, :url, "/0/odata/$batch")
 
-    boundary =
-      Keyword.get(opts, :boundary) ||
-        extract_boundary(body) ||
-        "batch_default"
+    if client.read_only do
+      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode. Binary batch requests are not supported in read-only mode.")}
+    else
+      url = Keyword.get(opts, :url, "/0/odata/$batch")
 
-    req =
-      client.req
-      |> Req.Request.put_header(
-        "content-type",
-        "multipart/mixed; boundary=#{boundary}; IEEE754Compatible=true"
-      )
-      |> Req.Request.put_header("accept", "application/json")
-      |> Req.Request.put_header("forceusesession", "true")
+      boundary =
+        Keyword.get(opts, :boundary) ||
+          extract_boundary(body) ||
+          "batch_default"
 
-    case Req.post(req, url: url, body: body) do
-      {:ok, %{status: 200, body: %{"responses" => _}} = resp} ->
-        parse_json_batch_response(resp)
+      req =
+        client.req
+        |> Req.Request.put_header(
+          "content-type",
+          "multipart/mixed; boundary=#{boundary}; IEEE754Compatible=true"
+        )
+        |> Req.Request.put_header("accept", "application/json")
+        |> Req.Request.put_header("forceusesession", "true")
 
-      {:ok, %{status: status, body: resp_body} = resp}
-      when status in 200..299 and is_binary(resp_body) ->
-        content_type = get_resp_content_type(resp)
-
-        if String.contains?(content_type, "multipart/mixed") do
-          resp_boundary = extract_boundary_from_header(content_type)
-          parse_multipart_response(resp_body, resp_boundary)
-        else
+      case Req.post(req, url: url, body: body) do
+        {:ok, %{status: 200, body: %{"responses" => _}} = resp} ->
           parse_json_batch_response(resp)
-        end
 
-      {:ok, %{status: status, body: %{}} = resp} when status in 200..299 ->
-        parse_json_batch_response(resp)
+        {:ok, %{status: status, body: resp_body} = resp}
+        when status in 200..299 and is_binary(resp_body) ->
+          content_type = get_resp_content_type(resp)
 
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
+          if String.contains?(content_type, "multipart/mixed") do
+            resp_boundary = extract_boundary_from_header(content_type)
+            parse_multipart_response(resp_body, resp_boundary)
+          else
+            parse_json_batch_response(resp)
+          end
 
-      {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        {:ok, %{status: status, body: %{}} = resp} when status in 200..299 ->
+          parse_json_batch_response(resp)
+
+        {:ok, %Req.Response{} = resp} ->
+          {:error, Error.from_response(resp)}
+
+        {:error, exception} ->
+          {:error, Error.new(message: Exception.message(exception), details: exception)}
+      end
     end
   end
 

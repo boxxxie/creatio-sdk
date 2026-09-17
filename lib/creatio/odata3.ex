@@ -463,33 +463,38 @@ defmodule Creatio.OData3 do
           {:ok, map()} | {:error, Error.t()}
   def create(client_or_req, entity, attrs, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    collection_name = collection_name(entity)
-    url = "#{@base_path}/#{collection_name}"
 
-    req =
-      client.req
-      |> Req.Request.put_header("content-type", "application/json; odata=verbose")
-      |> Req.Request.put_header("accept", "application/json; odata=verbose")
-      |> Req.Request.put_header("forceusesession", "true")
+    if client.read_only do
+      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode")}
+    else
+      collection_name = collection_name(entity)
+      url = "#{@base_path}/#{collection_name}"
 
-    case Req.post(req, url: url, json: attrs, params: normalize_params(opts)) do
-      {:ok, %{status: 201, body: %{"d" => record}}} ->
-        {:ok, record}
+      req =
+        client.req
+        |> Req.Request.put_header("content-type", "application/json; odata=verbose")
+        |> Req.Request.put_header("accept", "application/json; odata=verbose")
+        |> Req.Request.put_header("forceusesession", "true")
 
-      {:ok, %{status: 201, body: body}} ->
-        {:ok, body}
+      case Req.post(req, url: url, json: attrs, params: normalize_params(opts)) do
+        {:ok, %{status: 201, body: %{"d" => record}}} ->
+          {:ok, record}
 
-      {:ok, %{status: 200, body: %{"d" => record}}} ->
-        {:ok, record}
+        {:ok, %{status: 201, body: body}} ->
+          {:ok, body}
 
-      {:ok, %{status: 200, body: body}} ->
-        {:ok, body}
+        {:ok, %{status: 200, body: %{"d" => record}}} ->
+          {:ok, record}
 
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
+        {:ok, %{status: 200, body: body}} ->
+          {:ok, body}
 
-      {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        {:ok, %Req.Response{} = resp} ->
+          {:error, Error.from_response(resp)}
+
+        {:error, exception} ->
+          {:error, Error.new(message: Exception.message(exception), details: exception)}
+      end
     end
   end
 
@@ -510,31 +515,36 @@ defmodule Creatio.OData3 do
           :ok | {:ok, map()} | {:error, Error.t()}
   def update(client_or_req, entity, id, attrs, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    collection_name = collection_name(entity)
-    clean_id = clean_guid(id)
-    url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')"
 
-    req =
-      client.req
-      |> Req.Request.put_header("content-type", "application/json; odata=verbose")
-      |> Req.Request.put_header("accept", "application/json; odata=verbose")
-      |> Req.Request.put_header("forceusesession", "true")
+    if client.read_only do
+      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode")}
+    else
+      collection_name = collection_name(entity)
+      clean_id = clean_guid(id)
+      url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')"
 
-    case Req.patch(req, url: url, json: attrs, params: normalize_params(opts)) do
-      {:ok, %{status: 204}} ->
-        :ok
+      req =
+        client.req
+        |> Req.Request.put_header("content-type", "application/json; odata=verbose")
+        |> Req.Request.put_header("accept", "application/json; odata=verbose")
+        |> Req.Request.put_header("forceusesession", "true")
 
-      {:ok, %{status: 200, body: %{"d" => record}}} ->
-        {:ok, record}
+      case Req.patch(req, url: url, json: attrs, params: normalize_params(opts)) do
+        {:ok, %{status: 204}} ->
+          :ok
 
-      {:ok, %{status: 200, body: body}} ->
-        {:ok, body}
+        {:ok, %{status: 200, body: %{"d" => record}}} ->
+          {:ok, record}
 
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
+        {:ok, %{status: 200, body: body}} ->
+          {:ok, body}
 
-      {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        {:ok, %Req.Response{} = resp} ->
+          {:error, Error.from_response(resp)}
+
+        {:error, exception} ->
+          {:error, Error.new(message: Exception.message(exception), details: exception)}
+      end
     end
   end
 
@@ -556,26 +566,31 @@ defmodule Creatio.OData3 do
           :ok | {:error, Error.t()}
   def delete(client_or_req, entity, id, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    collection_name = collection_name(entity)
-    clean_id = clean_guid(id)
-    url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')"
 
-    req =
-      client.req
-      |> Req.Request.put_header("forceusesession", "true")
+    if client.read_only do
+      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode")}
+    else
+      collection_name = collection_name(entity)
+      clean_id = clean_guid(id)
+      url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')"
 
-    case Req.delete(req, url: url, params: normalize_params(opts)) do
-      {:ok, %{status: 204}} ->
-        :ok
+      req =
+        client.req
+        |> Req.Request.put_header("forceusesession", "true")
 
-      {:ok, %{status: 200}} ->
-        :ok
+      case Req.delete(req, url: url, params: normalize_params(opts)) do
+        {:ok, %{status: 204}} ->
+          :ok
 
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
+        {:ok, %{status: 200}} ->
+          :ok
 
-      {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        {:ok, %Req.Response{} = resp} ->
+          {:error, Error.from_response(resp)}
+
+        {:error, exception} ->
+          {:error, Error.new(message: Exception.message(exception), details: exception)}
+      end
     end
   end
 
