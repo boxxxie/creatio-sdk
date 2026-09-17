@@ -355,6 +355,23 @@ defmodule Creatio.ODataTest do
                OData.update_field!(client, "Contact", "uuid-123", "Photo", <<1, 2, 3, 4, 5>>)
     end
 
+    test "updates scalar primitive fields (boolean, integer, string)" do
+      plug = fn conn ->
+        assert conn.request_path == "/0/odata/Contact(uuid-123)/Active"
+        assert conn.method == "PUT"
+
+        {:ok, body, conn} = read_body(conn)
+        assert body == Jason.encode!(%{"value" => true})
+
+        conn
+        |> send_resp(204, "")
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+      assert :ok = OData.update_field(client, "Contact", "uuid-123", "Active", true)
+      assert :ok = OData.update_field!(client, "Contact", "uuid-123", "Active", true)
+    end
+
     test "deletes a field with proper stream headers" do
       plug = fn conn ->
         assert conn.request_path == "/0/odata/Contact(uuid-123)/Photo"

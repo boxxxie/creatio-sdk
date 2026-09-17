@@ -306,5 +306,26 @@ defmodule Creatio.BatchTest do
       assert {:ok, []} = Batch.execute(client, batch)
       assert {:ok, []} = Batch.execute(client, batch, format: :multipart)
     end
+
+    test "multipart payload building and response parsing" do
+      batch =
+        Batch.new()
+        |> Batch.add_get("Contact", "1")
+        |> Batch.add_create("Contact", %{"Name" => "Test"})
+        |> Batch.add_update("Contact", "1", %{"Name" => "Updated"})
+        |> Batch.add_delete("Contact", "1")
+
+      assert {boundary, body} = Batch.to_multipart(batch)
+      assert is_binary(boundary) and is_binary(body)
+      assert is_map(Batch.to_payload(batch))
+
+      multipart_resp =
+        "--changeset\r\nContent-Type: application/http\r\n\r\nHTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"value\": []}\r\n--changeset--"
+
+      assert {:ok, [resp]} = Batch.parse_multipart_response(multipart_resp, "changeset")
+      assert resp.status == 200
+      assert Creatio.Batch.Response.success?(resp)
+      refute Creatio.Batch.Response.error?(resp)
+    end
   end
 end

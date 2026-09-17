@@ -145,4 +145,43 @@ defmodule Creatio.ErrorTest do
     assert err.code == "ValidationError"
     assert err.message == "Field is required"
   end
+
+  test "from_response with legacy and alternative error payloads" do
+    payloads = [
+      %{"errorInfo" => %{"message" => "A", "errorCode" => "123"}},
+      %{"ErrorInfo" => %{"message" => "A", "errorCode" => "123"}},
+      %{"responseStatus" => %{"Message" => "A", "errorCode" => "123"}},
+      %{"ResponseStatus" => %{"Message" => "A", "ErrorCode" => "123"}},
+      %{"success" => false, "message" => "A"},
+      %{"success" => false, "errorInfo" => %{"message" => "A"}},
+      %{"success" => "false", "message" => "A"},
+      %{"error" => %{"message" => %{"value" => "nested"}}},
+      %{"error" => "string error"},
+      %{"error" => %{"message" => "msg", "code" => "123"}},
+      %{"error" => %{"code" => "123"}},
+      %{"error" => %{}},
+      %{"error" => nil},
+      %{"Success" => false, "Message" => "Failed", "ErrorCode" => "ERR"},
+      %{"Message" => "Just message"},
+      %{"ExceptionMessage" => "Just exception message"},
+      %{"message" => %{"value" => "string value"}},
+      %{"message" => "string value", "code" => "200"},
+      %{}
+    ]
+
+    for body <- payloads do
+      err = Error.from_response(%Req.Response{status: 400, body: body})
+      assert is_struct(err, Error)
+    end
+
+    assert is_struct(Error.from_response("not a response"), Error)
+
+    assert is_struct(
+             Error.from_response(%Req.Response{status: 400, body: "just a string"}),
+             Error
+           )
+
+    err = Error.from_response(%Req.Response{status: 400, body: %{"error" => %{"message" => 123}}})
+    assert err.message == "123"
+  end
 end

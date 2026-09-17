@@ -565,19 +565,49 @@ defmodule Creatio.OData.Query do
 
     params =
       case query.select do
-        nil -> params
-        list when is_list(list) -> Map.put(params, "$select", Enum.join(list, ","))
-        str when is_binary(str) -> Map.put(params, "$select", str)
+        nil ->
+          params
+
+        [] ->
+          params
+
+        "" ->
+          params
+
+        list when is_list(list) ->
+          case Enum.reject(list, &(&1 in [nil, ""])) do
+            [] -> params
+            non_empty -> Map.put(params, "$select", Enum.join(non_empty, ","))
+          end
+
+        str when is_binary(str) ->
+          Map.put(params, "$select", str)
       end
 
     params =
-      if query.filter, do: Map.put(params, "$filter", query.filter), else: params
+      if query.filter && query.filter != "",
+        do: Map.put(params, "$filter", query.filter),
+        else: params
 
     params =
       case query.orderby do
-        nil -> params
-        list when is_list(list) -> Map.put(params, "$orderby", Enum.join(list, ","))
-        str when is_binary(str) -> Map.put(params, "$orderby", str)
+        nil ->
+          params
+
+        [] ->
+          params
+
+        "" ->
+          params
+
+        list when is_list(list) ->
+          case Enum.reject(list, &(&1 in [nil, ""])) do
+            [] -> params
+            non_empty -> Map.put(params, "$orderby", Enum.join(non_empty, ","))
+          end
+
+        str when is_binary(str) ->
+          Map.put(params, "$orderby", str)
       end
 
     params =
@@ -588,9 +618,23 @@ defmodule Creatio.OData.Query do
 
     params =
       case query.expand do
-        nil -> params
-        list when is_list(list) -> Map.put(params, "$expand", Enum.join(list, ","))
-        str when is_binary(str) -> Map.put(params, "$expand", str)
+        nil ->
+          params
+
+        [] ->
+          params
+
+        "" ->
+          params
+
+        list when is_list(list) ->
+          case Enum.reject(list, &(&1 in [nil, ""])) do
+            [] -> params
+            non_empty -> Map.put(params, "$expand", Enum.join(non_empty, ","))
+          end
+
+        str when is_binary(str) ->
+          Map.put(params, "$expand", str)
       end
 
     params =
@@ -602,6 +646,38 @@ defmodule Creatio.OData.Query do
   defp format_literal(nil, _opts), do: "null"
   defp format_literal(true, _opts), do: "true"
   defp format_literal(false, _opts), do: "false"
+
+  defp format_literal(%DateTime{} = val, opts) do
+    if Keyword.get(opts, :protocol) == :odata3 or Keyword.get(opts, :odata3, false) do
+      "datetime'#{DateTime.to_iso8601(val)}'"
+    else
+      DateTime.to_iso8601(val)
+    end
+  end
+
+  defp format_literal(%NaiveDateTime{} = val, opts) do
+    if Keyword.get(opts, :protocol) == :odata3 or Keyword.get(opts, :odata3, false) do
+      "datetime'#{NaiveDateTime.to_iso8601(val)}'"
+    else
+      NaiveDateTime.to_iso8601(val) <> "Z"
+    end
+  end
+
+  defp format_literal(%Date{} = val, opts) do
+    if Keyword.get(opts, :protocol) == :odata3 or Keyword.get(opts, :odata3, false) do
+      "datetime'#{Date.to_iso8601(val)}T00:00:00'"
+    else
+      Date.to_iso8601(val)
+    end
+  end
+
+  defp format_literal(%Time{} = val, opts) do
+    if Keyword.get(opts, :protocol) == :odata3 or Keyword.get(opts, :odata3, false) do
+      "time'#{Time.to_iso8601(val)}'"
+    else
+      Time.to_iso8601(val)
+    end
+  end
 
   defp format_literal(val, opts) when is_integer(val) or is_float(val) do
     if Keyword.get(opts, :quoted, false) do
@@ -631,17 +707,7 @@ defmodule Creatio.OData.Query do
   end
 
   defp format_guid_literal(guid, opts) do
-    clean =
-      guid
-      |> to_string()
-      |> String.trim()
-      |> String.replace_prefix("guid'", "")
-      |> String.replace_suffix("'", "")
-      |> String.replace_prefix("{", "")
-      |> String.replace_suffix("}", "")
-      |> String.replace_prefix("'", "")
-      |> String.replace_suffix("'", "")
-      |> String.trim()
+    clean = Creatio.Util.clean_guid(guid)
 
     if Keyword.get(opts, :protocol) == :odata3 or Keyword.get(opts, :odata3, false) do
       "guid'#{clean}'"

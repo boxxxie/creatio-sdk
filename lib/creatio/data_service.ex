@@ -191,80 +191,70 @@ defmodule Creatio.DataService do
           keyword()
         ) ::
           {:ok, any()} | {:error, Error.t()}
-  def custom_service(client_or_req, service_name, endpoint, payload_or_opts \\ %{}, opts \\ [])
+  def custom_service(client_or_req, service_name, endpoint, payload \\ %{}, opts \\ []) do
+    {final_payload, final_opts} =
+      if opts == [] and is_list(payload) and Keyword.keyword?(payload) and
+           Enum.any?(Keyword.keys(payload), &(&1 in [:method, :params, :headers, :req_options])) do
+        {%{}, payload}
+      else
+        {payload, opts}
+      end
 
-  def custom_service(client_or_req, service_name, endpoint, opts, []) when is_list(opts) do
-    if Keyword.keyword?(opts) do
-      custom_service(client_or_req, service_name, endpoint, %{}, opts)
-    else
-      do_custom_service(client_or_req, service_name, endpoint, opts, [])
-    end
-  end
-
-  def custom_service(client_or_req, service_name, endpoint, payload, opts) when is_list(opts) do
-    do_custom_service(client_or_req, service_name, endpoint, payload, opts)
+    do_custom_service(client_or_req, service_name, endpoint, final_payload, final_opts)
   end
 
   defp do_custom_service(client_or_req, service_name, endpoint, payload, opts) do
     client = Client.ensure_client(client_or_req)
     url = "/0/rest/#{service_name}/#{endpoint}"
-    http_method = Keyword.get(opts, :method, :post)
-    params = Keyword.get(opts, :params, %{})
-    custom_headers = Keyword.get(opts, :headers, %{})
+
+    {http_method, req_opts} = Keyword.pop(opts, :method, :post)
+    {params, req_opts} = Keyword.pop(req_opts, :params, %{})
+    {custom_headers, req_opts} = Keyword.pop(req_opts, :headers, %{})
+    {extra_req_opts, req_opts} = Keyword.pop(req_opts, :req_options, [])
+    req_opts = Keyword.merge(req_opts, extra_req_opts)
 
     req =
       client.req
       |> Req.Request.put_header("forceusesession", "true")
       |> apply_custom_headers(custom_headers)
 
-    result =
-      case http_method do
-        :get ->
-          get_params =
-            cond do
-              is_map(payload) ->
-                Map.merge(payload, Map.new(params))
+    {final_payload, final_params} =
+      if http_method in [:get, :delete] do
+        cond do
+          is_map(payload) and not Map.has_key?(payload, :__struct__) ->
+            {nil, Map.merge(Map.new(params), payload)}
 
-              is_list(payload) and Keyword.keyword?(payload) ->
-                Keyword.merge(payload, Enum.to_list(params))
+          is_list(payload) and Keyword.keyword?(payload) ->
+            {nil, Keyword.merge(Enum.to_list(params), payload)}
 
-              true ->
-                params
-            end
-
-          Req.get(req, url: url, params: get_params)
-
-        :delete ->
-          delete_params =
-            cond do
-              is_map(payload) ->
-                Map.merge(payload, Map.new(params))
-
-              is_list(payload) and Keyword.keyword?(payload) ->
-                Keyword.merge(payload, Enum.to_list(params))
-
-              true ->
-                params
-            end
-
-          Req.delete(req, url: url, params: delete_params)
-
-        _method when is_binary(payload) ->
-          case http_method do
-            :post -> Req.post(req, url: url, body: payload, params: params)
-            :put -> Req.put(req, url: url, body: payload, params: params)
-            :patch -> Req.patch(req, url: url, body: payload, params: params)
-          end
-
-        _method ->
-          case http_method do
-            :post -> Req.post(req, url: url, json: payload, params: params)
-            :put -> Req.put(req, url: url, json: payload, params: params)
-            :patch -> Req.patch(req, url: url, json: payload, params: params)
-          end
+          true ->
+            {payload, params}
+        end
+      else
+        {payload, params}
       end
 
-    case result do
+    req_opts = Keyword.merge(req_opts, url: url, params: final_params, method: http_method)
+
+    final_payload =
+      if is_list(final_payload) and Keyword.keyword?(final_payload) do
+        Map.new(final_payload)
+      else
+        final_payload
+      end
+
+    req_opts =
+      if is_nil(final_payload) do
+        req_opts
+      else
+        if is_binary(final_payload) do
+          Keyword.put(req_opts, :body, final_payload)
+        else
+          Keyword.put(req_opts, :json, final_payload)
+        end
+      end
+
+    case Req.request(req, req_opts) do
       {:ok, %{status: status, body: body}} when status in 200..299 ->
         {:ok, body}
 

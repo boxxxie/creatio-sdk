@@ -122,22 +122,38 @@ defmodule Creatio do
   @doc """
   Queries an entity collection (`GET /0/odata/{Entity}`).
   """
-  defdelegate list(client, entity_or_query, opts \\ []), to: OData
+  def list(query_or_entity, client, opts \\ [])
+  def list(%Creatio.OData.Query{} = query, client, opts), do: OData.list(client, query, opts)
+  def list(client, entity_or_query, opts), do: OData.list(client, entity_or_query, opts)
 
   @doc """
   Same as `list/3`, raising `Creatio.Error` on failure.
   """
-  defdelegate list!(client, entity_or_query, opts \\ []), to: OData
+  def list!(query_or_entity, client, opts \\ [])
+  def list!(%Creatio.OData.Query{} = query, client, opts), do: OData.list!(client, query, opts)
+  def list!(client, entity_or_query, opts), do: OData.list!(client, entity_or_query, opts)
 
   @doc """
   Executes an OData query or entity listing. Alias for `list/3`.
   """
-  defdelegate execute(client, entity_or_query, opts \\ []), to: OData
+  def execute(query_or_entity, client, opts \\ [])
+
+  def execute(%Creatio.OData.Query{} = query, client, opts),
+    do: OData.execute(client, query, opts)
+
+  def execute(client, entity_or_query, opts),
+    do: OData.execute(client, entity_or_query, opts)
 
   @doc """
   Same as `execute/3`, raising `Creatio.Error` on failure.
   """
-  defdelegate execute!(client, entity_or_query, opts \\ []), to: OData
+  def execute!(query_or_entity, client, opts \\ [])
+
+  def execute!(%Creatio.OData.Query{} = query, client, opts),
+    do: OData.execute!(client, query, opts)
+
+  def execute!(client, entity_or_query, opts),
+    do: OData.execute!(client, entity_or_query, opts)
 
   @doc """
   Retrieves a single entity by its primary ID (`GET /0/odata/{Entity}({id})`).
@@ -252,7 +268,9 @@ defmodule Creatio do
   @doc """
   Returns a lazy `Stream` that paginates through records of an entity.
   """
-  defdelegate stream(client, entity, opts \\ []), to: OData
+  def stream(query_or_entity, client, opts \\ [])
+  def stream(%Creatio.OData.Query{} = query, client, opts), do: OData.stream(client, query, opts)
+  def stream(client, entity, opts), do: OData.stream(client, entity, opts)
 
   # ---------------------------------------------------------------------------
   # DataService & Custom WebServices Delegates
@@ -341,12 +359,24 @@ defmodule Creatio do
   @doc """
   Queries an entity collection via legacy OData 3 (`/0/ServiceModel/EntityDataService.svc/`).
   """
-  defdelegate odata3_list(client, entity, opts \\ []), to: OData3, as: :list
+  def odata3_list(query_or_entity, client, opts \\ [])
+
+  def odata3_list(%Creatio.OData.Query{} = query, client, opts),
+    do: OData3.list(client, query, opts)
+
+  def odata3_list(client, entity_or_query, opts),
+    do: OData3.list(client, entity_or_query, opts)
 
   @doc """
   Same as `odata3_list/3`, raising `Creatio.Error` on failure.
   """
-  defdelegate odata3_list!(client, entity, opts \\ []), to: OData3, as: :list!
+  def odata3_list!(query_or_entity, client, opts \\ [])
+
+  def odata3_list!(%Creatio.OData.Query{} = query, client, opts),
+    do: OData3.list!(client, query, opts)
+
+  def odata3_list!(client, entity_or_query, opts),
+    do: OData3.list!(client, entity_or_query, opts)
 
   @doc """
   Retrieves an entity by ID via legacy OData 3.
@@ -443,10 +473,22 @@ defmodule Creatio do
   @doc """
   Returns a lazy `Stream` that paginates through records of a legacy OData 3 entity collection.
   """
-  defdelegate odata3_stream(client, entity_or_query, opts \\ []), to: OData3, as: :stream
+  def odata3_stream(query_or_entity, client, opts \\ [])
+
+  def odata3_stream(%Creatio.OData.Query{} = query, client, opts),
+    do: OData3.stream(client, query, opts)
+
+  def odata3_stream(client, entity_or_query, opts),
+    do: OData3.stream(client, entity_or_query, opts)
 
   @doc """
   Same as `odata3_stream/3`.
   """
-  defdelegate odata3_stream!(client, entity_or_query, opts \\ []), to: OData3, as: :stream!
+  def odata3_stream!(query_or_entity, client, opts \\ [])
+
+  def odata3_stream!(%Creatio.OData.Query{} = query, client, opts),
+    do: OData3.stream!(client, query, opts)
+
+  def odata3_stream!(client, entity_or_query, opts),
+    do: OData3.stream!(client, entity_or_query, opts)
 end

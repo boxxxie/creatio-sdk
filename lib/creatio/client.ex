@@ -58,7 +58,6 @@ defmodule Creatio.Client do
     base_url =
       (Keyword.get(opts, :base_url) ||
          Application.get_env(:creatio, :base_url) ||
-         Application.get_env(:connect, :creatio)[:base_url] ||
          System.get_env("CREATIO_BASE_URL") ||
          "")
       |> String.trim_trailing("/")
@@ -66,8 +65,8 @@ defmodule Creatio.Client do
     auth_token =
       Keyword.get(opts, :auth_token) ||
         Application.get_env(:creatio, :auth_token) ||
-        Application.get_env(:connect, :creatio)[:auth_token] ||
-        System.get_env("CREATIO_AUTH_TOKEN")
+        System.get_env("CREATIO_AUTH_TOKEN") ||
+        System.get_env("CREATIO_BEARER_TOKEN")
 
     cookie = Keyword.get(opts, :cookie)
     bpmcsrf = Keyword.get(opts, :bpmcsrf)
@@ -141,8 +140,12 @@ defmodule Creatio.Client do
     client = %__MODULE__{
       base_url: String.trim_trailing(base_url, "/"),
       auth_token: Keyword.get(opts_list, :auth_token),
+      auth_mode: Keyword.get(opts_list, :auth_mode, :bearer),
       cookie: Keyword.get(opts_list, :cookie),
       bpmcsrf: Keyword.get(opts_list, :bpmcsrf),
+      identity_service_url: Keyword.get(opts_list, :identity_service_url),
+      client_id: Keyword.get(opts_list, :client_id),
+      client_secret: Keyword.get(opts_list, :client_secret),
       req: configured_req,
       options: opts_list
     }

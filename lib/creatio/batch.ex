@@ -109,7 +109,16 @@ defmodule Creatio.Batch do
         }
       end
 
-    headers = Keyword.get(opts, :headers, default_headers)
+    user_headers = Keyword.get(opts, :headers)
+
+    headers =
+      if user_headers do
+        user_headers
+        |> Map.new(fn {k, v} -> {to_string(k), to_string(v)} end)
+        |> then(&Map.merge(default_headers, &1))
+      else
+        default_headers
+      end
 
     item =
       %{
@@ -550,7 +559,15 @@ defmodule Creatio.Batch do
     case String.split(clean_text, ~r/\r?\n\r?\n/, parts: 2) do
       [raw_headers, body] ->
         headers = parse_headers(raw_headers)
-        {headers, String.trim(body)}
+
+        body_trimmed =
+          if String.ends_with?(body, "\r\n") do
+            String.slice(body, 0..-3//1)
+          else
+            body
+          end
+
+        {headers, body_trimmed}
 
       [raw_headers] ->
         headers = parse_headers(raw_headers)
@@ -683,8 +700,6 @@ defmodule Creatio.Batch do
     end
   end
 
-  defp extract_boundary_from_header(_), do: nil
-
   defp clean_boundary_str(boundary) when is_binary(boundary) do
     boundary
     |> String.trim()
@@ -693,10 +708,12 @@ defmodule Creatio.Batch do
   end
 
   defp get_resp_content_type(%{headers: headers}) when is_map(headers) do
-    headers["content-type"] || headers["Content-Type"] || ""
+    case headers["content-type"] || headers["Content-Type"] || "" do
+      [val | _] -> val
+      val when is_binary(val) -> val
+      _ -> ""
+    end
   end
-
-  defp get_resp_content_type(_), do: ""
 
   defp random_id do
     :crypto.strong_rand_bytes(6) |> Base.hex_encode32(case: :lower, padding: false)

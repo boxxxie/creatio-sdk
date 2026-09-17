@@ -1,7 +1,7 @@
 defmodule Creatio.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.2.0"
   @source_url "https://gitlab.nvestiv.com/caasa/creatio-sdk"
 
   def project do
@@ -10,6 +10,7 @@ defmodule Creatio.MixProject do
       version: @version,
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
+      test_coverage: [summary: [threshold: 84]],
       deps: deps(),
       description: description(),
       package: package(),

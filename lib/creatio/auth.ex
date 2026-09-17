@@ -197,10 +197,17 @@ defmodule Creatio.Auth do
   def openid_configuration(client_or_url, opts \\ [])
 
   def openid_configuration(%Client{} = client, opts) do
+    base = client.identity_service_url || (client.base_url || "") <> "/identity"
+
     url =
       Keyword.get(opts, :url) ||
-        "#{String.trim_trailing(client.identity_service_url || "", "/")}/.well-known/openid-configuration"
+        "#{String.trim_trailing(base, "/")}/.well-known/openid-configuration"
 
+    req_opts =
+      Keyword.get(client.options, :req_options, [])
+      |> Keyword.merge(Keyword.get(opts, :req_options, []))
+
+    opts = Keyword.put(opts, :req_options, req_opts)
     openid_configuration(url, opts)
   end
 

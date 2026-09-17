@@ -19,12 +19,11 @@ password = System.fetch_env!("CREATIO_PASSWORD")
 # Initialize client
 client = Creatio.Client.new(
   base_url: base_url,
-  username: username,
-  password: password
+  auth_mode: :forms
 )
 
 # Authenticate (This obtains the necessary auth cookies, like BPMCSRF)
-{:ok, client} = Creatio.auth(client)
+{:ok, client} = Creatio.Auth.login_forms(client, username, password)
 ```
 
 ## 2. Initial Full Backfill (Streaming)
@@ -35,24 +34,22 @@ Using Elixir Streams, we can process pages of Contacts iteratively, inserting th
 
 ```elixir
 # Stream Contacts from Creatio in chunks (e.g., 100 per page)
-contacts_stream = Creatio.stream(client, "Contact", query: [
-  "$select": "Id,Name,Email,ModifiedOn,AccountId",
-  "$expand": "Account($select=Id,Name)" # Eager-load the related Account!
-])
+contacts_stream = Creatio.stream(client, "Contact",
+  select: "Id,Name,Email,ModifiedOn,AccountId",
+  expand: "Account($select=Id,Name)" # Eager-load the related Account!
+)
 
 # Process the stream
-Stream.each(contacts_stream, fn page_results ->
-  # 'page_results' is a list of contacts from the current OData page
-  Enum.each(page_results, fn contact ->
-    # Insert or update the contact in your local DB (e.g., via Ecto)
-    # MyApp.Repo.insert_or_update!(...)
-    IO.puts("Syncing Contact: #{contact["Name"]} (Email: #{contact["Email"]})")
-    
-    # You can also handle the expanded account
-    if account = contact["Account"] do
-      IO.puts("  Belongs to Account: #{account["Name"]}")
-    end
-  end)
+Stream.each(contacts_stream, fn contact ->
+  # 'contact' is an individual record from the OData stream
+  # Insert or update the contact in your local DB (e.g., via Ecto)
+  # MyApp.Repo.insert_or_update!(...)
+  IO.puts("Syncing Contact: #{contact["Name"]} (Email: #{contact["Email"]})")
+  
+  # You can also handle the expanded account
+  if account = contact["Account"] do
+    IO.puts("  Belongs to Account: #{account["Name"]}")
+  end
 end)
 |> Stream.run() # Execute the lazy stream
 ```
@@ -66,7 +63,7 @@ After the initial backfill, you don't want to re-download everything. A schedule
 We achieve this using OData `$filter` on the `ModifiedOn` field.
 
 ```elixir
-def module MyApp.Workers.CreatioDeltaSync do
+defmodule MyApp.Workers.CreatioDeltaSync do
   @moduledoc """
   A background worker that runs every X minutes to fetch recently changed contacts.
   """
@@ -84,13 +81,13 @@ def module MyApp.Workers.CreatioDeltaSync do
     
     # 3. Query Contacts modified AFTER the last sync
     query = [
-      "$select": "Id,Name,Email,ModifiedOn",
-      "$filter": "ModifiedOn gt datetime'#{formatted_time}'",
-      "$orderby": "ModifiedOn asc"
+      select: "Id,Name,Email,ModifiedOn",
+      filter: "ModifiedOn gt datetime'#{formatted_time}'",
+      orderby: "ModifiedOn asc"
     ]
     
     # We can use the stream here as well in case there are many updates
-    Creatio.stream(client, "Contact", query: query)
+    Creatio.stream(client, "Contact", query)
     |> Stream.each(fn chunk ->
       MyApp.Accounts.bulk_upsert_contacts(chunk)
     end)
@@ -103,10 +100,13 @@ def module MyApp.Workers.CreatioDeltaSync do
   defp get_authenticated_client() do
     client = Creatio.Client.new(
       base_url: System.get_env("CREATIO_BASE_URL"),
-      username: System.get_env("CREATIO_USERNAME"),
-      password: System.get_env("CREATIO_PASSWORD")
+      auth_mode: :forms
     )
-    {:ok, client} = Creatio.auth(client)
+    {:ok, client} = Creatio.Auth.login_forms(
+      client,
+      System.get_env("CREATIO_USERNAME"),
+      System.get_env("CREATIO_PASSWORD")
+    )
     client
   end
 end
@@ -122,14 +122,14 @@ If the Creatio session expires, you will start receiving 401 Unauthorized or 403
 
 ```elixir
 def fetch_data_with_retry(client, entity, query) do
-  case Creatio.get(client, entity, query: query) do
+  case Creatio.list(client, entity, query) do
     {:ok, data} -> 
       {:ok, data}
       
-    {:error, %Creatio.Error{status_code: 401}} ->
+    {:error, %Creatio.Error{status: 401}} ->
       # Auth expired, re-authenticate and try once more
-      {:ok, new_client} = Creatio.auth(client)
-      Creatio.get(new_client, entity, query: query)
+      {:ok, new_client} = Creatio.Auth.login_forms(client, System.get_env("CREATIO_USERNAME"), System.get_env("CREATIO_PASSWORD"))
+      Creatio.list(new_client, entity, query)
       
     {:error, reason} ->
       # Log error and fail the background job so it can be retried later

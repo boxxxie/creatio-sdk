@@ -31,6 +31,10 @@ defmodule Creatio.OData3 do
           {:ok, list() | map()} | {:error, Error.t()}
   def list(client_or_req, entity_or_query, opts \\ [])
 
+  def list(%Creatio.OData.Query{} = query, client_or_req, opts) do
+    list(client_or_req, query, opts)
+  end
+
   def list(client_or_req, %Creatio.OData.Query{} = query, opts) do
     client = Client.ensure_client(client_or_req)
     query_params = Creatio.OData.Query.to_params(query)
@@ -90,8 +94,14 @@ defmodule Creatio.OData3 do
   @doc """
   Same as `list/3`, but raises `Creatio.Error` on failure.
   """
-  def list!(client, entity_or_query, opts \\ []) do
-    case list(client, entity_or_query, opts) do
+  def list!(client_or_req, entity_or_query, opts \\ [])
+
+  def list!(%Creatio.OData.Query{} = query, client_or_req, opts) do
+    list!(client_or_req, query, opts)
+  end
+
+  def list!(client_or_req, entity_or_query, opts) do
+    case list(client_or_req, entity_or_query, opts) do
       {:ok, result} -> result
       {:error, error} -> raise error
     end
@@ -359,9 +369,23 @@ defmodule Creatio.OData3 do
           String.t() | Creatio.OData.Query.t(),
           keyword()
         ) :: Enumerable.t()
-  def stream(client_or_req, entity_or_query, opts \\ []) do
+  def stream(client_or_req, entity_or_query, opts \\ [])
+
+  def stream(%Creatio.OData.Query{} = query, client_or_req, opts) do
+    stream(client_or_req, query, opts)
+  end
+
+  def stream(client_or_req, entity_or_query, opts) do
     client = Client.ensure_client(client_or_req)
-    page_size = max(1, Keyword.get(opts, :page_size, 100))
+    raw_page_size = Keyword.get(opts, :page_size, 100)
+
+    page_size =
+      case raw_page_size do
+        val when is_binary(val) -> String.to_integer(val)
+        val when is_integer(val) -> val
+      end
+
+    page_size = max(1, page_size)
     base_opts = Keyword.drop(opts, [:page_size, :top, :skip, :count])
 
     cleaned_entity_or_query =
@@ -384,27 +408,31 @@ defmodule Creatio.OData3 do
 
           case list(client, cleaned_entity_or_query, page_opts) do
             {:ok, records} when is_list(records) ->
+              len = length(records)
+
               cond do
-                records == [] ->
+                len == 0 ->
                   {:halt, nil}
 
-                length(records) < page_size ->
-                  {records, {offset + length(records), true}}
+                len < page_size ->
+                  {records, {offset + len, true}}
 
                 true ->
-                  {records, {offset + length(records), false}}
+                  {records, {offset + len, false}}
               end
 
             {:ok, %{records: records}} when is_list(records) ->
+              len = length(records)
+
               cond do
-                records == [] ->
+                len == 0 ->
                   {:halt, nil}
 
-                length(records) < page_size ->
-                  {records, {offset + length(records), true}}
+                len < page_size ->
+                  {records, {offset + len, true}}
 
                 true ->
-                  {records, {offset + length(records), false}}
+                  {records, {offset + len, false}}
               end
 
             {:error, error} ->
@@ -418,8 +446,14 @@ defmodule Creatio.OData3 do
   @doc """
   Same as `stream/3`.
   """
-  def stream!(client, entity_or_query, opts \\ []) do
-    stream(client, entity_or_query, opts)
+  def stream!(client_or_req, entity_or_query, opts \\ [])
+
+  def stream!(%Creatio.OData.Query{} = query, client_or_req, opts) do
+    stream!(client_or_req, query, opts)
+  end
+
+  def stream!(client_or_req, entity_or_query, opts) do
+    stream(client_or_req, entity_or_query, opts)
   end
 
   @doc """
@@ -587,6 +621,9 @@ defmodule Creatio.OData3 do
 
   defp normalize_params(opts) when is_list(opts) do
     Enum.reduce(opts, %{}, fn
+      {:select, []}, acc ->
+        acc
+
       {:select, val}, acc when is_list(val) ->
         Map.put(acc, "$select", Enum.map_join(val, ",", &to_string/1))
 
@@ -620,6 +657,9 @@ defmodule Creatio.OData3 do
       {:skip, val}, acc when not is_nil(val) ->
         Map.put(acc, "$skip", to_string(val))
 
+      {:expand, []}, acc ->
+        acc
+
       {:expand, val}, acc when is_list(val) ->
         Map.put(acc, "$expand", Enum.map_join(val, ",", &to_string/1))
 
@@ -638,6 +678,9 @@ defmodule Creatio.OData3 do
       {:params, list}, acc when is_list(list) ->
         Enum.reduce(list, acc, fn {k, v}, a -> Map.put(a, to_string(k), to_string(v)) end)
 
+      {key, val}, acc when is_binary(key) and is_list(val) ->
+        Map.put(acc, key, Enum.map_join(val, ",", &to_string/1))
+
       {key, val}, acc when is_binary(key) ->
         Map.put(acc, key, to_string(val))
 
@@ -646,5 +689,9 @@ defmodule Creatio.OData3 do
     end)
   end
 
-  defp normalize_params(map) when is_map(map), do: map
+  defp normalize_params(map) when is_map(map) do
+    map
+    |> Map.to_list()
+    |> normalize_params()
+  end
 end
