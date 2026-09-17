@@ -669,6 +669,17 @@ defmodule Creatio.OData do
     page_size = max(1, page_size)
     base_opts = Keyword.drop(opts, [:page_size, :top, :skip, :count])
 
+    initial_skip =
+      case entity_or_query do
+        %Query{skip: s} when is_integer(s) and s >= 0 -> s
+        _ ->
+          case Keyword.get(opts, :skip, 0) do
+            val when is_binary(val) -> String.to_integer(val)
+            val when is_integer(val) -> val
+            _ -> 0
+          end
+      end
+
     cleaned_entity_or_query =
       case entity_or_query do
         %Query{} = q -> %{q | count: false, top: nil, skip: nil}
@@ -676,7 +687,7 @@ defmodule Creatio.OData do
       end
 
     Stream.resource(
-      fn -> {0, false} end,
+      fn -> {initial_skip, false} end,
       fn
         {_offset, true} ->
           {:halt, nil}

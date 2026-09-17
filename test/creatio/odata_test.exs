@@ -453,6 +453,22 @@ defmodule Creatio.ODataTest do
       assert length(items) == 1
       assert hd(items)["Name"] == "Item"
     end
+
+    test "respects initial skip offset in stream" do
+      plug = fn conn ->
+        query = URI.decode_query(conn.query_string)
+        skip = String.to_integer(query["$skip"])
+        assert skip >= 10
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{"value" => [%{"Id" => "id-#{skip}", "Name" => "Item #{skip}"}]}))
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+      items = OData.stream(client, "Contact", skip: 10, page_size: 1) |> Enum.take(1)
+      assert hd(items)["Id"] == "id-10"
+    end
   end
 
   describe "Query builder enhancements" do
