@@ -482,6 +482,36 @@ defmodule Creatio.UtilTest do
       assert_raise ArgumentError, ~r/expected :max_records to be a non-negative integer/, fn ->
         Util.paginate_stream(client, "Contact", [max_records: "abc"], :odata4, page_fun)
       end
+
+      map_records =
+        Util.paginate_stream(
+          client,
+          "Contact",
+          %{"page_size" => 2, "top" => 2},
+          :odata4,
+          page_fun
+        )
+        |> Enum.to_list()
+
+      assert map_records == [{:ok, %{"Id" => "1"}}, {:ok, %{"Id" => "2"}}]
+    end
+
+    test "clean_guid/1 strips GUID wrappers and rejects traversal or injection characters" do
+      assert Util.clean_guid("guid'{12345678-1234-1234-1234-123456789abc}'") ==
+               "12345678-1234-1234-1234-123456789abc"
+
+      for bad <- [
+            "",
+            "../etc",
+            "1)/../../rest/Trigger?x=(",
+            "1?foo=bar",
+            "1#frag",
+            "id with space"
+          ] do
+        assert_raise ArgumentError, fn ->
+          Util.clean_guid(bad)
+        end
+      end
     end
   end
 end

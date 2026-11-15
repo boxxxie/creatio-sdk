@@ -39,10 +39,11 @@ defmodule Creatio do
 
   ### Streaming / Auto-pagination
 
-      # Seamlessly iterates over pages of `{:ok, record}` tuples using $top and $skip,
-      # with optional initial :skip offset for resuming syncs (or use stream!/3 for plain maps)
-      Creatio.stream(client, "Contact", page_size: 100, skip: 500, select: ["Id", "Name"])
-      |> Stream.map(fn {:ok, record} -> record end)
+      # Seamlessly iterates over pages using $top and $skip with optional initial :skip offset.
+      # Use `Creatio.stream/3` to handle `{:ok, record}` / `{:error, error}` tuples safely,
+      # or `Creatio.stream!/3` to stream plain record maps and raise `Creatio.Error` on failure:
+      Creatio.stream!(client, "Contact", page_size: 100, skip: 500, select: ["Id", "Name"])
+      |> Stream.map(& &1["Name"])
       |> Enum.take(250)
 
   ### Read-Only Safety Mode
@@ -285,15 +286,22 @@ defmodule Creatio do
   @doc """
   Gets total count of an entity collection (`GET /0/odata/{Entity}/$count`).
   """
-  @spec count(Client.t() | Req.Request.t(), String.t(), keyword()) ::
-          {:ok, integer()} | {:error, Error.t()}
-  defdelegate count(client, entity, opts \\ []), to: OData
+  @spec count(
+          Client.t() | Req.Request.t() | Query.t() | String.t(),
+          String.t() | Query.t() | Client.t() | Req.Request.t(),
+          keyword() | map()
+        ) :: {:ok, integer()} | {:error, Error.t()}
+  defdelegate count(client_or_query, entity_or_client, opts \\ []), to: OData
 
   @doc """
   Same as `count/3`, raising `Creatio.Error` on failure.
   """
-  @spec count!(Client.t() | Req.Request.t(), String.t(), keyword()) :: integer()
-  defdelegate count!(client, entity, opts \\ []), to: OData
+  @spec count!(
+          Client.t() | Req.Request.t() | Query.t() | String.t(),
+          String.t() | Query.t() | Client.t() | Req.Request.t(),
+          keyword() | map()
+        ) :: integer()
+  defdelegate count!(client_or_query, entity_or_client, opts \\ []), to: OData
 
   @doc """
   Creates an entity record (`POST /0/odata/{Entity}`).
@@ -409,7 +417,7 @@ defmodule Creatio do
       `$filter={field} gt {cursor}` keyset pagination instead of `$skip`.
     * `:after_cursor` - Initial cursor value to resume keyset pagination from.
     * `:max_records` - Maximum total number of records to stream.
-    * `:top` - Maximum total number of records to stream when set via `Query.top/2`.
+    * `:top` - Maximum total number of records to stream (in options or via `Query.top/2`).
     * `:select` - List of fields or comma-separated string to retrieve.
     * `:filter` - OData filter expression string.
     * `:orderby` - Ordering expression string.
@@ -677,15 +685,26 @@ defmodule Creatio do
   @doc """
   Gets total count of an entity collection in OData 3.
   """
-  @spec odata3_count(Client.t() | Req.Request.t(), String.t(), keyword()) ::
-          {:ok, integer()} | {:error, Error.t()}
-  defdelegate odata3_count(client, entity, opts \\ []), to: OData3, as: :count
+  @spec odata3_count(
+          Client.t() | Req.Request.t() | Query.t() | String.t(),
+          String.t() | Query.t() | Client.t() | Req.Request.t(),
+          keyword() | map()
+        ) :: {:ok, integer()} | {:error, Error.t()}
+  defdelegate odata3_count(client_or_query, entity_or_client, opts \\ []),
+    to: OData3,
+    as: :count
 
   @doc """
   Same as `odata3_count/3`, raising `Creatio.Error` on failure.
   """
-  @spec odata3_count!(Client.t() | Req.Request.t(), String.t(), keyword()) :: integer()
-  defdelegate odata3_count!(client, entity, opts \\ []), to: OData3, as: :count!
+  @spec odata3_count!(
+          Client.t() | Req.Request.t() | Query.t() | String.t(),
+          String.t() | Query.t() | Client.t() | Req.Request.t(),
+          keyword() | map()
+        ) :: integer()
+  defdelegate odata3_count!(client_or_query, entity_or_client, opts \\ []),
+    to: OData3,
+    as: :count!
 
   @doc """
   Creates an entity via legacy OData 3.
@@ -744,6 +763,7 @@ defmodule Creatio do
       `$orderby={field} asc` + `$filter={field} gt guid'...'` keyset pagination.
     * `:after_cursor` - Initial cursor value to resume keyset pagination from.
     * `:max_records` - Maximum total number of records to stream.
+    * `:top` - Maximum total number of records to stream (in options or via `Query.top/2`).
     * `:select` - List or string of fields to retrieve.
     * `:filter` - Filter expression.
     * `:orderby` - Ordering expression.

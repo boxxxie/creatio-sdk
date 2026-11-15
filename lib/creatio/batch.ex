@@ -67,10 +67,9 @@ defmodule Creatio.Batch do
     end
   end
 
-  defstruct requests: [], ops: [], count: 0, continue_on_error: false, return: nil
+  defstruct ops: [], count: 0, continue_on_error: false, return: nil
 
   @opaque t :: %__MODULE__{
-            requests: [map()],
             ops: [map()],
             count: non_neg_integer(),
             continue_on_error: boolean(),
@@ -98,17 +97,19 @@ defmodule Creatio.Batch do
   """
   @spec add(t(), String.t() | atom(), String.t(), keyword()) :: t()
   def add(%__MODULE__{} = batch, method, url, opts \\ []) do
-    base_count =
-      if batch.count == 0 and batch.requests != [] do
-        length(batch.requests)
-      else
-        batch.count
+    url = validate_batch_url!(url)
+    next_count = batch.count + 1
+    id = Keyword.get(opts, :id) || "req_#{next_count}"
+    id_str = validate_item_id!(id)
+    body = Keyword.get(opts, :body)
+
+    atomicity_group =
+      case Keyword.fetch(opts, :atomicity_group) do
+        {:ok, nil} -> nil
+        {:ok, group} -> validate_boundary!("atomicity_group", group)
+        :error -> nil
       end
 
-    next_count = base_count + 1
-    id = Keyword.get(opts, :id) || "req_#{next_count}"
-    body = Keyword.get(opts, :body)
-    atomicity_group = Keyword.get(opts, :atomicity_group)
     method_str = method |> to_string() |> String.upcase()
 
     prefer =
@@ -128,7 +129,7 @@ defmodule Creatio.Batch do
 
     item =
       %{
-        "id" => to_string(id),
+        "id" => id_str,
         "method" => method_str,
         "url" => url,
         "headers" => headers
@@ -156,6 +157,7 @@ defmodule Creatio.Batch do
 
   def add_get(%__MODULE__{} = batch, entity, id)
       when is_binary(entity) and is_binary(id) do
+    entity = Util.require_entity_name!(entity, :add_get)
     add(batch, "GET", "#{entity}(#{Util.clean_guid(id)})", [])
   end
 
@@ -165,6 +167,7 @@ defmodule Creatio.Batch do
   @spec add_get(t(), String.t(), String.t(), keyword()) :: t()
   def add_get(%__MODULE__{} = batch, entity, id, opts)
       when is_binary(entity) and is_binary(id) and is_list(opts) do
+    entity = Util.require_entity_name!(entity, :add_get)
     add(batch, "GET", "#{entity}(#{Util.clean_guid(id)})", opts)
   end
 
@@ -173,6 +176,7 @@ defmodule Creatio.Batch do
   """
   @spec add_create(t(), String.t(), map(), keyword()) :: t()
   def add_create(%__MODULE__{} = batch, entity, attrs, opts \\ []) do
+    entity = Util.require_entity_name!(entity, :add_create)
     add(batch, "POST", entity, Keyword.put(opts, :body, attrs))
   end
 
@@ -181,6 +185,7 @@ defmodule Creatio.Batch do
   """
   @spec add_update(t(), String.t(), String.t(), map(), keyword()) :: t()
   def add_update(%__MODULE__{} = batch, entity, id, attrs, opts \\ []) do
+    entity = Util.require_entity_name!(entity, :add_update)
     add(batch, "PATCH", "#{entity}(#{Util.clean_guid(id)})", Keyword.put(opts, :body, attrs))
   end
 
@@ -189,6 +194,7 @@ defmodule Creatio.Batch do
   """
   @spec add_delete(t(), String.t(), String.t(), keyword()) :: t()
   def add_delete(%__MODULE__{} = batch, entity, id, opts \\ []) do
+    entity = Util.require_entity_name!(entity, :add_delete)
     add(batch, "DELETE", "#{entity}(#{Util.clean_guid(id)})", opts)
   end
 
@@ -230,7 +236,7 @@ defmodule Creatio.Batch do
   """
   @spec to_multipart_iodata(t(), keyword()) :: {String.t(), iodata()}
   def to_multipart_iodata(%__MODULE__{} = batch, opts \\ []) do
-    batch_boundary = Keyword.get(opts, :boundary) || "batch_#{random_id()}"
+    batch_boundary = resolve_batch_boundary!(opts)
     requests = ordered_requests(batch)
     parts = build_multipart_iodata(requests, batch_boundary)
     iodata = [Enum.intersperse(parts, "\r\n"), "\r\n--", batch_boundary, "--\r\n"]
@@ -335,7 +341,14 @@ defmodule Creatio.Batch do
            )}
         else
           url = Keyword.get(opts, :url, "/0/odata/$batch")
-          boundary = Keyword.get(opts, :boundary) || extract_boundary(body) || "batch_default"
+
+          boundary =
+            case Keyword.fetch(opts, :boundary) do
+              {:ok, nil} -> extract_boundary(body) || "batch_default"
+              {:ok, b} -> validate_boundary!("boundary", b)
+              :error -> extract_boundary(body) || "batch_default"
+            end
+            |> then(&validate_boundary!("boundary", &1))
 
           req =
             client.req
@@ -404,7 +417,7 @@ defmodule Creatio.Batch do
   end
 
   defp execute_multipart(client, requests, url, prefer, opts) do
-    batch_boundary = Keyword.get(opts, :boundary) || "batch_#{random_id()}"
+    batch_boundary = resolve_batch_boundary!(opts)
     parts = build_multipart_iodata(requests, batch_boundary)
     iodata = [Enum.intersperse(parts, "\r\n"), "\r\n--", batch_boundary, "--\r\n"]
 
@@ -732,7 +745,9 @@ defmodule Creatio.Batch do
   end
 
   defp build_changeset_iodata(group_name, reqs, batch_boundary) do
+    validate_boundary!("atomicity_group", group_name)
     cs_boundary = "changeset_#{group_name}_#{random_id()}"
+    validate_boundary!("changeset boundary", cs_boundary)
 
     inner =
       Enum.map(reqs, fn req ->
@@ -759,7 +774,7 @@ defmodule Creatio.Batch do
 
   defp build_raw_http_iodata(req) do
     method = extract_method(req)
-    url = to_string(req["url"] || req[:url] || "")
+    url = validate_batch_url!(to_string(req["url"] || req[:url] || ""))
     id = req["id"] || req[:id]
     body = req["body"] || req[:body]
     req_headers = req["headers"] || req[:headers] || %{}
@@ -783,9 +798,7 @@ defmodule Creatio.Batch do
     [method, " ", url, " HTTP/1.1\r\n", header_iodata, "\r\n", body_iodata || ""]
   end
 
-  defp ordered_requests(%__MODULE__{requests: [], ops: ops}), do: Enum.reverse(ops)
-  defp ordered_requests(%__MODULE__{requests: reqs, ops: []}), do: reqs
-  defp ordered_requests(%__MODULE__{requests: reqs, ops: ops}), do: reqs ++ Enum.reverse(ops)
+  defp ordered_requests(%__MODULE__{ops: ops}), do: Enum.reverse(ops)
 
   defp has_mutation?(requests), do: Enum.any?(requests, &mutation_request?/1)
 
@@ -800,12 +813,78 @@ defmodule Creatio.Batch do
   end
 
   defp normalize_raw_request(req) when is_map(req) do
-    Enum.reduce(req, %{}, fn
-      {:atomicity_group, v}, acc -> Map.put(acc, "atomicityGroup", v)
-      {:method, v}, acc -> Map.put(acc, "method", v |> to_string() |> String.upcase())
-      {"method", v}, acc -> Map.put(acc, "method", v |> to_string() |> String.upcase())
-      {k, v}, acc -> Map.put(acc, to_string(k), v)
-    end)
+    normalized =
+      Enum.reduce(req, %{}, fn
+        {:atomicity_group, v}, acc -> Map.put(acc, "atomicityGroup", v)
+        {:method, v}, acc -> Map.put(acc, "method", v |> to_string() |> String.upcase())
+        {"method", v}, acc -> Map.put(acc, "method", v |> to_string() |> String.upcase())
+        {k, v}, acc -> Map.put(acc, to_string(k), v)
+      end)
+
+    url = validate_batch_url!(normalized["url"])
+
+    if Map.has_key?(normalized, "id") and not is_nil(normalized["id"]) do
+      validate_item_id!(normalized["id"])
+    end
+
+    case normalized["atomicityGroup"] do
+      nil -> :ok
+      "" -> :ok
+      group -> validate_boundary!("atomicity_group", group)
+    end
+
+    Map.put(normalized, "url", url)
+  end
+
+  defp resolve_batch_boundary!(opts) do
+    case Keyword.fetch(opts, :boundary) do
+      {:ok, nil} -> "batch_#{random_id()}"
+      {:ok, boundary} -> validate_boundary!("boundary", boundary)
+      :error -> "batch_#{random_id()}"
+    end
+  end
+
+  defp validate_boundary!(name, boundary) when is_binary(boundary) do
+    if boundary == "" or byte_size(boundary) > 70 or
+         not Regex.match?(~r/^[A-Za-z0-9_.-]+$/, boundary) do
+      raise ArgumentError,
+            "invalid #{name} #{inspect(boundary)}: expected non-empty ASCII token [A-Za-z0-9_.-] of at most 70 bytes"
+    end
+
+    boundary
+  end
+
+  defp validate_boundary!(name, other) do
+    raise ArgumentError, "invalid #{name}: expected string, got #{inspect(other)}"
+  end
+
+  defp validate_batch_url!(url) when is_binary(url) do
+    trimmed = String.trim(url)
+    down = String.downcase(trimmed)
+    trimmed_no_slash = String.trim_leading(down, "/")
+
+    if trimmed == "" or String.contains?(url, ["\r", "\n", "..", "://"]) or
+         String.starts_with?(trimmed, "//") or String.contains?(down, "%2e%2e") or
+         String.contains?(down, "/0/rest/") or String.starts_with?(trimmed_no_slash, "0/rest/") or
+         trimmed_no_slash == "0/rest" do
+      raise ArgumentError, "invalid batch sub-request URL: #{inspect(url)}"
+    end
+
+    url
+  end
+
+  defp validate_batch_url!(other) do
+    raise ArgumentError, "invalid batch sub-request URL: expected string, got #{inspect(other)}"
+  end
+
+  defp validate_item_id!(id) do
+    id_str = to_string(id)
+
+    if String.contains?(id_str, ["\r", "\n"]) do
+      raise ArgumentError, "invalid batch item id: contains CR/LF characters"
+    end
+
+    id_str
   end
 
   defp build_prefer(continue_on_error?, return_pref) do

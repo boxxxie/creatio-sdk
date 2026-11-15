@@ -28,6 +28,7 @@ defmodule Creatio.Auth do
     Telemetry.span(:auth, %{auth_mode: :forms, base_url: client.base_url}, fn ->
       url = Keyword.get(opts, :url, "/ServiceModel/AuthService.svc/Login")
       body = %{"UserName" => username, "UserPassword" => password}
+      req_opts = Util.extract_req_options(opts, [:url, :json, :method])
 
       req =
         client.req
@@ -36,7 +37,7 @@ defmodule Creatio.Auth do
         |> Req.Request.delete_header("bpmcsrf")
         |> Req.Request.put_header("content-type", "application/json; charset=utf-8")
 
-      case Req.post(req, url: url, json: body) do
+      case Req.post(req, [url: url, json: body] ++ req_opts) do
         {:ok, %Req.Response{} = resp} ->
           handle_forms_login_result(resp, client)
 
@@ -47,7 +48,8 @@ defmodule Creatio.Auth do
   end
 
   def login_forms(%Req.Request{} = req, username, password, opts) do
-    client = Client.from_req(req)
+    client_opts = Keyword.drop(opts, [:url, :req_options])
+    client = Client.from_req(req, client_opts)
     login_forms(client, username, password, opts)
   end
 
@@ -115,8 +117,10 @@ defmodule Creatio.Auth do
     client_secret = Keyword.get(opts, :client_secret) || client.client_secret
 
     identity_url =
-      (Keyword.get(opts, :identity_service_url) || client.identity_service_url || "")
-      |> String.trim_trailing("/")
+      case Keyword.get(opts, :identity_service_url) || client.identity_service_url do
+        url when is_binary(url) -> url |> String.trim() |> String.trim_trailing("/")
+        _ -> ""
+      end
 
     token_path =
       Keyword.get(opts, :token_url) || Keyword.get(client.options, :token_url) ||
@@ -160,7 +164,7 @@ defmodule Creatio.Auth do
               client_secret: client_secret
             ]
 
-            extra_req_opts = Keyword.get(opts, :req_options, [])
+            extra_req_opts = Util.extract_req_options(opts, [:url, :form, :method])
 
             token_req =
               client
@@ -170,21 +174,32 @@ defmodule Creatio.Auth do
             case Req.post(token_req) do
               {:ok, %Req.Response{} = raw_resp} ->
                 case Util.normalize_json_response(raw_resp) do
-                  %{status: 200, body: %{"access_token" => token} = token_body} ->
-                    updated_client =
-                      %Client{
-                        client
-                        | client_id: client_id,
-                          client_secret: client_secret,
-                          identity_service_url:
-                            if(identity_url != "",
-                              do: identity_url,
-                              else: client.identity_service_url
-                            )
-                      }
-                      |> Client.put_bearer_token(token)
+                  %{status: 200, body: %{"access_token" => token} = token_body} = resp ->
+                    trimmed_token = if is_binary(token), do: String.trim(token), else: ""
 
-                    {:ok, updated_client, token_body}
+                    if trimmed_token == "" do
+                      {:error,
+                       Error.new(
+                         status: 200,
+                         code: "OAuthMissingToken",
+                         message: "OAuth token response contained an empty or null access_token.",
+                         response: resp
+                       )}
+                    else
+                      updated_client =
+                        %Client{
+                          client
+                          | client_id: client_id,
+                            identity_service_url:
+                              if(identity_url != "",
+                                do: identity_url,
+                                else: client.identity_service_url
+                              )
+                        }
+                        |> Client.put_bearer_token(trimmed_token)
+
+                      {:ok, updated_client, token_body}
+                    end
 
                   %Req.Response{} = resp ->
                     {:error, Error.from_response(resp)}
@@ -208,8 +223,9 @@ defmodule Creatio.Auth do
   def oauth_health_check(%Client{} = client, opts \\ []) do
     Telemetry.span(:auth, %{auth_mode: :health_check, base_url: client.base_url}, fn ->
       url = Keyword.get(opts, :url, "/0/api/OAuthHealthCheck")
+      req_opts = Util.extract_req_options(opts, [:url, :method])
 
-      case Req.get(client.req, url: url) do
+      case Req.get(client.req, [url: url] ++ req_opts) do
         {:ok, %Req.Response{} = raw_resp} ->
           resp = Util.normalize_json_response(raw_resp)
 

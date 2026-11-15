@@ -468,17 +468,21 @@ defmodule Creatio.RegressionsTest do
       parent = self()
 
       plug = fn conn ->
+        range_headers = Plug.Conn.get_req_header(conn, "range")
+
         send(parent, {
           :seen_field_value_req,
           conn.request_path,
           Plug.Conn.fetch_query_params(conn).query_params,
           Plug.Conn.get_req_header(conn, "x-trace"),
-          Plug.Conn.get_req_header(conn, "range")
+          range_headers
         })
+
+        status = if range_headers == [], do: 200, else: 206
 
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.send_resp(200, ~s({"raw":"bytes"}))
+        |> Plug.Conn.send_resp(status, ~s({"raw":"bytes"}))
       end
 
       client = Client.new(base_url: "https://crm.test", req_options: [plug: plug])
@@ -1248,6 +1252,420 @@ defmodule Creatio.RegressionsTest do
                |> Enum.to_list()
 
       assert msg =~ "ModifiedOn"
+    end
+  end
+
+  describe "10 additional edge-case, pagination, and security regressions" do
+    test "issue 1: streams follow @odata.nextLink and __next under low server caps without wasted page fetches or nil loops" do
+      {:ok, req_count} = Agent.start_link(fn -> 0 end)
+      on_exit(fn -> if Process.alive?(req_count), do: Agent.stop(req_count) end)
+
+      # Server caps page 1 to 2 rows (below requested page_size: 5) and returns @odata.nextLink
+      next_link_plug = fn conn ->
+        attempt = Agent.get_and_update(req_count, fn n -> {n + 1, n + 1} end)
+        conn = Plug.Conn.fetch_query_params(conn)
+
+        case attempt do
+          1 ->
+            assert conn.request_path == "/0/odata/Contact"
+
+            Req.Test.json(conn, %{
+              "value" => [%{"Id" => "1"}, %{"Id" => "2"}],
+              "@odata.nextLink" =>
+                "https://test.creatio.com/0/odata/Contact?$skiptoken=page2&$top=5"
+            })
+
+          2 ->
+            assert conn.query_params["$skiptoken"] == "page2"
+
+            Req.Test.json(conn, %{
+              "value" => [%{"Id" => "3"}],
+              "@odata.nextLink" => nil
+            })
+
+          _ ->
+            flunk("unexpected extra request attempt #{attempt}")
+        end
+      end
+
+      client =
+        Client.new(base_url: "https://test.creatio.com", req_options: [plug: next_link_plug])
+
+      records =
+        Creatio.stream!(client, "Contact", page_size: 5)
+        |> Enum.to_list()
+
+      assert Enum.map(records, & &1["Id"]) == ["1", "2", "3"]
+      assert Agent.get(req_count, & &1) == 2
+
+      # OData3 __next pagination under low server cap
+      Agent.update(req_count, fn _ -> 0 end)
+
+      o3_plug = fn conn ->
+        attempt = Agent.get_and_update(req_count, fn n -> {n + 1, n + 1} end)
+        conn = Plug.Conn.fetch_query_params(conn)
+
+        case attempt do
+          1 ->
+            Req.Test.json(conn, %{
+              "d" => %{
+                "results" => [%{"Id" => "o3-1"}],
+                "__next" =>
+                  "https://test.creatio.com/0/ServiceModel/EntityDataService.svc/ContactCollection?$skiptoken=next"
+              }
+            })
+
+          2 ->
+            assert conn.query_params["$skiptoken"] == "next"
+            Req.Test.json(conn, %{"d" => %{"results" => [%{"Id" => "o3-2"}], "__next" => ""}})
+
+          _ ->
+            flunk("unexpected extra OData3 request #{attempt}")
+        end
+      end
+
+      o3_client = Client.new(base_url: "https://test.creatio.com", req_options: [plug: o3_plug])
+
+      assert Enum.map(OData3.stream!(o3_client, "Contact", page_size: 10), & &1["Id"]) == [
+               "o3-1",
+               "o3-2"
+             ]
+
+      # page_size > 20_000 on small table should not trigger a wasted extra HTTP call
+      Agent.update(req_count, fn _ -> 0 end)
+
+      single_page_plug = fn conn ->
+        Agent.update(req_count, &(&1 + 1))
+        Req.Test.json(conn, %{"value" => [%{"Id" => "only-1"}, %{"Id" => "only-2"}]})
+      end
+
+      sp_client =
+        Client.new(base_url: "https://test.creatio.com", req_options: [plug: single_page_plug])
+
+      assert [%{"Id" => "only-1"}, %{"Id" => "only-2"}] =
+               OData.stream!(sp_client, "Contact", page_size: 25_000) |> Enum.to_list()
+
+      assert Agent.get(req_count, & &1) == 1
+    end
+
+    test "issue 2: supports 206 Partial Content Range downloads and never writes WAF HTML to into: File.stream!" do
+      tmp_dir =
+        Path.join(System.tmp_dir!(), "creatio_waf_gate_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(tmp_dir)
+      on_exit(fn -> File.rm_rf!(tmp_dir) end)
+
+      range_client =
+        Client.new(
+          base_url: "https://test.creatio.com",
+          req_options: [
+            plug: fn conn ->
+              conn
+              |> Plug.Conn.put_resp_header("content-range", "bytes 0-4/100")
+              |> Plug.Conn.put_resp_content_type("application/octet-stream")
+              |> Plug.Conn.send_resp(206, "hello")
+            end
+          ]
+        )
+
+      assert {:ok, "hello"} =
+               OData.get_field_value(range_client, "SysFile", "1", "Data",
+                 headers: [{"range", "bytes=0-4"}]
+               )
+
+      assert {:ok, "hello"} =
+               OData3.get_field_value(range_client, "SysFile", "1", "Data",
+                 headers: [{"range", "bytes=0-4"}]
+               )
+
+      # Both small (<1KB) and large (>1KB) HTTP 200 WAF HTML responses must fail without writing to disk
+      for {label, body} <- [
+            {"small", "<html><iframe src=\"/_Incapsula_Resource\"></iframe></html>"},
+            {"large",
+             "<html><body>" <> String.duplicate("waf-challenge ", 150) <> "</body></html>"}
+          ] do
+        waf_client =
+          Client.new(
+            base_url: "https://test.creatio.com",
+            req_options: [
+              plug: fn conn ->
+                conn
+                |> Plug.Conn.put_resp_content_type("text/html")
+                |> Plug.Conn.send_resp(200, body)
+              end
+            ]
+          )
+
+        dest = Path.join(tmp_dir, "waf_#{label}.bin")
+
+        assert {:error, %Error{status: 200}} =
+                 OData.get_field_value(waf_client, "SysFile", "1", "Data",
+                   into: File.stream!(dest)
+                 )
+
+        refute File.exists?(dest)
+      end
+    end
+
+    test "issue 3: blocks path traversal, DataService read_only :url bypass, and Batch header injection" do
+      ro_client = Client.new(base_url: "https://test.creatio.com", read_only: true)
+
+      for bad_id <- ["1)/../../rest/CustomService/Trigger?x=(", "../etc", "a/b", "1?x=2"] do
+        assert_raise ArgumentError, fn -> OData.get(ro_client, "Contact", bad_id) end
+        assert_raise ArgumentError, fn -> OData.delete(ro_client, "Contact", bad_id) end
+        assert_raise ArgumentError, fn -> OData3.get(ro_client, "Contact", bad_id) end
+        assert_raise ArgumentError, fn -> Batch.add_delete(Batch.new(), "Contact", bad_id) end
+      end
+
+      assert_raise ArgumentError, fn -> OData.get(ro_client, "Contact/../rest", "1") end
+
+      assert_raise ArgumentError, fn ->
+        OData.get_field(ro_client, "Contact", "1", "Name/../$value")
+      end
+
+      assert_raise ArgumentError, fn ->
+        OData.get_navigation(ro_client, "Contact", "1", "Account/../Secret")
+      end
+
+      assert_raise ArgumentError, fn ->
+        DataService.custom_service(ro_client, "Svc/..", "Op", %{})
+      end
+
+      assert {:error, %Error{status: 403, code: "ReadOnlyMode"}} =
+               DataService.select_query(ro_client, %{},
+                 url: "/0/DataService/json/SyncReply/DeleteQuery"
+               )
+
+      assert {:error, %Error{status: 403, code: "ReadOnlyMode"}} =
+               DataService.execute_query(ro_client, "SelectQuery", %{},
+                 url: "/0/DataService/json/SyncReply/InsertQuery"
+               )
+
+      assert {:error, %Error{status: 403, code: "ReadOnlyMode"}} =
+               Req.get(ro_client.req, url: "/0/odata/Contact/../../rest/Trigger")
+               |> then(fn
+                 {:ok, _} -> :ok
+                 {:error, exc} -> Error.wrap_error(exc)
+               end)
+
+      assert_raise ArgumentError, fn ->
+        Batch.execute(Client.new(base_url: "https://test.creatio.com"), "raw",
+          format: :multipart,
+          boundary: "bad;\r\nX-Injected: yes"
+        )
+      end
+    end
+
+    test "issue 4 & issue 5: supports string maps in stream/3, Query.t()/maps in count/3, and strict non-negative integer parsing" do
+      plug = fn conn ->
+        case conn.request_path do
+          "/0/odata/Contact/$count" ->
+            conn
+            |> Plug.Conn.put_resp_content_type("text/plain")
+            |> Plug.Conn.send_resp(200, "42")
+
+          "/0/ServiceModel/EntityDataService.svc/ContactCollection/$count" ->
+            conn
+            |> Plug.Conn.put_resp_content_type("text/plain")
+            |> Plug.Conn.send_resp(200, "7")
+
+          "/0/odata/Contact" ->
+            conn = Plug.Conn.fetch_query_params(conn)
+
+            if conn.query_params["$top"] == "0" do
+              Req.Test.json(conn, %{"@odata.count" => 9, "value" => []})
+            else
+              Req.Test.json(conn, %{"value" => [%{"Id" => "1"}, %{"Id" => "2"}]})
+            end
+
+          "/0/ServiceModel/EntityDataService.svc/ContactCollection" ->
+            resp_count =
+              if String.starts_with?(conn.query_string, "/$count"), do: "11", else: "0"
+
+            conn
+            |> Plug.Conn.put_resp_content_type("text/plain")
+            |> Plug.Conn.send_resp(200, resp_count)
+        end
+      end
+
+      client = Client.new(base_url: "https://test.creatio.com", req_options: [plug: plug])
+
+      assert [%{"Id" => "1"}, %{"Id" => "2"}] =
+               Creatio.stream!(client, "Contact", %{"page_size" => 2, "top" => 2})
+               |> Enum.to_list()
+
+      q = Query.new("Contact") |> Query.filter_eq("Active", true)
+      assert {:ok, 42} = OData.count(client, q, %{"strategy" => :path})
+      assert {:ok, 42} = Creatio.count(q, client, %{strategy: :path})
+      assert {:ok, 9} = OData.count(q, client, strategy: :top_zero)
+      assert {:ok, 7} = OData3.count(client, q, %{"strategy" => :path})
+      assert {:ok, 11} = Creatio.odata3_count(q, client, strategy: :query)
+
+      for bad_body <- ["503 Service Unavailable", "404 Not Found", "2026-11-15 Error", "-1"] do
+        bad_client =
+          Client.new(
+            base_url: "https://test.creatio.com",
+            req_options: [
+              plug: fn conn ->
+                conn
+                |> Plug.Conn.put_resp_content_type("text/plain")
+                |> Plug.Conn.send_resp(200, bad_body)
+              end
+            ]
+          )
+
+        assert {:error, %Error{status: 200}} = OData.count(bad_client, "Contact")
+        assert {:error, %Error{status: 200}} = OData3.count(bad_client, "Contact")
+      end
+    end
+
+    test "issue 7: Auth rejects blank access_token, normalizes identity URL, drops transient secret, and forwards req_options" do
+      for bad_token <- [nil, "", "   "] do
+        bad_client =
+          Client.new(
+            base_url: "https://test.creatio.com",
+            identity_service_url: "https://id.creatio.com/0///",
+            client_id: "cid",
+            req_options: [
+              plug: fn conn ->
+                assert conn.request_path == "/0/connect/token"
+                Req.Test.json(conn, %{"access_token" => bad_token})
+              end
+            ]
+          )
+
+        assert {:error, %Error{code: "OAuthMissingToken", status: 200}} =
+                 Auth.login_oauth(bad_client, client_secret: "transient-sec")
+      end
+
+      ok_client =
+        Client.new(
+          base_url: "https://test.creatio.com",
+          client_id: "cid",
+          req_options: [
+            plug: fn conn ->
+              assert conn.request_path == "/0/connect/token"
+              Req.Test.json(conn, %{"access_token" => "valid-jwt", "expires_in" => 3600})
+            end
+          ]
+        )
+
+      assert {:ok, authed, _token} =
+               Auth.login_oauth(ok_client,
+                 identity_service_url: " https://id.creatio.com/0// ",
+                 client_secret: "transient-sec"
+               )
+
+      assert authed.identity_service_url == "https://id.creatio.com/0"
+      assert authed.client_secret == nil
+      assert authed.auth_token == "valid-jwt"
+
+      forms_req = Req.new()
+
+      forms_plug = fn conn ->
+        assert conn.host == "forms.example.com"
+
+        conn
+        |> Plug.Conn.put_resp_cookie("BPMCSRF", "c1", path: "/")
+        |> Req.Test.json(%{"Code" => 0})
+      end
+
+      assert {:ok, forms_client} =
+               Auth.login_forms(forms_req, "u", "p",
+                 base_url: "https://forms.example.com",
+                 req_options: [plug: forms_plug]
+               )
+
+      assert forms_client.base_url == "https://forms.example.com"
+
+      health_client = Client.new(base_url: "https://test.creatio.com")
+
+      assert {:ok, "Healthy"} =
+               Auth.oauth_health_check(health_client,
+                 req_options: [plug: fn conn -> Plug.Conn.send_resp(conn, 200, "Healthy") end]
+               )
+    end
+
+    test "issue 8: honors opts[:top] in streams, IO.Stream in update_field, 200 error maps, and 4-arg custom_service keyword payloads" do
+      stream_client =
+        Client.new(
+          base_url: "https://test.creatio.com",
+          req_options: [
+            plug: fn conn ->
+              Req.Test.json(conn, %{
+                "value" => [%{"Id" => "1"}, %{"Id" => "2"}, %{"Id" => "3"}, %{"Id" => "4"}]
+              })
+            end
+          ]
+        )
+
+      assert [%{"Id" => "1"}, %{"Id" => "2"}, %{"Id" => "3"}] =
+               Creatio.stream!(stream_client, "Contact", top: 3, page_size: 2)
+               |> Enum.to_list()
+
+      # %IO.Stream{} binary upload in OData.update_field/6
+      {:ok, io_dev} = StringIO.open("binary-stream-content")
+      io_stream = IO.binstream(io_dev, 6)
+
+      try do
+        upload_client =
+          Client.new(
+            base_url: "https://test.creatio.com",
+            req_options: [
+              plug: fn conn ->
+                {:ok, body, conn} = Plug.Conn.read_body(conn)
+                assert body == "binary-stream-content"
+                Plug.Conn.send_resp(conn, 204, "")
+              end
+            ]
+          )
+
+        assert :ok == OData.update_field(upload_client, "Contact", "id-1", "Photo", io_stream)
+      after
+        if Process.alive?(io_dev), do: StringIO.close(io_dev)
+      end
+
+      # HTTP 200 error maps and invalid OData3 shapes
+      err_map_client =
+        Client.new(
+          base_url: "https://test.creatio.com",
+          req_options: [
+            plug: fn conn -> Req.Test.json(conn, %{"error" => %{"message" => "boom"}}) end
+          ]
+        )
+
+      assert {:error, %Error{status: 200}} = OData.get(err_map_client, "Contact", "id-1")
+      assert {:error, %Error{status: 200}} = OData3.get(err_map_client, "Contact", "id-1")
+      assert {:error, %Error{status: 200}} = OData3.list(err_map_client, "Contact")
+
+      nil_o3_client =
+        Client.new(
+          base_url: "https://test.creatio.com",
+          req_options: [plug: fn conn -> Req.Test.json(conn, %{"d" => nil}) end]
+        )
+
+      assert {:error, %Error{status: 200}} = OData3.get(nil_o3_client, "Contact", "id-1")
+
+      # 4-arg DataService.custom_service treats non-option keyword list as JSON payload
+      ds_client =
+        Client.new(
+          base_url: "https://test.creatio.com",
+          req_options: [
+            plug: fn conn ->
+              assert conn.method == "POST"
+              {:ok, body, conn} = Plug.Conn.read_body(conn)
+              assert Jason.decode!(body) == %{"alpha" => 1, "beta" => "two"}
+              Req.Test.json(conn, %{"ok" => true})
+            end
+          ]
+        )
+
+      assert {:ok, %{"ok" => true}} =
+               DataService.custom_service(ds_client, "CustomSvc", "DoWork", alpha: 1, beta: "two")
+
+      assert_raise ArgumentError, fn ->
+        Client.put_bearer_token(ds_client, "")
+      end
     end
   end
 end

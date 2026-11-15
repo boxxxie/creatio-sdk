@@ -534,5 +534,29 @@ defmodule Creatio.OData.QueryTest do
       refute Map.has_key?(params, "$filter")
       refute Map.has_key?(params, "$orderby")
     end
+
+    test "handles custom_params overrides for $top, $skip, $count, $inlinecount, $filter, and $orderby" do
+      q =
+        Query.new("Contact")
+        |> Query.param("$top", "30")
+        |> Query.param("$skip", 10)
+        |> Query.param("$count", true)
+        |> Query.param("$inlinecount", "allpages")
+        |> Query.param("$filter", "Active eq true")
+        |> Query.param("$orderby", "Name asc")
+
+      assert Query.get_top(q) == 30
+      assert Query.get_skip(q) == 10
+
+      reset_params = q |> Query.reset_stream_target() |> Query.to_params()
+      refute Map.has_key?(reset_params, "$top")
+      refute Map.has_key?(reset_params, "$skip")
+      refute Map.has_key?(reset_params, "$count")
+      refute Map.has_key?(reset_params, "$inlinecount")
+
+      stripped_params = q |> Query.strip_filter_and_order() |> Query.to_params()
+      refute Map.has_key?(stripped_params, "$filter")
+      refute Map.has_key?(stripped_params, "$orderby")
+    end
   end
 end

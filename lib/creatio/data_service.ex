@@ -140,6 +140,11 @@ defmodule Creatio.DataService do
   @spec execute_query(Client.t() | Req.Request.t(), String.t(), map(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def execute_query(client_or_req, action, query_payload, opts \\ []) do
+    action = validate_path_segment!(action, "action", "execute_query/4")
+
+    url =
+      validate_query_url!(Keyword.get(opts, :url, "/0/DataService/json/SyncReply/#{action}"))
+
     client = Client.ensure_client(client_or_req)
 
     Telemetry.span(
@@ -150,10 +155,10 @@ defmodule Creatio.DataService do
         base_url: client.base_url
       },
       fn ->
-        if client.read_only and action != "SelectQuery" do
+        if client.read_only and not allowed_read_only_query?(action, url) do
           {:error, read_only_error()}
         else
-          do_execute_query(client, action, query_payload, opts)
+          do_execute_query(client, url, query_payload)
         end
       end
     )
@@ -188,8 +193,7 @@ defmodule Creatio.DataService do
           {:ok, any()} | {:error, Error.t()}
   def custom_service(client_or_req, service_name, endpoint, payload \\ %{}, opts \\ []) do
     {final_payload, final_opts} =
-      if opts == [] and is_list(payload) and payload != [] and Keyword.keyword?(payload) and
-           Enum.any?(Keyword.keys(payload), &(&1 in [:method, :params, :headers, :req_options])) do
+      if opts == [] and custom_service_opts?(payload) do
         {%{}, payload}
       else
         {payload, opts}
@@ -220,9 +224,7 @@ defmodule Creatio.DataService do
     execute_query(client_or_req, action, query_payload, opts)
   end
 
-  defp do_execute_query(%Client{} = client, action, query_payload, opts) do
-    url = Keyword.get(opts, :url, "/0/DataService/json/SyncReply/#{action}")
-
+  defp do_execute_query(%Client{} = client, url, query_payload) do
     req = Req.Request.put_header(client.req, "content-type", "application/json; charset=utf-8")
 
     case Req.post(req, url: url, json: query_payload) do
@@ -254,6 +256,8 @@ defmodule Creatio.DataService do
   end
 
   defp do_custom_service(client_or_req, service_name, endpoint, payload, opts) do
+    service_name = validate_path_segment!(service_name, "service_name", "custom_service/5")
+    endpoint = validate_path_segment!(endpoint, "endpoint", "custom_service/5")
     client = Client.ensure_client(client_or_req)
     {http_method, req_opts} = Keyword.pop(opts, :method, :post)
 
@@ -363,6 +367,57 @@ defmodule Creatio.DataService do
   end
 
   defp apply_custom_headers(req, _), do: req
+
+  defp custom_service_opts?(term) do
+    is_list(term) and term != [] and Keyword.keyword?(term) and
+      Enum.all?(Keyword.keys(term), &(&1 in [:method, :params, :headers, :req_options]))
+  end
+
+  defp validate_path_segment!(val, label, fun_name)
+       when is_atom(val) and not is_nil(val) and not is_boolean(val) do
+    val |> Atom.to_string() |> validate_path_segment!(label, fun_name)
+  end
+
+  defp validate_path_segment!(val, label, fun_name) when is_binary(val) do
+    trimmed = String.trim(val)
+
+    if trimmed != "" and trimmed not in [".", ".."] and not String.contains?(trimmed, "..") and
+         Regex.match?(~r/^[A-Za-z0-9_.-]+$/, trimmed) do
+      trimmed
+    else
+      raise ArgumentError,
+            "#{label} must be a non-empty safe path segment before calling #{fun_name}, got: #{inspect(val)}"
+    end
+  end
+
+  defp validate_path_segment!(other, label, fun_name) do
+    raise ArgumentError,
+          "#{label} must be a non-empty safe path segment before calling #{fun_name}, got: #{inspect(other)}"
+  end
+
+  defp validate_query_url!(url) when is_binary(url) do
+    trimmed = String.trim(url)
+
+    if trimmed == "" or String.contains?(trimmed, ["..", "\r", "\n"]) do
+      raise ArgumentError,
+            "invalid DataService query URL: #{inspect(url)}"
+    else
+      trimmed
+    end
+  end
+
+  defp validate_query_url!(other) do
+    raise ArgumentError, "invalid DataService query URL: #{inspect(other)}"
+  end
+
+  defp allowed_read_only_query?(action, url) do
+    path = URI.parse(url).path || ""
+
+    action == "SelectQuery" and
+      not String.contains?(path, "..") and
+      not String.contains?(path, "/0/rest/") and
+      String.ends_with?(path, "/DataService/json/SyncReply/SelectQuery")
+  end
 
   defp read_only_error do
     Error.new(

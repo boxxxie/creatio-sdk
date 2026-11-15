@@ -514,7 +514,9 @@ defmodule Creatio.OData.Query do
 
   """
   @spec get_top(t()) :: non_neg_integer() | nil
-  def get_top(%__MODULE__{top: top_val}), do: top_val
+  def get_top(%__MODULE__{top: top_val, custom_params: custom_params}) do
+    top_val || parse_non_neg_custom_param(custom_params["$top"])
+  end
 
   @doc """
   Returns the configured `$skip` offset on the query, or `nil` if unset.
@@ -526,19 +528,25 @@ defmodule Creatio.OData.Query do
 
   """
   @spec get_skip(t()) :: non_neg_integer() | nil
-  def get_skip(%__MODULE__{skip: skip_val}), do: skip_val
+  def get_skip(%__MODULE__{skip: skip_val, custom_params: custom_params}) do
+    skip_val || parse_non_neg_custom_param(custom_params["$skip"])
+  end
+
+  defp parse_non_neg_custom_param(val) when is_integer(val) and val >= 0, do: val
+
+  defp parse_non_neg_custom_param(val) when is_binary(val) do
+    case Integer.parse(String.trim(val)) do
+      {int, ""} when int >= 0 -> int
+      _ -> nil
+    end
+  end
+
+  defp parse_non_neg_custom_param(_), do: nil
 
   @doc false
   @spec require_entity!(t(), String.t()) :: String.t()
   def require_entity!(%__MODULE__{entity: entity}, fun_name) when is_binary(entity) do
-    trimmed = String.trim(entity)
-
-    if trimmed == "" do
-      raise ArgumentError,
-            "Creatio.OData.Query must specify a non-empty entity name before calling #{fun_name}"
-    else
-      trimmed
-    end
+    Util.require_entity_name!(entity, fun_name)
   end
 
   def require_entity!(other, fun_name) do
@@ -552,14 +560,25 @@ defmodule Creatio.OData.Query do
 
   @doc false
   @spec reset_stream_target(t()) :: t()
-  def reset_stream_target(%__MODULE__{} = query) do
-    %__MODULE__{query | count: false, top: nil, skip: nil}
+  def reset_stream_target(%__MODULE__{custom_params: custom_params} = query) do
+    %__MODULE__{
+      query
+      | count: false,
+        top: nil,
+        skip: nil,
+        custom_params: Map.drop(custom_params, ["$count", "$inlinecount", "$top", "$skip"])
+    }
   end
 
   @doc false
   @spec strip_filter_and_order(t()) :: t()
-  def strip_filter_and_order(%__MODULE__{} = query) do
-    %__MODULE__{query | filters_rev: [], orderby_rev: []}
+  def strip_filter_and_order(%__MODULE__{custom_params: custom_params} = query) do
+    %__MODULE__{
+      query
+      | filters_rev: [],
+        orderby_rev: [],
+        custom_params: Map.drop(custom_params, ["$filter", "$orderby"])
+    }
   end
 
   @doc """

@@ -278,5 +278,26 @@ defmodule Creatio.BatchTest do
         Batch.execute(client, "raw body", boundary: "b1", format: :multiprat)
       end
     end
+
+    test "issue 10 & issue 3: drops unused :requests field and validates boundary, atomicity_group, and sub-request URLs" do
+      batch = Batch.new()
+      refute Map.has_key?(batch, :requests)
+
+      assert_raise ArgumentError, ~r/invalid batch sub-request URL/, fn ->
+        Batch.add(batch, "GET", "Contact\r\nX-Injected: yes")
+      end
+
+      assert_raise ArgumentError, ~r/invalid batch sub-request URL/, fn ->
+        Batch.add(batch, "GET", "../rest/CustomSvc/Op")
+      end
+
+      assert_raise ArgumentError, ~r/invalid atomicity_group/, fn ->
+        Batch.add_create(batch, "Contact", %{"Name" => "A"}, atomicity_group: "g1; bad")
+      end
+
+      assert_raise ArgumentError, ~r/invalid boundary/, fn ->
+        Batch.to_multipart_iodata(Batch.add_get(batch, "Contact"), boundary: "b1;\r\nbad")
+      end
+    end
   end
 end
