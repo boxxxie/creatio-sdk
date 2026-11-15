@@ -60,13 +60,13 @@ defmodule Creatio.OData.Query do
   """
   @spec select(t(), [String.t() | atom()] | String.t() | atom()) :: t()
   def select(%__MODULE__{} = query, fields) when is_list(fields) do
-    new_fields = Enum.map(fields, &to_string/1)
+    new_fields = normalize_field_list(fields)
 
     existing =
       case query.select do
         nil -> []
         list when is_list(list) -> list
-        str when is_binary(str) -> String.split(str, ",")
+        str when is_binary(str) -> normalize_field_list([str])
       end
 
     %{query | select: Enum.uniq(existing ++ new_fields)}
@@ -141,6 +141,7 @@ defmodule Creatio.OData.Query do
   @doc """
   Alias for `filter_eq/4`.
   """
+  @spec where_eq(t(), String.t() | atom(), any(), keyword()) :: t()
   def where_eq(query, field, value, opts \\ []), do: filter_eq(query, field, value, opts)
 
   @doc """
@@ -288,17 +289,31 @@ defmodule Creatio.OData.Query do
   @doc """
   Adds an OData `day` date function condition (`day({field}) {op} {value}`).
   """
-  @spec filter_day(t(), String.t() | atom(), any(), String.t()) :: t()
+  @spec filter_day(
+          t(),
+          String.t() | atom(),
+          integer() | String.t() | Date.t() | DateTime.t() | NaiveDateTime.t(),
+          String.t() | atom()
+        ) :: t()
   def filter_day(%__MODULE__{} = query, field, day_value, op \\ "eq") do
-    and_filter(query, "day(#{field}) #{op} #{day_value}")
+    op_str = validate_comparison_op!(op)
+    day = extract_day(day_value)
+    and_filter(query, "day(#{field}) #{op_str} #{day}")
   end
 
   @doc """
   Adds an OData `day` date function condition combined with `or` (`day({field}) {op} {value}`).
   """
-  @spec or_filter_day(t(), String.t() | atom(), any(), String.t()) :: t()
+  @spec or_filter_day(
+          t(),
+          String.t() | atom(),
+          integer() | String.t() | Date.t() | DateTime.t() | NaiveDateTime.t(),
+          String.t() | atom()
+        ) :: t()
   def or_filter_day(%__MODULE__{} = query, field, day_value, op \\ "eq") do
-    or_filter(query, "day(#{field}) #{op} #{day_value}")
+    op_str = validate_comparison_op!(op)
+    day = extract_day(day_value)
+    or_filter(query, "day(#{field}) #{op_str} #{day}")
   end
 
   @doc """
@@ -343,28 +358,7 @@ defmodule Creatio.OData.Query do
   """
   @spec filter_in(t(), String.t() | atom(), [any()], keyword()) :: t()
   def filter_in(%__MODULE__{} = query, field, values, opts \\ []) do
-    quoted? = Keyword.get(opts, :quoted, true)
-
-    conditions =
-      values
-      |> Enum.uniq()
-      |> Enum.map(fn
-        nil ->
-          "#{field} eq null"
-
-        val ->
-          formatted =
-            if quoted? do
-              escaped = String.replace(to_string(val), "'", "''")
-              "'#{escaped}'"
-            else
-              to_string(val)
-            end
-
-          "#{field} eq #{formatted}"
-      end)
-
-    case conditions do
+    case build_in_conditions(field, values, opts) do
       [] ->
         # No values matching
         and_filter(query, "1 eq 0")
@@ -382,30 +376,9 @@ defmodule Creatio.OData.Query do
   """
   @spec or_filter_in(t(), String.t() | atom(), [any()], keyword()) :: t()
   def or_filter_in(%__MODULE__{} = query, field, values, opts \\ []) do
-    quoted? = Keyword.get(opts, :quoted, true)
-
-    conditions =
-      values
-      |> Enum.uniq()
-      |> Enum.map(fn
-        nil ->
-          "#{field} eq null"
-
-        val ->
-          formatted =
-            if quoted? do
-              escaped = String.replace(to_string(val), "'", "''")
-              "'#{escaped}'"
-            else
-              to_string(val)
-            end
-
-          "#{field} eq #{formatted}"
-      end)
-
-    case conditions do
+    case build_in_conditions(field, values, opts) do
       [] ->
-        query
+        if is_nil(query.filter), do: or_filter(query, "1 eq 0"), else: query
 
       [single] ->
         or_filter(query, single)
@@ -419,9 +392,9 @@ defmodule Creatio.OData.Query do
   Builds an OData filter condition for a list of UUID / GUID primary keys.
   Since GUIDs in OData 4 are unquoted literals, this formats as `(Id eq uuid1 or Id eq uuid2)`.
   """
-  @spec filter_in_ids(t(), String.t() | atom(), [any()]) :: t()
-  def filter_in_ids(%__MODULE__{} = query, field, ids) when is_list(ids) do
-    filter_in(query, field, ids, quoted: false)
+  @spec filter_in_ids(t(), String.t() | atom(), [any()], keyword()) :: t()
+  def filter_in_ids(%__MODULE__{} = query, field, ids, opts \\ []) when is_list(ids) do
+    filter_in(query, field, ids, Keyword.merge([guid: true, quoted: false], opts))
   end
 
   @doc """
@@ -516,13 +489,13 @@ defmodule Creatio.OData.Query do
   """
   @spec expand(t(), [String.t() | atom()] | String.t() | atom()) :: t()
   def expand(%__MODULE__{} = query, nav_props) when is_list(nav_props) do
-    new_props = Enum.map(nav_props, &to_string/1)
+    new_props = normalize_field_list(nav_props)
 
     existing =
       case query.expand do
         nil -> []
         list when is_list(list) -> list
-        str when is_binary(str) -> String.split(str, ",")
+        str when is_binary(str) -> normalize_field_list([str])
       end
 
     %{query | expand: Enum.uniq(existing ++ new_props)}
@@ -703,6 +676,43 @@ defmodule Creatio.OData.Query do
 
       true ->
         str
+    end
+  end
+
+  @valid_comparison_ops ~w(eq ne gt ge lt le)
+
+  defp normalize_field_list(fields) do
+    fields
+    |> Enum.flat_map(fn f ->
+      f
+      |> to_string()
+      |> String.split(",", trim: true)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+    end)
+  end
+
+  defp build_in_conditions(field, values, opts) do
+    values
+    |> Enum.uniq()
+    |> Enum.map(fn val ->
+      "#{field} eq #{format_literal(val, opts)}"
+    end)
+  end
+
+  defp extract_day(%Date{day: day}), do: day
+  defp extract_day(%DateTime{day: day}), do: day
+  defp extract_day(%NaiveDateTime{day: day}), do: day
+  defp extract_day(day) when is_integer(day) or is_binary(day), do: day
+
+  defp validate_comparison_op!(op) do
+    op_str = to_string(op)
+
+    if op_str in @valid_comparison_ops do
+      op_str
+    else
+      raise ArgumentError,
+            "invalid OData comparison operator #{inspect(op)}, expected one of: #{Enum.join(@valid_comparison_ops, ", ")}"
     end
   end
 

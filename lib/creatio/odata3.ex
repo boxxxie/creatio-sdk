@@ -6,7 +6,7 @@ defmodule Creatio.OData3 do
   Supports collection listing, CRUD, navigation traversal, field values, and counts.
   """
 
-  alias Creatio.{Client, Error}
+  alias Creatio.{Client, Error, Util}
 
   @base_path "/0/ServiceModel/EntityDataService.svc"
 
@@ -21,11 +21,11 @@ defmodule Creatio.OData3 do
     * `:top` - Maximum records to retrieve.
     * `:skip` - Number of records to skip.
     * `:expand` - Related entities to expand.
-    * `:count` - When `true`, requests inline count via `$inlinecount=allpages`.
+    * `:count` - When `true`, requests inline count via `$inlinecount=allpages`; when `false`, overrides `Query.count/2`.
   """
   @spec list(
-          Client.t() | Req.Request.t(),
-          String.t() | Creatio.OData.Query.t(),
+          Client.t() | Req.Request.t() | Creatio.OData.Query.t() | String.t(),
+          String.t() | Creatio.OData.Query.t() | Client.t() | Req.Request.t(),
           keyword() | map()
         ) ::
           {:ok, list() | map()} | {:error, Error.t()}
@@ -35,11 +35,17 @@ defmodule Creatio.OData3 do
     list(client_or_req, query, opts)
   end
 
+  def list(entity, client_or_req, opts)
+      when is_binary(entity) and
+             (is_struct(client_or_req, Client) or is_struct(client_or_req, Req.Request)) do
+    list(client_or_req, entity, opts)
+  end
+
   def list(client_or_req, %Creatio.OData.Query{} = query, opts) do
     client = Client.ensure_client(client_or_req)
     query_params = Creatio.OData.Query.to_params(query)
 
-    query_params =
+    base_params =
       if Map.get(query_params, "$count") == "true" do
         query_params
         |> Map.delete("$count")
@@ -48,18 +54,17 @@ defmodule Creatio.OData3 do
         query_params
       end
 
-    opts_params = normalize_params(opts)
-    params = Map.merge(query_params, opts_params)
-    do_list(client, query.entity, params, opts)
+    params = Util.normalize_odata_params(opts, base_params, {"$inlinecount", "allpages"})
+    do_list(client, query.entity, params)
   end
 
   def list(client_or_req, entity, opts) when is_binary(entity) do
     client = Client.ensure_client(client_or_req)
     params = normalize_params(opts)
-    do_list(client, entity, params, opts)
+    do_list(client, entity, params)
   end
 
-  defp do_list(%Client{} = client, entity, params, opts) do
+  defp do_list(%Client{} = client, entity, params) do
     collection_name = collection_name(entity)
     url = "#{@base_path}/#{collection_name}"
 
@@ -70,7 +75,7 @@ defmodule Creatio.OData3 do
 
     case Req.get(req, url: url, params: params) do
       {:ok, %{status: 200, body: %{"d" => %{"results" => records} = d_map}}} ->
-        if params["$inlinecount"] == "allpages" or Keyword.get(opts, :count, false) do
+        if params["$inlinecount"] == "allpages" do
           count_val = parse_count_value(d_map["__count"] || d_map["count"])
           {:ok, %{records: records, count: count_val, raw: d_map}}
         else
@@ -87,17 +92,28 @@ defmodule Creatio.OData3 do
         {:error, Error.from_response(resp)}
 
       {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        Error.wrap_error(exception)
     end
   end
 
   @doc """
   Same as `list/3`, but raises `Creatio.Error` on failure.
   """
+  @spec list!(
+          Client.t() | Req.Request.t() | Creatio.OData.Query.t() | String.t(),
+          String.t() | Creatio.OData.Query.t() | Client.t() | Req.Request.t(),
+          keyword() | map()
+        ) :: list() | map()
   def list!(client_or_req, entity_or_query, opts \\ [])
 
   def list!(%Creatio.OData.Query{} = query, client_or_req, opts) do
     list!(client_or_req, query, opts)
+  end
+
+  def list!(entity, client_or_req, opts)
+      when is_binary(entity) and
+             (is_struct(client_or_req, Client) or is_struct(client_or_req, Req.Request)) do
+    list!(client_or_req, entity, opts)
   end
 
   def list!(client_or_req, entity_or_query, opts) do
@@ -115,7 +131,7 @@ defmodule Creatio.OData3 do
   def get(client_or_req, entity, id, opts \\ []) do
     client = Client.ensure_client(client_or_req)
     collection_name = collection_name(entity)
-    clean_id = clean_guid(id)
+    clean_id = Util.clean_guid(id)
     url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')"
     params = normalize_params(opts)
 
@@ -135,13 +151,14 @@ defmodule Creatio.OData3 do
         {:error, Error.from_response(resp)}
 
       {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        Error.wrap_error(exception)
     end
   end
 
   @doc """
   Same as `get/4`, but raises `Creatio.Error` on failure.
   """
+  @spec get!(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) :: map()
   def get!(client, entity, id, opts \\ []) do
     case get(client, entity, id, opts) do
       {:ok, record} -> record
@@ -163,7 +180,7 @@ defmodule Creatio.OData3 do
   def get_navigation(client_or_req, entity, id, nav_property, opts \\ []) do
     client = Client.ensure_client(client_or_req)
     collection_name = collection_name(entity)
-    clean_id = clean_guid(id)
+    clean_id = Util.clean_guid(id)
     url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')/#{nav_property}"
     params = normalize_params(opts)
 
@@ -173,6 +190,9 @@ defmodule Creatio.OData3 do
       |> Req.Request.put_header("forceusesession", "true")
 
     case Req.get(req, url: url, params: params) do
+      {:ok, %{status: 204}} ->
+        {:ok, nil}
+
       {:ok, %{status: 200, body: %{"d" => %{"results" => records}}}} ->
         {:ok, records}
 
@@ -186,13 +206,20 @@ defmodule Creatio.OData3 do
         {:error, Error.from_response(resp)}
 
       {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        Error.wrap_error(exception)
     end
   end
 
   @doc """
   Same as `get_navigation/5`, but raises `Creatio.Error` on failure.
   """
+  @spec get_navigation!(
+          Client.t() | Req.Request.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          keyword()
+        ) :: any()
   def get_navigation!(client, entity, id, nav_property, opts \\ []) do
     case get_navigation(client, entity, id, nav_property, opts) do
       {:ok, result} -> result
@@ -208,7 +235,7 @@ defmodule Creatio.OData3 do
   def get_field(client_or_req, entity, id, field_name, opts \\ []) do
     client = Client.ensure_client(client_or_req)
     collection_name = collection_name(entity)
-    clean_id = clean_guid(id)
+    clean_id = Util.clean_guid(id)
     url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')/#{field_name}"
     params = normalize_params(opts)
 
@@ -218,6 +245,9 @@ defmodule Creatio.OData3 do
       |> Req.Request.put_header("forceusesession", "true")
 
     case Req.get(req, url: url, params: params) do
+      {:ok, %{status: 204}} ->
+        {:ok, nil}
+
       {:ok, %{status: 200, body: %{"d" => %{} = d_map}}} ->
         val = Map.get(d_map, field_name, d_map)
         {:ok, val}
@@ -232,13 +262,15 @@ defmodule Creatio.OData3 do
         {:error, Error.from_response(resp)}
 
       {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        Error.wrap_error(exception)
     end
   end
 
   @doc """
   Same as `get_field/5`, but raises `Creatio.Error` on failure.
   """
+  @spec get_field!(Client.t() | Req.Request.t(), String.t(), String.t(), String.t(), keyword()) ::
+          any()
   def get_field!(client, entity, id, field_name, opts \\ []) do
     case get_field(client, entity, id, field_name, opts) do
       {:ok, result} -> result
@@ -250,11 +282,11 @@ defmodule Creatio.OData3 do
   Retrieves raw scalar/stream value in OData 3 (`GET .../{Entity}Collection(guid'{id}')/{field_name}/$value`).
   """
   @spec get_field_value(Client.t() | Req.Request.t(), String.t(), String.t(), String.t()) ::
-          {:ok, binary()} | {:error, Error.t()}
+          {:ok, binary() | nil} | {:error, Error.t()}
   def get_field_value(client_or_req, entity, id, field_name) do
     client = Client.ensure_client(client_or_req)
     collection_name = collection_name(entity)
-    clean_id = clean_guid(id)
+    clean_id = Util.clean_guid(id)
     url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')/#{field_name}/$value"
 
     req =
@@ -262,6 +294,9 @@ defmodule Creatio.OData3 do
       |> Req.Request.put_header("forceusesession", "true")
 
     case Req.get(req, url: url) do
+      {:ok, %{status: 204}} ->
+        {:ok, nil}
+
       {:ok, %{status: 200, body: body}} ->
         {:ok, body}
 
@@ -269,13 +304,15 @@ defmodule Creatio.OData3 do
         {:error, Error.from_response(resp)}
 
       {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        Error.wrap_error(exception)
     end
   end
 
   @doc """
   Same as `get_field_value/4`, but raises `Creatio.Error` on failure.
   """
+  @spec get_field_value!(Client.t() | Req.Request.t(), String.t(), String.t(), String.t()) ::
+          binary() | nil
   def get_field_value!(client, entity, id, field_name) do
     case get_field_value(client, entity, id, field_name) do
       {:ok, result} -> result
@@ -300,22 +337,28 @@ defmodule Creatio.OData3 do
     client = Client.ensure_client(client_or_req)
     collection_name = collection_name(entity)
     strategy = Keyword.get(opts, :strategy, :path)
-
-    url =
-      if strategy == :query do
-        "#{@base_path}/#{collection_name}?/$count"
-      else
-        "#{@base_path}/#{collection_name}/$count"
-      end
-
     params = normalize_params(Keyword.drop(opts, [:strategy]))
+
+    req_opts =
+      if strategy == :query do
+        base = "#{@base_path}/#{collection_name}?/$count"
+
+        url =
+          if map_size(params) > 0 do
+            "#{base}&#{URI.encode_query(params)}"
+          else
+            base
+          end
+
+        [url: url]
+      else
+        url = "#{@base_path}/#{collection_name}/$count"
+        if map_size(params) > 0, do: [url: url, params: params], else: [url: url]
+      end
 
     req =
       client.req
       |> Req.Request.put_header("forceusesession", "true")
-
-    req_opts = [url: url]
-    req_opts = if map_size(params) > 0, do: Keyword.put(req_opts, :params, params), else: req_opts
 
     case Req.get(req, req_opts) do
       {:ok, %{status: 200, body: body}} when is_integer(body) ->
@@ -339,13 +382,14 @@ defmodule Creatio.OData3 do
         {:error, Error.from_response(resp)}
 
       {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        Error.wrap_error(exception)
     end
   end
 
   @doc """
   Same as `count/3`, but raises `Creatio.Error` on failure.
   """
+  @spec count!(Client.t() | Req.Request.t(), String.t(), keyword()) :: integer()
   def count!(client, entity, opts \\ []) do
     case count(client, entity, opts) do
       {:ok, int} -> int
@@ -366,9 +410,9 @@ defmodule Creatio.OData3 do
     * `:expand` - Relations to expand.
   """
   @spec stream(
-          Client.t() | Req.Request.t(),
-          String.t() | Creatio.OData.Query.t(),
-          keyword()
+          Client.t() | Req.Request.t() | Creatio.OData.Query.t() | String.t(),
+          String.t() | Creatio.OData.Query.t() | Client.t() | Req.Request.t(),
+          keyword() | map()
         ) :: Enumerable.t()
   def stream(client_or_req, entity_or_query, opts \\ [])
 
@@ -376,92 +420,35 @@ defmodule Creatio.OData3 do
     stream(client_or_req, query, opts)
   end
 
+  def stream(entity, client_or_req, opts)
+      when is_binary(entity) and
+             (is_struct(client_or_req, Client) or is_struct(client_or_req, Req.Request)) do
+    stream(client_or_req, entity, opts)
+  end
+
   def stream(client_or_req, entity_or_query, opts) do
     client = Client.ensure_client(client_or_req)
-    raw_page_size = Keyword.get(opts, :page_size, 100)
-
-    page_size =
-      case raw_page_size do
-        val when is_binary(val) -> String.to_integer(val)
-        val when is_integer(val) -> val
-      end
-
-    page_size = max(1, page_size)
-    base_opts = Keyword.drop(opts, [:page_size, :top, :skip, :count])
-
-    initial_skip =
-      case entity_or_query do
-        %Creatio.OData.Query{skip: s} when is_integer(s) and s >= 0 -> s
-        _ ->
-          case Keyword.get(opts, :skip, 0) do
-            val when is_binary(val) -> String.to_integer(val)
-            val when is_integer(val) -> val
-            _ -> 0
-          end
-      end
-
-    cleaned_entity_or_query =
-      case entity_or_query do
-        %Creatio.OData.Query{} = q -> %{q | count: false, top: nil, skip: nil}
-        other -> other
-      end
-
-    Stream.resource(
-      fn -> {initial_skip, false} end,
-      fn
-        {_offset, true} ->
-          {:halt, nil}
-
-        {offset, false} ->
-          page_opts =
-            base_opts
-            |> Keyword.put(:top, page_size)
-            |> Keyword.put(:skip, offset)
-
-          case list(client, cleaned_entity_or_query, page_opts) do
-            {:ok, records} when is_list(records) ->
-              len = length(records)
-
-              cond do
-                len == 0 ->
-                  {:halt, nil}
-
-                len < page_size ->
-                  {records, {offset + len, true}}
-
-                true ->
-                  {records, {offset + len, false}}
-              end
-
-            {:ok, %{records: records}} when is_list(records) ->
-              len = length(records)
-
-              cond do
-                len == 0 ->
-                  {:halt, nil}
-
-                len < page_size ->
-                  {records, {offset + len, true}}
-
-                true ->
-                  {records, {offset + len, false}}
-              end
-
-            {:error, error} ->
-              raise error
-          end
-      end,
-      fn _ -> :ok end
-    )
+    Util.paginate_stream(client, entity_or_query, opts, &list/3)
   end
 
   @doc """
   Same as `stream/3`.
   """
+  @spec stream!(
+          Client.t() | Req.Request.t() | Creatio.OData.Query.t() | String.t(),
+          String.t() | Creatio.OData.Query.t() | Client.t() | Req.Request.t(),
+          keyword() | map()
+        ) :: Enumerable.t()
   def stream!(client_or_req, entity_or_query, opts \\ [])
 
   def stream!(%Creatio.OData.Query{} = query, client_or_req, opts) do
     stream!(client_or_req, query, opts)
+  end
+
+  def stream!(entity, client_or_req, opts)
+      when is_binary(entity) and
+             (is_struct(client_or_req, Client) or is_struct(client_or_req, Req.Request)) do
+    stream!(client_or_req, entity, opts)
   end
 
   def stream!(client_or_req, entity_or_query, opts) do
@@ -477,7 +464,12 @@ defmodule Creatio.OData3 do
     client = Client.ensure_client(client_or_req)
 
     if client.read_only do
-      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode")}
+      {:error,
+       Creatio.Error.new(
+         status: 403,
+         code: "ReadOnlyMode",
+         message: "Client is in read-only mode"
+       )}
     else
       collection_name = collection_name(entity)
       url = "#{@base_path}/#{collection_name}"
@@ -505,7 +497,7 @@ defmodule Creatio.OData3 do
           {:error, Error.from_response(resp)}
 
         {:error, exception} ->
-          {:error, Error.new(message: Exception.message(exception), details: exception)}
+          Error.wrap_error(exception)
       end
     end
   end
@@ -513,6 +505,7 @@ defmodule Creatio.OData3 do
   @doc """
   Same as `create/4`, but raises `Creatio.Error` on failure.
   """
+  @spec create!(Client.t() | Req.Request.t(), String.t(), map(), keyword()) :: map()
   def create!(client, entity, attrs, opts \\ []) do
     case create(client, entity, attrs, opts) do
       {:ok, body} -> body
@@ -529,10 +522,15 @@ defmodule Creatio.OData3 do
     client = Client.ensure_client(client_or_req)
 
     if client.read_only do
-      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode")}
+      {:error,
+       Creatio.Error.new(
+         status: 403,
+         code: "ReadOnlyMode",
+         message: "Client is in read-only mode"
+       )}
     else
       collection_name = collection_name(entity)
-      clean_id = clean_guid(id)
+      clean_id = Util.clean_guid(id)
       url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')"
 
       req =
@@ -555,7 +553,7 @@ defmodule Creatio.OData3 do
           {:error, Error.from_response(resp)}
 
         {:error, exception} ->
-          {:error, Error.new(message: Exception.message(exception), details: exception)}
+          Error.wrap_error(exception)
       end
     end
   end
@@ -563,6 +561,8 @@ defmodule Creatio.OData3 do
   @doc """
   Same as `update/5`, but raises `Creatio.Error` on failure.
   """
+  @spec update!(Client.t() | Req.Request.t(), String.t(), String.t(), map(), keyword()) ::
+          :ok | map()
   def update!(client, entity, id, attrs, opts \\ []) do
     case update(client, entity, id, attrs, opts) do
       :ok -> :ok
@@ -580,10 +580,15 @@ defmodule Creatio.OData3 do
     client = Client.ensure_client(client_or_req)
 
     if client.read_only do
-      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode")}
+      {:error,
+       Creatio.Error.new(
+         status: 403,
+         code: "ReadOnlyMode",
+         message: "Client is in read-only mode"
+       )}
     else
       collection_name = collection_name(entity)
-      clean_id = clean_guid(id)
+      clean_id = Util.clean_guid(id)
       url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')"
 
       req =
@@ -601,7 +606,7 @@ defmodule Creatio.OData3 do
           {:error, Error.from_response(resp)}
 
         {:error, exception} ->
-          {:error, Error.new(message: Exception.message(exception), details: exception)}
+          Error.wrap_error(exception)
       end
     end
   end
@@ -609,24 +614,12 @@ defmodule Creatio.OData3 do
   @doc """
   Same as `delete/4`, but raises `Creatio.Error` on failure.
   """
+  @spec delete!(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) :: :ok
   def delete!(client, entity, id, opts \\ []) do
     case delete(client, entity, id, opts) do
       :ok -> :ok
       {:error, error} -> raise error
     end
-  end
-
-  defp clean_guid(id) do
-    id
-    |> to_string()
-    |> String.trim()
-    |> String.replace_prefix("guid'", "")
-    |> String.replace_suffix("'", "")
-    |> String.replace_prefix("{", "")
-    |> String.replace_suffix("}", "")
-    |> String.replace_prefix("'", "")
-    |> String.replace_suffix("'", "")
-    |> String.trim()
   end
 
   defp parse_count_value(val) when is_integer(val), do: val
@@ -646,79 +639,7 @@ defmodule Creatio.OData3 do
     if String.ends_with?(name, "Collection"), do: name, else: "#{name}Collection"
   end
 
-  defp normalize_params(opts) when is_list(opts) do
-    Enum.reduce(opts, %{}, fn
-      {:select, []}, acc ->
-        acc
-
-      {:select, val}, acc when is_list(val) ->
-        Map.put(acc, "$select", Enum.map_join(val, ",", &to_string/1))
-
-      {:select, val}, acc when is_binary(val) or is_atom(val) ->
-        Map.put(acc, "$select", to_string(val))
-
-      {:filter, val}, acc when is_binary(val) ->
-        Map.put(acc, "$filter", val)
-
-      {key, val}, acc when key in [:orderby, :order_by] ->
-        orderby_str =
-          cond do
-            is_list(val) ->
-              Enum.map_join(val, ",", fn
-                {col, dir} -> "#{col} #{dir}"
-                col -> to_string(col)
-              end)
-
-            is_binary(val) or is_atom(val) ->
-              to_string(val)
-
-            true ->
-              nil
-          end
-
-        if orderby_str, do: Map.put(acc, "$orderby", orderby_str), else: acc
-
-      {:top, val}, acc when not is_nil(val) ->
-        Map.put(acc, "$top", to_string(val))
-
-      {:skip, val}, acc when not is_nil(val) ->
-        Map.put(acc, "$skip", to_string(val))
-
-      {:expand, []}, acc ->
-        acc
-
-      {:expand, val}, acc when is_list(val) ->
-        Map.put(acc, "$expand", Enum.map_join(val, ",", &to_string/1))
-
-      {:expand, val}, acc when is_binary(val) or is_atom(val) ->
-        Map.put(acc, "$expand", to_string(val))
-
-      {:count, true}, acc ->
-        Map.put(acc, "$inlinecount", "allpages")
-
-      {:inlinecount, val}, acc when not is_nil(val) ->
-        Map.put(acc, "$inlinecount", to_string(val))
-
-      {:params, map}, acc when is_map(map) ->
-        Map.merge(acc, map)
-
-      {:params, list}, acc when is_list(list) ->
-        Enum.reduce(list, acc, fn {k, v}, a -> Map.put(a, to_string(k), to_string(v)) end)
-
-      {key, val}, acc when is_binary(key) and is_list(val) ->
-        Map.put(acc, key, Enum.map_join(val, ",", &to_string/1))
-
-      {key, val}, acc when is_binary(key) ->
-        Map.put(acc, key, to_string(val))
-
-      _, acc ->
-        acc
-    end)
-  end
-
-  defp normalize_params(map) when is_map(map) do
-    map
-    |> Map.to_list()
-    |> normalize_params()
+  defp normalize_params(opts) do
+    Util.normalize_odata_params(opts, %{}, {"$inlinecount", "allpages"})
   end
 end

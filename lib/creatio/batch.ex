@@ -22,7 +22,7 @@ defmodule Creatio.Batch do
       {:ok, responses} = Creatio.Batch.execute(client, batch, format: :multipart)
   """
 
-  alias Creatio.{Client, Error}
+  alias Creatio.{Client, Error, Util}
 
   defmodule Response do
     @moduledoc """
@@ -31,7 +31,7 @@ defmodule Creatio.Batch do
     defstruct [:id, :status, :headers, :body, :atomicity_group]
 
     @type t :: %__MODULE__{
-            id: String.t(),
+            id: String.t() | nil,
             status: integer(),
             headers: map(),
             body: any(),
@@ -64,11 +64,13 @@ defmodule Creatio.Batch do
     end
   end
 
-  defstruct requests: [], continue_on_error: false
+  defstruct requests: [], continue_on_error: false, reversed?: false, count: 0
 
   @type t :: %__MODULE__{
           requests: [map()],
-          continue_on_error: boolean()
+          continue_on_error: boolean(),
+          reversed?: boolean(),
+          count: non_neg_integer()
         }
 
   @doc """
@@ -82,16 +84,26 @@ defmodule Creatio.Batch do
   def new(opts \\ []) do
     %__MODULE__{
       requests: [],
-      continue_on_error: Keyword.get(opts, :continue_on_error, false)
+      continue_on_error: Keyword.get(opts, :continue_on_error, false),
+      reversed?: true,
+      count: 0
     }
   end
 
   @doc """
   Adds a generic request to the batch.
   """
-  @spec add(t(), String.t(), String.t(), keyword()) :: t()
+  @spec add(t(), String.t() | atom(), String.t(), keyword()) :: t()
   def add(%__MODULE__{} = batch, method, url, opts \\ []) do
-    id = Keyword.get(opts, :id) || "req_#{length(batch.requests) + 1}"
+    {reversed_reqs, current_count} =
+      if batch.reversed? do
+        {batch.requests, batch.count}
+      else
+        {Enum.reverse(batch.requests), length(batch.requests)}
+      end
+
+    next_count = current_count + 1
+    id = Keyword.get(opts, :id) || "req_#{next_count}"
     body = Keyword.get(opts, :body)
     atomicity_group = Keyword.get(opts, :atomicity_group)
 
@@ -113,9 +125,12 @@ defmodule Creatio.Batch do
 
     headers =
       if user_headers do
-        user_headers
-        |> Map.new(fn {k, v} -> {to_string(k), to_string(v)} end)
-        |> then(&Map.merge(default_headers, &1))
+        normalized_user = Map.new(user_headers, fn {k, v} -> {to_string(k), to_string(v)} end)
+        user_downcased = MapSet.new(normalized_user, fn {k, _v} -> String.downcase(k) end)
+
+        default_headers
+        |> Map.reject(fn {k, _v} -> MapSet.member?(user_downcased, String.downcase(k)) end)
+        |> Map.merge(normalized_user)
       else
         default_headers
       end
@@ -123,14 +138,14 @@ defmodule Creatio.Batch do
     item =
       %{
         "id" => to_string(id),
-        "method" => String.upcase(to_string(method)),
+        "method" => method |> to_string() |> String.upcase(),
         "url" => url,
         "headers" => headers
       }
       |> maybe_put("body", body)
       |> maybe_put("atomicityGroup", atomicity_group)
 
-    %{batch | requests: batch.requests ++ [item]}
+    %{batch | requests: [item | reversed_reqs], reversed?: true, count: next_count}
   end
 
   @doc """
@@ -150,7 +165,7 @@ defmodule Creatio.Batch do
 
   def add_get(%__MODULE__{} = batch, entity, id)
       when is_binary(entity) and is_binary(id) do
-    add(batch, "GET", "#{entity}(#{id})", [])
+    add(batch, "GET", "#{entity}(#{Util.clean_guid(id)})", [])
   end
 
   @doc """
@@ -159,7 +174,7 @@ defmodule Creatio.Batch do
   @spec add_get(t(), String.t(), String.t(), keyword()) :: t()
   def add_get(%__MODULE__{} = batch, entity, id, opts)
       when is_binary(entity) and is_binary(id) and is_list(opts) do
-    add(batch, "GET", "#{entity}(#{id})", opts)
+    add(batch, "GET", "#{entity}(#{Util.clean_guid(id)})", opts)
   end
 
   @doc """
@@ -175,7 +190,7 @@ defmodule Creatio.Batch do
   """
   @spec add_update(t(), String.t(), String.t(), map(), keyword()) :: t()
   def add_update(%__MODULE__{} = batch, entity, id, attrs, opts \\ []) do
-    add(batch, "PATCH", "#{entity}(#{id})", Keyword.put(opts, :body, attrs))
+    add(batch, "PATCH", "#{entity}(#{Util.clean_guid(id)})", Keyword.put(opts, :body, attrs))
   end
 
   @doc """
@@ -183,15 +198,15 @@ defmodule Creatio.Batch do
   """
   @spec add_delete(t(), String.t(), String.t(), keyword()) :: t()
   def add_delete(%__MODULE__{} = batch, entity, id, opts \\ []) do
-    add(batch, "DELETE", "#{entity}(#{id})", opts)
+    add(batch, "DELETE", "#{entity}(#{Util.clean_guid(id)})", opts)
   end
 
   @doc """
   Converts the batch to the JSON payload map expected by `/0/odata/$batch`.
   """
   @spec to_payload(t()) :: map()
-  def to_payload(%__MODULE__{requests: requests}) do
-    %{"requests" => requests}
+  def to_payload(%__MODULE__{} = batch) do
+    %{"requests" => ordered_requests(batch)}
   end
 
   @doc """
@@ -199,14 +214,9 @@ defmodule Creatio.Batch do
   Returns `{boundary, body}`.
   """
   @spec to_multipart(t(), keyword()) :: {String.t(), String.t()}
-  def to_multipart(%__MODULE__{requests: requests}, opts \\ []) do
+  def to_multipart(%__MODULE__{} = batch, opts \\ []) do
     batch_boundary = Keyword.get(opts, :boundary) || "batch_#{random_id()}"
-
-    # Group requests by atomicityGroup.
-    # Requests without atomicityGroup that are write operations (POST, PATCH, PUT, DELETE)
-    # are put in an automatic changeset as required by OData 4.
-    # GET requests without atomicityGroup can be direct batch parts.
-    parts = build_multipart_parts(requests, batch_boundary)
+    parts = build_multipart_parts(ordered_requests(batch), batch_boundary)
     body = Enum.join(parts, "\r\n") <> "\r\n--#{batch_boundary}--\r\n"
 
     {batch_boundary, body}
@@ -231,10 +241,17 @@ defmodule Creatio.Batch do
 
   def execute(client_or_req, %__MODULE__{} = batch, opts) do
     client = Client.ensure_client(client_or_req)
+    requests = ordered_requests(batch)
 
-    if client.read_only and Enum.any?(batch.requests, fn r -> String.upcase(r["method"] || "GET") not in ["GET", "HEAD", "OPTIONS"] end) do
-      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode. Batch contains mutation requests.")}
+    if client.read_only and Enum.any?(requests, &mutation_request?/1) do
+      {:error,
+       Error.new(
+         status: 403,
+         code: "ReadOnlyMode",
+         message: "Client is in read-only mode. Batch contains mutation requests."
+       )}
     else
+      normalized_batch = %{batch | requests: requests, reversed?: false}
       url = Keyword.get(opts, :url, "/0/odata/$batch")
       format = Keyword.get(opts, :format, :json)
 
@@ -243,17 +260,26 @@ defmodule Creatio.Batch do
 
       case format do
         :multipart ->
-          execute_multipart(client, batch, url, continue_on_error, opts)
+          execute_multipart(client, normalized_batch, url, continue_on_error, opts)
 
         _ ->
-          execute_json(client, batch, url, continue_on_error)
+          execute_json(client, normalized_batch, url, continue_on_error)
       end
     end
   end
 
-  def execute(client_or_req, %{"requests" => _} = payload, opts) do
+  def execute(client_or_req, %{"requests" => requests}, opts) when is_list(requests) do
     batch = %__MODULE__{
-      requests: payload["requests"],
+      requests: Enum.map(requests, &normalize_raw_request/1),
+      continue_on_error: Keyword.get(opts, :continue_on_error, false)
+    }
+
+    execute(client_or_req, batch, opts)
+  end
+
+  def execute(client_or_req, %{requests: requests}, opts) when is_list(requests) do
+    batch = %__MODULE__{
+      requests: Enum.map(requests, &normalize_raw_request/1),
       continue_on_error: Keyword.get(opts, :continue_on_error, false)
     }
 
@@ -262,7 +288,7 @@ defmodule Creatio.Batch do
 
   def execute(client_or_req, requests, opts) when is_list(requests) do
     batch = %__MODULE__{
-      requests: requests,
+      requests: Enum.map(requests, &normalize_raw_request/1),
       continue_on_error: Keyword.get(opts, :continue_on_error, false)
     }
 
@@ -273,7 +299,13 @@ defmodule Creatio.Batch do
     client = Client.ensure_client(client_or_req)
 
     if client.read_only do
-      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode. Binary batch requests are not supported in read-only mode.")}
+      {:error,
+       Error.new(
+         status: 403,
+         code: "ReadOnlyMode",
+         message:
+           "Client is in read-only mode. Binary batch requests are not supported in read-only mode."
+       )}
     else
       url = Keyword.get(opts, :url, "/0/odata/$batch")
 
@@ -291,30 +323,7 @@ defmodule Creatio.Batch do
         |> Req.Request.put_header("accept", "application/json")
         |> Req.Request.put_header("forceusesession", "true")
 
-      case Req.post(req, url: url, body: body) do
-        {:ok, %{status: 200, body: %{"responses" => _}} = resp} ->
-          parse_json_batch_response(resp)
-
-        {:ok, %{status: status, body: resp_body} = resp}
-        when status in 200..299 and is_binary(resp_body) ->
-          content_type = get_resp_content_type(resp)
-
-          if String.contains?(content_type, "multipart/mixed") do
-            resp_boundary = extract_boundary_from_header(content_type)
-            parse_multipart_response(resp_body, resp_boundary)
-          else
-            parse_json_batch_response(resp)
-          end
-
-        {:ok, %{status: status, body: %{}} = resp} when status in 200..299 ->
-          parse_json_batch_response(resp)
-
-        {:ok, %Req.Response{} = resp} ->
-          {:error, Error.from_response(resp)}
-
-        {:error, exception} ->
-          {:error, Error.new(message: Exception.message(exception), details: exception)}
-      end
+      handle_batch_response(Req.post(req, url: url, body: body))
     end
   end
 
@@ -337,16 +346,7 @@ defmodule Creatio.Batch do
         req
       end
 
-    case Req.post(req, url: url, json: payload) do
-      {:ok, %{status: status} = resp} when status in 200..299 ->
-        parse_json_batch_response(resp)
-
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
-
-      {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
-    end
+    handle_batch_response(Req.post(req, url: url, json: payload))
   end
 
   defp execute_multipart(client, batch, url, continue_on_error, opts) do
@@ -368,33 +368,47 @@ defmodule Creatio.Batch do
         req
       end
 
-    case Req.post(req, url: url, body: body) do
-      {:ok, %{status: 200, body: %{"responses" => _}} = resp} ->
+    handle_batch_response(Req.post(req, url: url, body: body))
+  end
+
+  defp handle_batch_response(
+         {:ok, %Req.Response{status: status, body: %{"responses" => _}} = resp}
+       )
+       when status in 200..299 do
+    parse_json_batch_response(resp)
+  end
+
+  defp handle_batch_response({:ok, %Req.Response{status: status, body: resp_body} = resp})
+       when status in 200..299 and is_binary(resp_body) do
+    content_type = resp |> get_resp_content_type() |> String.downcase()
+
+    cond do
+      String.contains?(content_type, "multipart/mixed") ->
+        resp_boundary = extract_boundary_from_header(content_type)
+        parse_multipart_response(resp_body, resp_boundary)
+
+      String.trim(resp_body) == "" ->
+        {:ok, []}
+
+      true ->
         parse_json_batch_response(resp)
-
-      {:ok, %{status: status, body: resp_body} = resp}
-      when status in 200..299 and is_binary(resp_body) ->
-        content_type = get_resp_content_type(resp)
-
-        if String.contains?(content_type, "multipart/mixed") do
-          resp_boundary = extract_boundary_from_header(content_type)
-          parse_multipart_response(resp_body, resp_boundary)
-        else
-          parse_json_batch_response(resp)
-        end
-
-      {:ok, %{status: status, body: %{}} = resp} when status in 200..299 ->
-        parse_json_batch_response(resp)
-
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
-
-      {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
     end
   end
 
-  defp parse_json_batch_response(%{body: %{"responses" => raw_responses}}) do
+  defp handle_batch_response({:ok, %Req.Response{status: status, body: %{}} = resp})
+       when status in 200..299 do
+    parse_json_batch_response(resp)
+  end
+
+  defp handle_batch_response({:ok, %Req.Response{} = resp}) do
+    {:error, Error.from_response(resp)}
+  end
+
+  defp handle_batch_response({:error, exception}) do
+    Error.wrap_error(exception)
+  end
+
+  defp parse_json_batch_response(%Req.Response{body: %{"responses" => raw_responses}}) do
     responses =
       Enum.map(raw_responses, fn r ->
         status =
@@ -424,29 +438,32 @@ defmodule Creatio.Batch do
     {:ok, responses}
   end
 
-  defp parse_json_batch_response(%{body: body_str} = resp) when is_binary(body_str) do
+  defp parse_json_batch_response(%Req.Response{body: body_str} = resp) when is_binary(body_str) do
     case Jason.decode(body_str) do
       {:ok, %{"responses" => _} = map} ->
-        parse_json_batch_response(%{resp | body: map})
+        parse_json_batch_response(%Req.Response{resp | body: map})
 
       {:ok, %{} = entity} ->
-        parse_json_batch_response(%{resp | body: entity})
+        parse_json_batch_response(%Req.Response{resp | body: entity})
 
       _ ->
-        {:ok, []}
+        {:error,
+         Error.new(
+           status: resp.status,
+           message: "Unexpected non-JSON batch response",
+           details: body_str,
+           response: resp
+         )}
     end
   end
 
-  defp parse_json_batch_response(%{body: %{} = entity} = resp) do
-    status = Map.get(resp, :status, 200)
-    headers = Map.get(resp, :headers, %{})
-
+  defp parse_json_batch_response(%Req.Response{body: %{} = entity} = resp) do
     {:ok,
      [
        %Response{
          id: entity["Id"] || entity["id"] || "1",
-         status: status,
-         headers: headers,
+         status: resp.status || 200,
+         headers: resp.headers || %{},
          body: entity,
          atomicity_group: nil
        }
@@ -480,30 +497,54 @@ defmodule Creatio.Batch do
     case String.split(body, "--#{clean_boundary}") do
       [_preamble | parts] ->
         Enum.flat_map(parts, fn part ->
-          trimmed = String.trim(part)
+          stripped = strip_boundary_framing(part)
+          trimmed_check = String.trim(stripped)
 
           cond do
-            trimmed == "" or trimmed == "--" or String.starts_with?(trimmed, "--") ->
+            trimmed_check == "" or trimmed_check == "--" or
+                String.starts_with?(trimmed_check, "--") ->
               []
 
-            match =
-                Regex.run(
-                  ~r/Content-Type:\s*multipart\/mixed;\s*boundary="?([^";\s\r\n]+)"?/i,
-                  trimmed
-                ) ->
-              [_, inner_boundary] = match
-              clean_inner = clean_boundary_str(inner_boundary)
-
-              group = extract_group_name(clean_inner)
-              do_parse_multipart(trimmed, clean_inner, group)
-
             true ->
-              parse_http_response_part(trimmed, current_group)
+              {mime_headers, _mime_body} = split_mime_headers(stripped)
+
+              case Regex.run(
+                     ~r/Content-Type:\s*multipart\/mixed;\s*boundary="?([^";\s\r\n]+)"?/i,
+                     mime_headers
+                   ) do
+                [_, inner_boundary] ->
+                  clean_inner = clean_boundary_str(inner_boundary)
+                  group = extract_group_name(clean_inner)
+                  do_parse_multipart(stripped, clean_inner, group)
+
+                nil ->
+                  parse_http_response_part(stripped, current_group)
+              end
           end
         end)
 
       _ ->
         []
+    end
+  end
+
+  defp strip_boundary_framing(part) do
+    part
+    |> String.replace_prefix("\r\n", "")
+    |> String.replace_prefix("\n", "")
+    |> then(fn s ->
+      cond do
+        String.ends_with?(s, "\r\n") -> String.replace_suffix(s, "\r\n", "")
+        String.ends_with?(s, "\n") -> String.replace_suffix(s, "\n", "")
+        true -> s
+      end
+    end)
+  end
+
+  defp split_mime_headers(part) do
+    case String.split(part, ~r/\r?\n\r?\n/, parts: 2) do
+      [headers, body] -> {headers, body}
+      [headers] -> {headers, ""}
     end
   end
 
@@ -521,7 +562,7 @@ defmodule Creatio.Batch do
   end
 
   defp parse_http_response_part(part, current_group) do
-    case Regex.run(~r/HTTP\/1\.[01]\s+(\d{3})[^\r\n]*/i, part) do
+    case Regex.run(~r/HTTP\/(?:1\.[01]|2(?:\.0)?)\s+(\d{3})[^\r\n]*/i, part) do
       [status_line, status_str] ->
         status = String.to_integer(status_str)
         [mime_headers_part, rest] = String.split(part, status_line, parts: 2)
@@ -573,15 +614,7 @@ defmodule Creatio.Batch do
     case String.split(clean_text, ~r/\r?\n\r?\n/, parts: 2) do
       [raw_headers, body] ->
         headers = parse_headers(raw_headers)
-
-        body_trimmed =
-          if String.ends_with?(body, "\r\n") do
-            String.slice(body, 0..-3//1)
-          else
-            body
-          end
-
-        {headers, body_trimmed}
+        {headers, body}
 
       [raw_headers] ->
         headers = parse_headers(raw_headers)
@@ -603,42 +636,64 @@ defmodule Creatio.Batch do
   end
 
   defp build_multipart_parts(requests, batch_boundary) do
-    {direct_gets, writes_and_groups} =
-      Enum.split_with(requests, fn r ->
-        r["method"] == "GET" and is_nil(r["atomicityGroup"])
+    # Preserve request order:
+    # - Read requests (GET/HEAD/OPTIONS) are always direct top-level batch parts
+    #   (OData 4 forbids read operations inside changesets).
+    # - Grouped writes sharing an explicit `atomicityGroup` are emitted together in a
+    #   changeset at the position of their first occurrence.
+    # - Ungrouped writes each receive their own single-request changeset so they execute
+    #   independently (matching JSON batch semantics).
+    {entries, group_buckets} =
+      Enum.reduce(requests, {[], %{}}, fn req, {acc, groups} ->
+        if mutation_request?(req) do
+          case req["atomicityGroup"] do
+            nil ->
+              {[{:single_changeset, req} | acc], groups}
+
+            group_name ->
+              if Map.has_key?(groups, group_name) do
+                {acc, Map.update!(groups, group_name, &[req | &1])}
+              else
+                {[{:group, group_name} | acc], Map.put(groups, group_name, [req])}
+              end
+          end
+        else
+          {[{:direct, req} | acc], groups}
+        end
       end)
 
-    get_parts =
-      Enum.map(direct_gets, fn req ->
+    entries
+    |> Enum.reverse()
+    |> Enum.map(fn
+      {:direct, req} ->
         build_http_request_block(req, batch_boundary)
+
+      {:single_changeset, req} ->
+        build_changeset_block("op_#{req["id"] || random_id()}", [req], batch_boundary)
+
+      {:group, group_name} ->
+        group_reqs = group_buckets |> Map.fetch!(group_name) |> Enum.reverse()
+        build_changeset_block(group_name, group_reqs, batch_boundary)
+    end)
+  end
+
+  defp build_changeset_block(group_name, reqs, batch_boundary) do
+    changeset_boundary = "changeset_#{group_name}_#{random_id()}"
+
+    inner_blocks =
+      Enum.map(reqs, fn req ->
+        "--#{changeset_boundary}\r\n" <>
+          "Content-Type: application/http\r\n" <>
+          "Content-Transfer-Encoding: binary\r\n\r\n" <>
+          build_raw_http_message(req)
       end)
 
-    grouped_writes =
-      Enum.group_by(writes_and_groups, fn r ->
-        r["atomicityGroup"] || "default_changeset"
-      end)
+    changeset_content =
+      Enum.join(inner_blocks, "\r\n") <> "\r\n--#{changeset_boundary}--\r\n"
 
-    changeset_parts =
-      Enum.map(grouped_writes, fn {group_name, reqs} ->
-        changeset_boundary = "changeset_#{group_name}_#{random_id()}"
-
-        inner_blocks =
-          Enum.map(reqs, fn req ->
-            "--#{changeset_boundary}\r\n" <>
-              "Content-Type: application/http\r\n" <>
-              "Content-Transfer-Encoding: binary\r\n\r\n" <>
-              build_raw_http_message(req)
-          end)
-
-        changeset_content =
-          Enum.join(inner_blocks, "\r\n") <> "\r\n--#{changeset_boundary}--\r\n"
-
-        "--#{batch_boundary}\r\n" <>
-          "Content-Type: multipart/mixed; boundary=#{changeset_boundary}\r\n\r\n" <>
-          changeset_content
-      end)
-
-    changeset_parts ++ get_parts
+    "--#{batch_boundary}\r\n" <>
+      "Content-Type: multipart/mixed; boundary=#{changeset_boundary}\r\n\r\n" <>
+      changeset_content
   end
 
   defp build_http_request_block(req, batch_boundary) do
@@ -664,20 +719,18 @@ defmodule Creatio.Batch do
 
     headers_map =
       req_headers
-      |> Map.put_new("Accept", "application/json;odata=verbose")
+      |> put_header_if_absent("Accept", "application/json;odata=verbose")
       |> maybe_put_content_type(body_str)
 
     headers_map =
-      if id && !Map.has_key?(headers_map, "Content-ID") &&
-           !Map.has_key?(headers_map, "content-id") do
-        Map.put(headers_map, "Content-ID", id)
+      if id do
+        put_header_if_absent(headers_map, "Content-ID", id)
       else
         headers_map
       end
 
     rendered_headers =
-      headers_map
-      |> Enum.map_join("\r\n", fn {k, v} -> "#{k}: #{v}" end)
+      Enum.map_join(headers_map, "\r\n", fn {k, v} -> "#{k}: #{v}" end)
 
     header_block = if rendered_headers != "", do: rendered_headers <> "\r\n", else: ""
 
@@ -687,14 +740,49 @@ defmodule Creatio.Batch do
       (body_str || "")
   end
 
+  defp put_header_if_absent(map, name, value) do
+    downcased = String.downcase(name)
+
+    if Enum.any?(map, fn {k, _v} -> String.downcase(to_string(k)) == downcased end) do
+      map
+    else
+      Map.put(map, name, value)
+    end
+  end
+
   defp maybe_put_content_type(map, nil), do: map
 
   defp maybe_put_content_type(map, _body_str) do
-    if Map.has_key?(map, "Content-Type") or Map.has_key?(map, "content-type") do
-      map
-    else
-      Map.put(map, "Content-Type", "application/json;odata=verbose")
-    end
+    put_header_if_absent(map, "Content-Type", "application/json;odata=verbose")
+  end
+
+  defp ordered_requests(%__MODULE__{requests: requests, reversed?: true}),
+    do: Enum.reverse(requests)
+
+  defp ordered_requests(%__MODULE__{requests: requests}), do: requests
+
+  defp mutation_request?(req) when is_map(req) do
+    method =
+      case Map.fetch(req, "method") do
+        {:ok, m} when not is_nil(m) -> m
+        _ -> Map.get(req, :method) || "GET"
+      end
+
+    normalized_method =
+      method
+      |> to_string()
+      |> String.upcase()
+
+    normalized_method not in ["GET", "HEAD", "OPTIONS"]
+  end
+
+  defp normalize_raw_request(req) when is_map(req) do
+    Enum.reduce(req, %{}, fn
+      {:atomicity_group, v}, acc -> Map.put(acc, "atomicityGroup", v)
+      {:method, v}, acc -> Map.put(acc, "method", v |> to_string() |> String.upcase())
+      {"method", v}, acc -> Map.put(acc, "method", v |> to_string() |> String.upcase())
+      {k, v}, acc -> Map.put(acc, to_string(k), v)
+    end)
   end
 
   defp extract_boundary(str_or_headers) when is_binary(str_or_headers) do

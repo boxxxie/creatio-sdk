@@ -35,6 +35,7 @@ defmodule Creatio.DataService do
   @doc """
   Same as `select_query/3`, but raises `Creatio.Error` on failure.
   """
+  @spec select_query!(Client.t() | Req.Request.t(), map(), keyword()) :: map()
   def select_query!(client, query_payload, opts \\ []) do
     case select_query(client, query_payload, opts) do
       {:ok, result} -> result
@@ -50,17 +51,13 @@ defmodule Creatio.DataService do
   @spec insert_query(Client.t() | Req.Request.t(), map(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def insert_query(client_or_req, query_payload, opts \\ []) do
-    client = Client.ensure_client(client_or_req)
-    if client.read_only do
-      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode")}
-    else
-      execute_query(client, "InsertQuery", query_payload, opts)
-    end
+    execute_mutation_query(client_or_req, "InsertQuery", query_payload, opts)
   end
 
   @doc """
   Same as `insert_query/3`, but raises `Creatio.Error` on failure.
   """
+  @spec insert_query!(Client.t() | Req.Request.t(), map(), keyword()) :: map()
   def insert_query!(client, query_payload, opts \\ []) do
     case insert_query(client, query_payload, opts) do
       {:ok, result} -> result
@@ -76,17 +73,13 @@ defmodule Creatio.DataService do
   @spec update_query(Client.t() | Req.Request.t(), map(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def update_query(client_or_req, query_payload, opts \\ []) do
-    client = Client.ensure_client(client_or_req)
-    if client.read_only do
-      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode")}
-    else
-      execute_query(client, "UpdateQuery", query_payload, opts)
-    end
+    execute_mutation_query(client_or_req, "UpdateQuery", query_payload, opts)
   end
 
   @doc """
   Same as `update_query/3`, but raises `Creatio.Error` on failure.
   """
+  @spec update_query!(Client.t() | Req.Request.t(), map(), keyword()) :: map()
   def update_query!(client, query_payload, opts \\ []) do
     case update_query(client, query_payload, opts) do
       {:ok, result} -> result
@@ -102,17 +95,13 @@ defmodule Creatio.DataService do
   @spec delete_query(Client.t() | Req.Request.t(), map(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def delete_query(client_or_req, query_payload, opts \\ []) do
-    client = Client.ensure_client(client_or_req)
-    if client.read_only do
-      {:error, Creatio.Error.new(status: 403, code: "ReadOnlyMode", message: "Client is in read-only mode")}
-    else
-      execute_query(client, "DeleteQuery", query_payload, opts)
-    end
+    execute_mutation_query(client_or_req, "DeleteQuery", query_payload, opts)
   end
 
   @doc """
   Same as `delete_query/3`, but raises `Creatio.Error` on failure.
   """
+  @spec delete_query!(Client.t() | Req.Request.t(), map(), keyword()) :: map()
   def delete_query!(client, query_payload, opts \\ []) do
     case delete_query(client, query_payload, opts) do
       {:ok, result} -> result
@@ -122,16 +111,19 @@ defmodule Creatio.DataService do
 
   @doc """
   Executes a BatchQuery against `/0/DataService/json/SyncReply/BatchQuery`.
+
+  Returns `{:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}}` if the client is in read-only mode.
   """
   @spec batch_query(Client.t() | Req.Request.t(), map(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def batch_query(client_or_req, query_payload, opts \\ []) do
-    execute_query(client_or_req, "BatchQuery", query_payload, opts)
+    execute_mutation_query(client_or_req, "BatchQuery", query_payload, opts)
   end
 
   @doc """
   Same as `batch_query/3`, but raises `Creatio.Error` on failure.
   """
+  @spec batch_query!(Client.t() | Req.Request.t(), map(), keyword()) :: map()
   def batch_query!(client, query_payload, opts \\ []) do
     case batch_query(client, query_payload, opts) do
       {:ok, result} -> result
@@ -141,54 +133,26 @@ defmodule Creatio.DataService do
 
   @doc """
   Executes a generic DataService query against `/0/DataService/json/SyncReply/{action}`.
+
+  Non-`SelectQuery` actions are blocked with `{:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}}`
+  when `client.read_only` is `true`.
   """
   @spec execute_query(Client.t() | Req.Request.t(), String.t(), map(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def execute_query(client_or_req, action, query_payload, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    url = Keyword.get(opts, :url, "/0/DataService/json/SyncReply/#{action}")
 
-    req =
-      client.req
-      |> Req.Request.put_header("content-type", "application/json; charset=utf-8")
-      |> Req.Request.put_header("forceusesession", "true")
-
-    case Req.post(req, url: url, json: query_payload) do
-      {:ok, %{status: status, body: %{} = body} = resp} when status in 200..299 ->
-        if body["success"] in [false, "false"] or body["Success"] in [false, "false"] do
-          {:error, Error.from_response(resp)}
-        else
-          {:ok, body}
-        end
-
-      {:ok, %{status: status, body: body_str} = resp}
-      when status in 200..299 and is_binary(body_str) ->
-        case Jason.decode(body_str) do
-          {:ok, %{} = decoded} ->
-            if decoded["success"] in [false, "false"] or decoded["Success"] in [false, "false"] do
-              {:error, Error.from_response(%{resp | body: decoded})}
-            else
-              {:ok, decoded}
-            end
-
-          _ ->
-            {:ok, body_str}
-        end
-
-      {:ok, %{status: status, body: body}} when status in 200..299 ->
-        {:ok, body}
-
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
-
-      {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+    if client.read_only and action != "SelectQuery" do
+      {:error, read_only_error()}
+    else
+      do_execute_query(client, action, query_payload, opts)
     end
   end
 
   @doc """
   Same as `execute_query/4`, but raises `Creatio.Error` on failure.
   """
+  @spec execute_query!(Client.t() | Req.Request.t(), String.t(), map(), keyword()) :: map()
   def execute_query!(client, action, query_payload, opts \\ []) do
     case execute_query(client, action, query_payload, opts) do
       {:ok, result} -> result
@@ -214,7 +178,7 @@ defmodule Creatio.DataService do
           {:ok, any()} | {:error, Error.t()}
   def custom_service(client_or_req, service_name, endpoint, payload \\ %{}, opts \\ []) do
     {final_payload, final_opts} =
-      if opts == [] and is_list(payload) and Keyword.keyword?(payload) and
+      if opts == [] and is_list(payload) and payload != [] and Keyword.keyword?(payload) and
            Enum.any?(Keyword.keys(payload), &(&1 in [:method, :params, :headers, :req_options])) do
         {%{}, payload}
       else
@@ -223,83 +187,6 @@ defmodule Creatio.DataService do
 
     do_custom_service(client_or_req, service_name, endpoint, final_payload, final_opts)
   end
-
-  defp do_custom_service(client_or_req, service_name, endpoint, payload, opts) do
-    client = Client.ensure_client(client_or_req)
-    url = "/0/rest/#{service_name}/#{endpoint}"
-
-    {http_method, req_opts} = Keyword.pop(opts, :method, :post)
-    {params, req_opts} = Keyword.pop(req_opts, :params, %{})
-    {custom_headers, req_opts} = Keyword.pop(req_opts, :headers, %{})
-    {extra_req_opts, req_opts} = Keyword.pop(req_opts, :req_options, [])
-    req_opts = Keyword.merge(req_opts, extra_req_opts)
-
-    req =
-      client.req
-      |> Req.Request.put_header("forceusesession", "true")
-      |> apply_custom_headers(custom_headers)
-
-    {final_payload, final_params} =
-      if http_method in [:get, :delete] do
-        cond do
-          is_map(payload) and not Map.has_key?(payload, :__struct__) ->
-            {nil, Map.merge(Map.new(params), payload)}
-
-          is_list(payload) and Keyword.keyword?(payload) ->
-            {nil, Keyword.merge(Enum.to_list(params), payload)}
-
-          true ->
-            {payload, params}
-        end
-      else
-        {payload, params}
-      end
-
-    req_opts = Keyword.merge(req_opts, url: url, params: final_params, method: http_method)
-
-    final_payload =
-      if is_list(final_payload) and Keyword.keyword?(final_payload) do
-        Map.new(final_payload)
-      else
-        final_payload
-      end
-
-    req_opts =
-      if is_nil(final_payload) do
-        req_opts
-      else
-        if is_binary(final_payload) do
-          Keyword.put(req_opts, :body, final_payload)
-        else
-          Keyword.put(req_opts, :json, final_payload)
-        end
-      end
-
-    case Req.request(req, req_opts) do
-      {:ok, %{status: status, body: body}} when status in 200..299 ->
-        {:ok, body}
-
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
-
-      {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
-    end
-  end
-
-  defp apply_custom_headers(req, headers) when is_map(headers) do
-    Enum.reduce(headers, req, fn {k, v}, r ->
-      Req.Request.put_header(r, to_string(k), to_string(v))
-    end)
-  end
-
-  defp apply_custom_headers(req, headers) when is_list(headers) do
-    Enum.reduce(headers, req, fn {k, v}, r ->
-      Req.Request.put_header(r, to_string(k), to_string(v))
-    end)
-  end
-
-  defp apply_custom_headers(req, _), do: req
 
   @doc """
   Same as `custom_service/5`, but raises `Creatio.Error` on failure.
@@ -312,23 +199,159 @@ defmodule Creatio.DataService do
           keyword()
         ) ::
           any()
-  def custom_service!(client, service_name, endpoint, payload_or_opts \\ %{}, opts \\ [])
+  def custom_service!(client, service_name, endpoint, payload_or_opts \\ %{}, opts \\ []) do
+    case custom_service(client, service_name, endpoint, payload_or_opts, opts) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
 
-  def custom_service!(client, service_name, endpoint, opts, []) when is_list(opts) do
-    if Keyword.keyword?(opts) do
-      custom_service!(client, service_name, endpoint, %{}, opts)
+  defp execute_mutation_query(client_or_req, action, query_payload, opts) do
+    client = Client.ensure_client(client_or_req)
+
+    if client.read_only do
+      {:error, read_only_error()}
     else
-      case custom_service(client, service_name, endpoint, opts, []) do
-        {:ok, result} -> result
-        {:error, error} -> raise error
+      do_execute_query(client, action, query_payload, opts)
+    end
+  end
+
+  defp do_execute_query(%Client{} = client, action, query_payload, opts) do
+    url = Keyword.get(opts, :url, "/0/DataService/json/SyncReply/#{action}")
+
+    req =
+      client.req
+      |> Req.Request.put_header("content-type", "application/json; charset=utf-8")
+      |> Req.Request.put_header("forceusesession", "true")
+
+    case Req.post(req, url: url, json: query_payload) do
+      {:ok, %Req.Response{status: status, body: %{} = body} = resp} when status in 200..299 ->
+        if body["success"] in [false, "false"] or body["Success"] in [false, "false"] do
+          {:error, Error.from_response(resp)}
+        else
+          {:ok, body}
+        end
+
+      {:ok, %Req.Response{status: status, body: body_str} = resp}
+      when status in 200..299 and is_binary(body_str) ->
+        case Jason.decode(body_str) do
+          {:ok, %{} = decoded} ->
+            if decoded["success"] in [false, "false"] or decoded["Success"] in [false, "false"] do
+              {:error, Error.from_response(%Req.Response{resp | body: decoded})}
+            else
+              {:ok, decoded}
+            end
+
+          _ ->
+            {:ok, body_str}
+        end
+
+      {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
+        {:ok, body}
+
+      {:ok, %Req.Response{} = resp} ->
+        {:error, Error.from_response(resp)}
+
+      {:error, exception} ->
+        Error.wrap_error(exception)
+    end
+  end
+
+  defp do_custom_service(client_or_req, service_name, endpoint, payload, opts) do
+    client = Client.ensure_client(client_or_req)
+    {http_method, req_opts} = Keyword.pop(opts, :method, :post)
+
+    if client.read_only and http_method not in [:get, :head, :options] do
+      {:error, read_only_error()}
+    else
+      url = "/0/rest/#{service_name}/#{endpoint}"
+
+      {params, req_opts} = Keyword.pop(req_opts, :params, %{})
+      {custom_headers, req_opts} = Keyword.pop(req_opts, :headers, %{})
+      {extra_req_opts, req_opts} = Keyword.pop(req_opts, :req_options, [])
+      req_opts = Keyword.merge(req_opts, extra_req_opts)
+
+      req =
+        client.req
+        |> Req.Request.put_header("forceusesession", "true")
+        |> apply_custom_headers(custom_headers)
+
+      {final_payload, final_params} =
+        resolve_custom_payload_and_params(http_method, payload, params)
+
+      req_opts = Keyword.merge(req_opts, url: url, params: final_params, method: http_method)
+
+      final_payload =
+        if is_list(final_payload) and final_payload != [] and Keyword.keyword?(final_payload) do
+          Map.new(final_payload)
+        else
+          final_payload
+        end
+
+      req_opts =
+        cond do
+          is_nil(final_payload) -> req_opts
+          is_binary(final_payload) -> Keyword.put(req_opts, :body, final_payload)
+          true -> Keyword.put(req_opts, :json, final_payload)
+        end
+
+      case Req.request(req, req_opts) do
+        {:ok, %{status: status, body: body}} when status in 200..299 ->
+          {:ok, body}
+
+        {:ok, %Req.Response{} = resp} ->
+          {:error, Error.from_response(resp)}
+
+        {:error, exception} ->
+          Error.wrap_error(exception)
       end
     end
   end
 
-  def custom_service!(client, service_name, endpoint, payload, opts) when is_list(opts) do
-    case custom_service(client, service_name, endpoint, payload, opts) do
-      {:ok, result} -> result
-      {:error, error} -> raise error
+  defp resolve_custom_payload_and_params(http_method, payload, params)
+       when http_method in [:get, :head] do
+    cond do
+      is_map(payload) and not is_struct(payload) ->
+        {nil, Map.merge(stringify_keys(params), stringify_keys(payload))}
+
+      is_list(payload) and payload != [] and Keyword.keyword?(payload) ->
+        {nil, Map.merge(stringify_keys(params), stringify_keys(payload))}
+
+      true ->
+        {payload, params}
     end
+  end
+
+  defp resolve_custom_payload_and_params(:delete, payload, params)
+       when is_nil(payload) or payload == %{} do
+    {nil, params}
+  end
+
+  defp resolve_custom_payload_and_params(_http_method, payload, params) do
+    {payload, params}
+  end
+
+  defp stringify_keys(map) when is_map(map) do
+    Map.new(map, fn {k, v} -> {to_string(k), v} end)
+  end
+
+  defp stringify_keys(list) when is_list(list) do
+    Map.new(list, fn {k, v} -> {to_string(k), v} end)
+  end
+
+  defp apply_custom_headers(req, headers) when is_map(headers) or is_list(headers) do
+    Enum.reduce(headers, req, fn {k, v}, r ->
+      Req.Request.put_header(r, to_string(k), to_string(v))
+    end)
+  end
+
+  defp apply_custom_headers(req, _), do: req
+
+  defp read_only_error do
+    Error.new(
+      status: 403,
+      code: "ReadOnlyMode",
+      message: "Client is in read-only mode"
+    )
   end
 end

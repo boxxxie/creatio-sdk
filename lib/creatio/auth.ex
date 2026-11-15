@@ -38,7 +38,7 @@ defmodule Creatio.Auth do
         handle_forms_login_result(resp, client)
 
       {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        Error.wrap_error(exception)
     end
   end
 
@@ -47,18 +47,18 @@ defmodule Creatio.Auth do
     login_forms(client, username, password, opts)
   end
 
-  defp handle_forms_login_result(%{status: 200, body: body_str} = resp, client)
+  defp handle_forms_login_result(%Req.Response{status: 200, body: body_str} = resp, client)
        when is_binary(body_str) do
     case Jason.decode(body_str) do
       {:ok, %{} = decoded} ->
-        handle_forms_login_result(%{resp | body: decoded}, client)
+        handle_forms_login_result(%Req.Response{resp | body: decoded}, client)
 
       _ ->
         {:error, Error.from_response(resp)}
     end
   end
 
-  defp handle_forms_login_result(%{status: 200, body: %{} = body} = resp, client) do
+  defp handle_forms_login_result(%Req.Response{status: 200, body: %{} = body} = resp, client) do
     code = body["Code"] || body["code"]
 
     cond do
@@ -67,10 +67,7 @@ defmodule Creatio.Auth do
         bpmcsrf = extract_bpmcsrf(cookies, resp.headers)
         cookie_header = Enum.join(cookies, "; ")
 
-        updated_client =
-          client
-          |> Client.put_forms_auth(cookie_header, bpmcsrf)
-
+        updated_client = Client.put_forms_auth(client, cookie_header, bpmcsrf)
         {:ok, updated_client}
 
       code != nil ->
@@ -104,7 +101,8 @@ defmodule Creatio.Auth do
     * `:client_id` - The OAuth client ID (defaults to `client.client_id`).
     * `:client_secret` - The OAuth client secret (defaults to `client.client_secret`).
     * `:identity_service_url` - The base URL of the Identity Service (defaults to `client.identity_service_url`).
-    * `:token_url` - Overrides the token endpoint path (defaults to `"/connect/token"`).
+    * `:token_url` - Overrides the token endpoint path or full URL (defaults to `"/connect/token"`).
+    * `:req_options` - Additional options merged into the request.
   """
   @spec login_oauth(Client.t(), keyword()) ::
           {:ok, Client.t(), map()} | {:error, Error.t()}
@@ -116,7 +114,11 @@ defmodule Creatio.Auth do
       (Keyword.get(opts, :identity_service_url) || client.identity_service_url || "")
       |> String.trim_trailing("/")
 
-    token_path = Keyword.get(opts, :token_url, "/connect/token")
+    token_path =
+      Keyword.get(opts, :token_url) || Keyword.get(client.options, :token_url) ||
+        "/connect/token"
+
+    full_token_url? = String.starts_with?(token_path, ["http://", "https://"])
 
     cond do
       is_nil(client_id) or client_id == "" ->
@@ -125,14 +127,19 @@ defmodule Creatio.Auth do
       is_nil(client_secret) or client_secret == "" ->
         {:error, Error.new(message: "Missing :client_secret for OAuth 2.0 authentication")}
 
-      identity_url == "" ->
+      not full_token_url? and identity_url == "" ->
         {:error, Error.new(message: "Missing :identity_service_url for OAuth 2.0 authentication")}
 
       true ->
         full_token_url =
-          if String.starts_with?(token_path, "http"),
-            do: token_path,
-            else: "#{identity_url}#{token_path}"
+          if full_token_url? do
+            token_path
+          else
+            normalized_path =
+              if String.starts_with?(token_path, "/"), do: token_path, else: "/#{token_path}"
+
+            "#{identity_url}#{normalized_path}"
+          end
 
         form_data = [
           grant_type: "client_credentials",
@@ -140,12 +147,12 @@ defmodule Creatio.Auth do
           client_secret: client_secret
         ]
 
-        req_opts = Keyword.get(client.options, :req_options, [])
+        extra_req_opts = Keyword.get(opts, :req_options, [])
 
         token_req =
-          [url: full_token_url, form: form_data]
-          |> Keyword.merge(req_opts)
-          |> Req.new()
+          client.req
+          |> strip_auth_headers()
+          |> Req.merge([base_url: nil, url: full_token_url, form: form_data] ++ extra_req_opts)
 
         case Req.post(token_req) do
           {:ok, %{status: 200, body: %{"access_token" => token} = token_body}} ->
@@ -154,7 +161,10 @@ defmodule Creatio.Auth do
               |> Client.put_bearer_token(token)
               |> Map.put(:client_id, client_id)
               |> Map.put(:client_secret, client_secret)
-              |> Map.put(:identity_service_url, identity_url)
+              |> Map.put(
+                :identity_service_url,
+                if(identity_url != "", do: identity_url, else: client.identity_service_url)
+              )
 
             {:ok, updated_client, token_body}
 
@@ -162,7 +172,7 @@ defmodule Creatio.Auth do
             {:error, Error.from_response(resp)}
 
           {:error, exception} ->
-            {:error, Error.new(message: Exception.message(exception), details: exception)}
+            Error.wrap_error(exception)
         end
     end
   end
@@ -185,7 +195,7 @@ defmodule Creatio.Auth do
         {:error, Error.from_response(resp)}
 
       {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        Error.wrap_error(exception)
     end
   end
 
@@ -203,12 +213,23 @@ defmodule Creatio.Auth do
       Keyword.get(opts, :url) ||
         "#{String.trim_trailing(base, "/")}/.well-known/openid-configuration"
 
-    req_opts =
-      Keyword.get(client.options, :req_options, [])
-      |> Keyword.merge(Keyword.get(opts, :req_options, []))
+    extra_req_opts = Keyword.get(opts, :req_options, [])
 
-    opts = Keyword.put(opts, :req_options, req_opts)
-    openid_configuration(url, opts)
+    req =
+      client.req
+      |> strip_auth_headers()
+      |> Req.merge([base_url: nil, url: url] ++ extra_req_opts)
+
+    case Req.get(req) do
+      {:ok, %{status: 200, body: body}} ->
+        {:ok, body}
+
+      {:ok, %Req.Response{} = resp} ->
+        {:error, Error.from_response(resp)}
+
+      {:error, exception} ->
+        Error.wrap_error(exception)
+    end
   end
 
   def openid_configuration(url, opts) when is_binary(url) do
@@ -222,8 +243,15 @@ defmodule Creatio.Auth do
         {:error, Error.from_response(resp)}
 
       {:error, exception} ->
-        {:error, Error.new(message: Exception.message(exception), details: exception)}
+        Error.wrap_error(exception)
     end
+  end
+
+  defp strip_auth_headers(req) do
+    req
+    |> Req.Request.delete_header("authorization")
+    |> Req.Request.delete_header("cookie")
+    |> Req.Request.delete_header("bpmcsrf")
   end
 
   defp extract_cookies(headers) when is_map(headers) do
@@ -240,18 +268,34 @@ defmodule Creatio.Auth do
   end
 
   defp parse_set_cookie_raw(list) when is_list(list) do
-    list
-    |> Enum.flat_map(fn item when is_binary(item) ->
-      Regex.split(~r/,\s*(?=[A-Za-z0-9_.-]+=)/, item)
-    end)
-    |> Enum.map(fn cookie_str ->
-      cookie_str
-      |> String.split(";")
-      |> List.first()
-      |> String.trim()
-    end)
-    |> Enum.reject(&(&1 == "" or is_nil(&1)))
-    |> Enum.uniq()
+    # Deduplicate by cookie name keeping the latest Set-Cookie header value
+    # (IIS commonly clears a cookie before setting its new value in the same response).
+    {ordered_names, by_name} =
+      list
+      |> Enum.flat_map(fn item when is_binary(item) ->
+        Regex.split(~r/,\s*(?=[A-Za-z0-9_.-]+=)/, item)
+      end)
+      |> Enum.map(fn cookie_str ->
+        cookie_str
+        |> String.split(";")
+        |> List.first()
+        |> String.trim()
+      end)
+      |> Enum.reject(&(&1 == "" or is_nil(&1)))
+      |> Enum.reduce({[], %{}}, fn cookie, {names, acc} ->
+        name_key =
+          case String.split(cookie, "=", parts: 2) do
+            [name, _val] -> String.downcase(String.trim(name))
+            [name] -> String.downcase(String.trim(name))
+          end
+
+        names = if Map.has_key?(acc, name_key), do: names, else: [name_key | names]
+        {names, Map.put(acc, name_key, cookie)}
+      end)
+
+    ordered_names
+    |> Enum.reverse()
+    |> Enum.map(&Map.fetch!(by_name, &1))
   end
 
   defp extract_bpmcsrf(cookies, headers) when is_list(cookies) do
@@ -260,13 +304,19 @@ defmodule Creatio.Auth do
         cookie = String.trim(cookie)
 
         case Regex.run(~r/^bpmcsrf=(.*)$/i, cookie) do
-          [_, val] -> URI.decode_www_form(val)
+          [_, val] -> safe_uri_decode(val)
           _ -> nil
         end
       end)
 
     from_cookies || extract_header_val(headers, "bpmcsrf") ||
       extract_header_val(headers, "BPMCSRF")
+  end
+
+  defp safe_uri_decode(val) do
+    URI.decode(val)
+  rescue
+    ArgumentError -> val
   end
 
   defp extract_header_val(headers, name) when is_map(headers) do

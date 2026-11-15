@@ -91,18 +91,7 @@ defmodule Creatio.Client do
         System.get_env("CREATIO_CLIENT_SECRET")
 
     req_options = Keyword.get(opts, :req_options, [])
-
-    read_only =
-      Keyword.get(opts, :read_only)
-      |> case do
-        nil ->
-          Application.get_env(:creatio, :read_only)
-          |> case do
-            nil -> System.get_env("CREATIO_READ_ONLY") in ["true", "1"]
-            val -> val
-          end
-        val -> val
-      end
+    read_only = resolve_read_only(opts)
 
     auth_mode =
       cond do
@@ -148,17 +137,19 @@ defmodule Creatio.Client do
       Keyword.get(opts_list, :base_url) || req.options[:base_url] ||
         System.get_env("CREATIO_BASE_URL") || ""
 
-    read_only =
-      Keyword.get(opts_list, :read_only)
-      |> case do
-        nil ->
-          Application.get_env(:creatio, :read_only)
-          |> case do
-            nil -> System.get_env("CREATIO_READ_ONLY") in ["true", "1"]
-            val -> val
-          end
-        val -> val
-      end
+    auth_token = Keyword.get(opts_list, :auth_token)
+    cookie = Keyword.get(opts_list, :cookie)
+    bpmcsrf = Keyword.get(opts_list, :bpmcsrf)
+    read_only = resolve_read_only(opts_list)
+
+    auth_mode =
+      Keyword.get_lazy(opts_list, :auth_mode, fn ->
+        cond do
+          auth_token || Req.Request.get_header(req, "authorization") != [] -> :bearer
+          cookie || bpmcsrf || Req.Request.get_header(req, "cookie") != [] -> :forms
+          true -> :none
+        end
+      end)
 
     configured_req =
       req
@@ -167,10 +158,10 @@ defmodule Creatio.Client do
 
     client = %__MODULE__{
       base_url: String.trim_trailing(base_url, "/"),
-      auth_token: Keyword.get(opts_list, :auth_token),
-      auth_mode: Keyword.get(opts_list, :auth_mode, :bearer),
-      cookie: Keyword.get(opts_list, :cookie),
-      bpmcsrf: Keyword.get(opts_list, :bpmcsrf),
+      auth_token: auth_token,
+      auth_mode: auth_mode,
+      cookie: cookie,
+      bpmcsrf: bpmcsrf,
       identity_service_url: Keyword.get(opts_list, :identity_service_url),
       client_id: Keyword.get(opts_list, :client_id),
       client_secret: Keyword.get(opts_list, :client_secret),
@@ -190,20 +181,20 @@ defmodule Creatio.Client do
   def ensure_client(%Req.Request{} = req), do: from_req(req)
 
   @doc """
-  Sets an OAuth 2.0 Bearer token on the client.
+  Sets an OAuth 2.0 Bearer token on the client, clearing any prior Forms auth credentials.
   """
   @spec put_bearer_token(t(), String.t()) :: t()
   def put_bearer_token(%__MODULE__{} = client, token) when is_binary(token) do
-    client = %{client | auth_token: token, auth_mode: :bearer}
+    client = %{client | auth_token: token, auth_mode: :bearer, cookie: nil, bpmcsrf: nil}
     apply_auth_headers(client)
   end
 
   @doc """
-  Sets Forms authentication cookies and BPMCSRF token on the client.
+  Sets Forms authentication cookies and BPMCSRF token on the client, clearing any prior Bearer token.
   """
   @spec put_forms_auth(t(), String.t(), String.t() | nil) :: t()
   def put_forms_auth(%__MODULE__{} = client, cookie, bpmcsrf \\ nil) when is_binary(cookie) do
-    client = %{client | cookie: cookie, bpmcsrf: bpmcsrf, auth_mode: :forms}
+    client = %{client | cookie: cookie, bpmcsrf: bpmcsrf, auth_mode: :forms, auth_token: nil}
     apply_auth_headers(client)
   end
 
@@ -221,15 +212,52 @@ defmodule Creatio.Client do
   @spec to_req(t()) :: Req.Request.t()
   def to_req(%__MODULE__{req: req}), do: req
 
+  defp resolve_read_only(opts) do
+    raw =
+      case Keyword.fetch(opts, :read_only) do
+        {:ok, val} when not is_nil(val) ->
+          val
+
+        _ ->
+          case Application.get_env(:creatio, :read_only) do
+            nil -> System.get_env("CREATIO_READ_ONLY")
+            val -> val
+          end
+      end
+
+    normalize_read_only(raw)
+  end
+
+  defp normalize_read_only(val) when val in [true, "true", "TRUE", "1", 1], do: true
+  defp normalize_read_only(_), do: false
+
   defp apply_auth_headers(%__MODULE__{} = client) do
     req =
-      client.req
-      |> maybe_put_header("authorization", client.auth_token && "Bearer #{client.auth_token}")
-      |> maybe_put_header("cookie", client.cookie)
-      |> maybe_put_header("bpmcsrf", client.bpmcsrf)
+      case client.auth_mode do
+        :bearer ->
+          client.req
+          |> Req.Request.delete_header("cookie")
+          |> Req.Request.delete_header("bpmcsrf")
+          |> put_or_delete_header(
+            "authorization",
+            client.auth_token && "Bearer #{client.auth_token}"
+          )
+
+        :forms ->
+          client.req
+          |> Req.Request.delete_header("authorization")
+          |> put_or_delete_header("cookie", client.cookie)
+          |> put_or_delete_header("bpmcsrf", client.bpmcsrf)
+
+        _ ->
+          client.req
+          |> maybe_put_header("authorization", client.auth_token && "Bearer #{client.auth_token}")
+          |> maybe_put_header("cookie", client.cookie)
+          |> maybe_put_header("bpmcsrf", client.bpmcsrf)
+      end
 
     req =
-      if client.read_only do
+      if client.read_only and not Keyword.has_key?(req.request_steps, :read_only_guard) do
         Req.Request.append_request_steps(req, read_only_guard: &read_only_guard/1)
       else
         req
@@ -248,9 +276,16 @@ defmodule Creatio.Client do
           %URI{path: p} -> p
         end
 
-      allowed_paths = ["/SelectQuery", "/Login", "/token", "/$batch", "/AuthService.svc/Login"]
+      allowed_suffixes = [
+        "/DataService/json/SyncReply/SelectQuery",
+        "/ServiceModel/AuthService.svc/Login",
+        "/AuthService.svc/Login",
+        "/connect/token",
+        "/odata/$batch"
+      ]
 
-      if Enum.any?(allowed_paths, &String.ends_with?(path, &1)) do
+      if not String.contains?(path, "/0/rest/") and
+           Enum.any?(allowed_suffixes, &String.ends_with?(path, &1)) do
         req
       else
         {req,
@@ -264,8 +299,8 @@ defmodule Creatio.Client do
   end
 
   defp maybe_put_header(req, _name, nil), do: req
+  defp maybe_put_header(req, name, value), do: Req.Request.put_header(req, name, value)
 
-  defp maybe_put_header(req, name, value) do
-    Req.Request.put_header(req, name, value)
-  end
+  defp put_or_delete_header(req, name, nil), do: Req.Request.delete_header(req, name)
+  defp put_or_delete_header(req, name, value), do: Req.Request.put_header(req, name, value)
 end
