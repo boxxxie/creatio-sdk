@@ -199,7 +199,11 @@ defmodule Creatio.Features.OData3LegacyEntitiesTest do
                %{"Id" => "3"}
              ])
       @upon streaming_odata3_entities("Contact", page_size: 2)
-      @then streamed_entities_match([%{"Id" => "1"}, %{"Id" => "2"}, %{"Id" => "3"}])
+      @then streamed_entities_match([
+              {:ok, %{"Id" => "1"}},
+              {:ok, %{"Id" => "2"}},
+              {:ok, %{"Id" => "3"}}
+            ])
       @then query_parameters_mapped(skip: 2, top: 2)
 
       @upon streaming_odata3_entities(Query.new("Contact"), query_first: true, bang: true)
@@ -221,7 +225,7 @@ defmodule Creatio.Features.OData3LegacyEntitiesTest do
               query_first: true,
               page_size: 2
             )
-      @then streamed_entities_match([%{"Id" => "3"}])
+      @then streamed_entities_match([{:ok, %{"Id" => "3"}}])
       @then query_parameters_mapped(skip: 2, top: 2)
     end
   end

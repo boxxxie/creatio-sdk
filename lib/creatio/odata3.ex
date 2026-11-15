@@ -6,9 +6,13 @@ defmodule Creatio.OData3 do
   Supports collection listing, CRUD, navigation traversal, field values, and counts.
   """
 
-  alias Creatio.{Client, Error, Util}
+  alias Creatio.{Client, Error, Telemetry, Util}
+  alias Creatio.OData.Query
 
   @base_path "/0/ServiceModel/EntityDataService.svc"
+
+  defguardp is_client_or_req(term)
+            when is_struct(term, Client) or is_struct(term, Req.Request)
 
   @doc """
   Queries an OData 3 entity collection (`GET .../{Entity}Collection`).
@@ -31,19 +35,17 @@ defmodule Creatio.OData3 do
           {:ok, list() | map()} | {:error, Error.t()}
   def list(client_or_req, entity_or_query, opts \\ [])
 
-  def list(%Creatio.OData.Query{} = query, client_or_req, opts) do
-    list(client_or_req, query, opts)
-  end
-
-  def list(entity, client_or_req, opts)
-      when is_binary(entity) and
-             (is_struct(client_or_req, Client) or is_struct(client_or_req, Req.Request)) do
-    list(client_or_req, entity, opts)
-  end
-
-  def list(client_or_req, %Creatio.OData.Query{} = query, opts) do
+  def list(client_or_req, entity, opts)
+      when is_client_or_req(client_or_req) and is_binary(entity) do
     client = Client.ensure_client(client_or_req)
-    query_params = Creatio.OData.Query.to_params(query)
+    params = normalize_params(opts)
+    do_list(client, entity, params)
+  end
+
+  def list(client_or_req, query, opts) when is_client_or_req(client_or_req) do
+    entity = require_query_entity!(query)
+    client = Client.ensure_client(client_or_req)
+    query_params = Query.to_params(query)
 
     base_params =
       if Map.get(query_params, "$count") == "true" do
@@ -55,42 +57,49 @@ defmodule Creatio.OData3 do
       end
 
     params = Util.normalize_odata_params(opts, base_params, {"$inlinecount", "allpages"})
-    do_list(client, query.entity, params)
-  end
-
-  def list(client_or_req, entity, opts) when is_binary(entity) do
-    client = Client.ensure_client(client_or_req)
-    params = normalize_params(opts)
     do_list(client, entity, params)
   end
 
+  def list(entity_or_query, client_or_req, opts) when is_client_or_req(client_or_req) do
+    list(client_or_req, entity_or_query, opts)
+  end
+
   defp do_list(%Client{} = client, entity, params) do
-    collection_name = collection_name(entity)
-    url = "#{@base_path}/#{collection_name}"
+    Telemetry.span(
+      :odata3,
+      %{protocol: :odata3, action: :list, entity: entity, base_url: client.base_url},
+      fn ->
+        collection_name = collection_name(entity)
+        url = "#{@base_path}/#{collection_name}"
 
-    req = Req.Request.put_header(client.req, "accept", "application/json; odata=verbose")
+        req = Req.Request.put_header(client.req, "accept", "application/json; odata=verbose")
 
-    case Req.get(req, url: url, params: params) do
-      {:ok, %{status: 200, body: %{"d" => %{"results" => records} = d_map}}} ->
-        if params["$inlinecount"] == "allpages" do
-          count_val = parse_count_value(d_map["__count"] || d_map["count"])
-          {:ok, %{records: records, count: count_val, raw: d_map}}
-        else
-          {:ok, records}
+        case Req.get(req, url: url, params: params) do
+          {:ok, %Req.Response{} = raw_resp} ->
+            case Util.normalize_json_response(raw_resp) do
+              %{status: 200, body: %{"d" => %{"results" => records} = d_map}} ->
+                if params["$inlinecount"] == "allpages" do
+                  count_val = parse_count_value(d_map["__count"] || d_map["count"])
+                  {:ok, %{records: records, count: count_val, raw: d_map}}
+                else
+                  {:ok, records}
+                end
+
+              %{status: 200, body: %{"d" => records}} when is_list(records) ->
+                {:ok, records}
+
+              %{status: 200, body: body} when is_map(body) or is_list(body) ->
+                {:ok, body}
+
+              %Req.Response{} = resp ->
+                {:error, Error.from_response(resp)}
+            end
+
+          {:error, exception} ->
+            Error.wrap_error(exception)
         end
-
-      {:ok, %{status: 200, body: %{"d" => records}}} when is_list(records) ->
-        {:ok, records}
-
-      {:ok, %{status: 200, body: body}} ->
-        {:ok, body}
-
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
-
-      {:error, exception} ->
-        Error.wrap_error(exception)
-    end
+      end
+    )
   end
 
   @doc """
@@ -103,21 +112,15 @@ defmodule Creatio.OData3 do
         ) :: list() | map()
   def list!(client_or_req, entity_or_query, opts \\ [])
 
-  def list!(%Creatio.OData.Query{} = query, client_or_req, opts) do
-    list!(client_or_req, query, opts)
-  end
-
-  def list!(entity, client_or_req, opts)
-      when is_binary(entity) and
-             (is_struct(client_or_req, Client) or is_struct(client_or_req, Req.Request)) do
-    list!(client_or_req, entity, opts)
-  end
-
-  def list!(client_or_req, entity_or_query, opts) do
+  def list!(client_or_req, entity_or_query, opts) when is_client_or_req(client_or_req) do
     case list(client_or_req, entity_or_query, opts) do
       {:ok, result} -> result
       {:error, error} -> raise error
     end
+  end
+
+  def list!(entity_or_query, client_or_req, opts) when is_client_or_req(client_or_req) do
+    list!(client_or_req, entity_or_query, opts)
   end
 
   @doc """
@@ -127,26 +130,31 @@ defmodule Creatio.OData3 do
           {:ok, map()} | {:error, Error.t()}
   def get(client_or_req, entity, id, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    collection_name = collection_name(entity)
-    clean_id = Util.clean_guid(id)
-    url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')"
-    params = normalize_params(opts)
 
-    req = Req.Request.put_header(client.req, "accept", "application/json; odata=verbose")
+    Telemetry.span(
+      :odata3,
+      %{protocol: :odata3, action: :get, entity: entity, base_url: client.base_url},
+      fn ->
+        collection_name = collection_name(entity)
+        clean_id = Util.clean_guid(id)
+        url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')"
+        params = normalize_params(opts)
 
-    case Req.get(req, url: url, params: params) do
-      {:ok, %{status: 200, body: %{"d" => record}}} ->
-        {:ok, record}
+        req = Req.Request.put_header(client.req, "accept", "application/json; odata=verbose")
 
-      {:ok, %{status: 200, body: body}} ->
-        {:ok, body}
+        case Req.get(req, url: url, params: params) do
+          {:ok, %Req.Response{} = raw_resp} ->
+            case Util.normalize_json_response(raw_resp) do
+              %{status: 200, body: %{"d" => record}} -> {:ok, record}
+              %{status: 200, body: %{} = body} -> {:ok, body}
+              %Req.Response{} = resp -> {:error, Error.from_response(resp)}
+            end
 
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
-
-      {:error, exception} ->
-        Error.wrap_error(exception)
-    end
+          {:error, exception} ->
+            Error.wrap_error(exception)
+        end
+      end
+    )
   end
 
   @doc """
@@ -173,32 +181,41 @@ defmodule Creatio.OData3 do
           {:ok, any()} | {:error, Error.t()}
   def get_navigation(client_or_req, entity, id, nav_property, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    collection_name = collection_name(entity)
-    clean_id = Util.clean_guid(id)
-    url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')/#{nav_property}"
-    params = normalize_params(opts)
 
-    req = Req.Request.put_header(client.req, "accept", "application/json; odata=verbose")
+    Telemetry.span(
+      :odata3,
+      %{
+        protocol: :odata3,
+        action: :get_navigation,
+        entity: entity,
+        navigation: nav_property,
+        base_url: client.base_url
+      },
+      fn ->
+        collection_name = collection_name(entity)
+        clean_id = Util.clean_guid(id)
+        url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')/#{nav_property}"
+        params = normalize_params(opts)
 
-    case Req.get(req, url: url, params: params) do
-      {:ok, %{status: 204}} ->
-        {:ok, nil}
+        req = Req.Request.put_header(client.req, "accept", "application/json; odata=verbose")
 
-      {:ok, %{status: 200, body: %{"d" => %{"results" => records}}}} ->
-        {:ok, records}
+        case Req.get(req, url: url, params: params) do
+          {:ok, %Req.Response{status: 204}} ->
+            {:ok, nil}
 
-      {:ok, %{status: 200, body: %{"d" => record}}} ->
-        {:ok, record}
+          {:ok, %Req.Response{} = raw_resp} ->
+            case Util.normalize_json_response(raw_resp) do
+              %{status: 200, body: %{"d" => %{"results" => records}}} -> {:ok, records}
+              %{status: 200, body: %{"d" => record}} -> {:ok, record}
+              %{status: 200, body: body} when is_map(body) or is_list(body) -> {:ok, body}
+              %Req.Response{} = resp -> {:error, Error.from_response(resp)}
+            end
 
-      {:ok, %{status: 200, body: body}} ->
-        {:ok, body}
-
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
-
-      {:error, exception} ->
-        Error.wrap_error(exception)
-    end
+          {:error, exception} ->
+            Error.wrap_error(exception)
+        end
+      end
+    )
   end
 
   @doc """
@@ -225,33 +242,46 @@ defmodule Creatio.OData3 do
           {:ok, any()} | {:error, Error.t()}
   def get_field(client_or_req, entity, id, field_name, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    collection_name = collection_name(entity)
-    clean_id = Util.clean_guid(id)
-    url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')/#{field_name}"
-    params = normalize_params(opts)
 
-    req = Req.Request.put_header(client.req, "accept", "application/json; odata=verbose")
+    Telemetry.span(
+      :odata3,
+      %{
+        protocol: :odata3,
+        action: :get_field,
+        entity: entity,
+        field: field_name,
+        base_url: client.base_url
+      },
+      fn ->
+        collection_name = collection_name(entity)
+        clean_id = Util.clean_guid(id)
+        url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')/#{field_name}"
+        params = normalize_params(opts)
 
-    case Req.get(req, url: url, params: params) do
-      {:ok, %{status: 204}} ->
-        {:ok, nil}
+        req = Req.Request.put_header(client.req, "accept", "application/json; odata=verbose")
 
-      {:ok, %{status: 200, body: %{"d" => %{} = d_map}}} ->
-        val = Map.get(d_map, field_name, d_map)
-        {:ok, val}
+        case Req.get(req, url: url, params: params) do
+          {:ok, %Req.Response{status: 204}} ->
+            {:ok, nil}
 
-      {:ok, %{status: 200, body: %{"d" => val}}} ->
-        {:ok, val}
+          {:ok, %Req.Response{} = raw_resp} ->
+            resp = Util.normalize_json_response(raw_resp)
 
-      {:ok, %{status: 200, body: body}} ->
-        {:ok, body}
+            if resp.status == 200 and not Util.html_or_xml_response?(resp) do
+              case resp.body do
+                %{"d" => %{} = d_map} -> {:ok, Map.get(d_map, field_name, d_map)}
+                %{"d" => val} -> {:ok, val}
+                other -> {:ok, other}
+              end
+            else
+              {:error, Error.from_response(resp)}
+            end
 
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
-
-      {:error, exception} ->
-        Error.wrap_error(exception)
-    end
+          {:error, exception} ->
+            Error.wrap_error(exception)
+        end
+      end
+    )
   end
 
   @doc """
@@ -269,44 +299,43 @@ defmodule Creatio.OData3 do
   @doc """
   Retrieves raw scalar/stream value in OData 3 (`GET .../{Entity}Collection(guid'{id}')/{field_name}/$value`).
 
-  Pass `into: File.stream!("/path/to/file")` to stream large attachments directly to disk
-  without buffering in memory.
+  ## Options
+
+    * `:into` - Pass `into: File.stream!("/path/to/file")` to stream large attachments
+      directly to disk without buffering in memory.
+    * `:headers` - Extra request headers (map or keyword/tuple list), e.g. `[{"range", "bytes=0-1023"}]`.
+    * `:req_options` - Extra `Req` options (such as `:receive_timeout` or `:params`).
+      `decode_body: false` is always preserved even if `:req_options` specifies `decode_body: true`.
+    * Any standard OData query options (`:select`, `:filter`, `:params`, etc.).
   """
   @spec get_field_value(
           Client.t() | Req.Request.t(),
           String.t(),
           String.t(),
           String.t(),
-          keyword()
+          keyword() | map()
         ) ::
           {:ok, any()} | {:error, Error.t()}
   def get_field_value(client_or_req, entity, id, field_name, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    collection_name = collection_name(entity)
-    clean_id = Util.clean_guid(id)
-    url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')/#{field_name}/$value"
 
-    req_opts =
-      [url: url, decode_body: false]
-      |> maybe_put_into(Keyword.get(opts, :into))
-
-    case Req.get(client.req, req_opts) do
-      {:ok, %{status: 204}} ->
-        {:ok, nil}
-
-      {:ok, %{status: 200, body: body}} ->
-        {:ok, body}
-
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
-
-      {:error, exception} ->
-        Error.wrap_error(exception)
-    end
+    Telemetry.span(
+      :odata3,
+      %{
+        protocol: :odata3,
+        action: :get_field_value,
+        entity: entity,
+        field: field_name,
+        base_url: client.base_url
+      },
+      fn ->
+        collection_name = collection_name(entity)
+        clean_id = Util.clean_guid(id)
+        url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')/#{field_name}/$value"
+        Util.fetch_field_value(client.req, url, opts, {"$inlinecount", "allpages"})
+      end
+    )
   end
-
-  defp maybe_put_into(req_opts, nil), do: req_opts
-  defp maybe_put_into(req_opts, into_sink), do: Keyword.put(req_opts, :into, into_sink)
 
   @doc """
   Same as `get_field_value/5`, but raises `Creatio.Error` on failure.
@@ -316,7 +345,7 @@ defmodule Creatio.OData3 do
           String.t(),
           String.t(),
           String.t(),
-          keyword()
+          keyword() | map()
         ) ::
           any()
   def get_field_value!(client, entity, id, field_name, opts \\ []) do
@@ -341,51 +370,58 @@ defmodule Creatio.OData3 do
           {:ok, integer()} | {:error, Error.t()}
   def count(client_or_req, entity, opts \\ []) do
     client = Client.ensure_client(client_or_req)
-    collection_name = collection_name(entity)
-    strategy = Keyword.get(opts, :strategy, :path)
-    params = normalize_params(Keyword.drop(opts, [:strategy]))
 
-    req_opts =
-      if strategy == :query do
-        base = "#{@base_path}/#{collection_name}?/$count"
+    Telemetry.span(
+      :odata3,
+      %{protocol: :odata3, action: :count, entity: entity, base_url: client.base_url},
+      fn ->
+        collection_name = collection_name(entity)
+        strategy = Keyword.get(opts, :strategy, :path)
+        params = normalize_params(Keyword.drop(opts, [:strategy]))
 
-        url =
-          if map_size(params) > 0 do
-            "#{base}&#{URI.encode_query(params)}"
+        req_opts =
+          if strategy == :query do
+            base = "#{@base_path}/#{collection_name}?/$count"
+
+            url =
+              if map_size(params) > 0 do
+                "#{base}&#{URI.encode_query(params)}"
+              else
+                base
+              end
+
+            [url: url]
           else
-            base
+            url = "#{@base_path}/#{collection_name}/$count"
+            if map_size(params) > 0, do: [url: url, params: params], else: [url: url]
           end
 
-        [url: url]
-      else
-        url = "#{@base_path}/#{collection_name}/$count"
-        if map_size(params) > 0, do: [url: url, params: params], else: [url: url]
-      end
+        case Req.get(client.req, req_opts) do
+          {:ok, %{status: 200, body: body}} when is_integer(body) ->
+            {:ok, body}
 
-    case Req.get(client.req, req_opts) do
-      {:ok, %{status: 200, body: body}} when is_integer(body) ->
-        {:ok, body}
+          {:ok, %{status: 200, body: %{"d" => count}}} when is_integer(count) ->
+            {:ok, count}
 
-      {:ok, %{status: 200, body: %{"d" => count}}} when is_integer(count) ->
-        {:ok, count}
+          {:ok, %{status: 200, body: %{"d" => %{"count" => count}}}} when is_integer(count) ->
+            {:ok, count}
 
-      {:ok, %{status: 200, body: %{"d" => %{"count" => count}}}} when is_integer(count) ->
-        {:ok, count}
+          {:ok, %{status: 200, body: body}} when is_binary(body) ->
+            cleaned = body |> String.trim() |> String.trim_leading("\uFEFF") |> String.trim()
 
-      {:ok, %{status: 200, body: body}} when is_binary(body) ->
-        cleaned = body |> String.trim() |> String.trim_leading("\uFEFF") |> String.trim()
+            case Integer.parse(cleaned) do
+              {int, _} -> {:ok, int}
+              :error -> {:error, Error.new(message: "Failed to parse count response: #{body}")}
+            end
 
-        case Integer.parse(cleaned) do
-          {int, _} -> {:ok, int}
-          :error -> {:error, Error.new(message: "Failed to parse count response: #{body}")}
+          {:ok, %Req.Response{} = resp} ->
+            {:error, Error.from_response(resp)}
+
+          {:error, exception} ->
+            Error.wrap_error(exception)
         end
-
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
-
-      {:error, exception} ->
-        Error.wrap_error(exception)
-    end
+      end
+    )
   end
 
   @doc """
@@ -400,7 +436,10 @@ defmodule Creatio.OData3 do
   end
 
   @doc """
-  Returns a lazy `Stream` that paginates through records of an OData 3 entity collection.
+  Returns a lazy `Stream` yielding `{:ok, record}` tuples through an OData 3 entity collection.
+
+  If a page fetch or response payload fails mid-stream, yields `{:error, %Creatio.Error{}}`
+  and halts cleanly. Use `stream!/3` for an exception-raising stream of plain record maps.
 
   Supports both offset (`$top`/`$skip`) and keyset/cursor pagination (`cursor_field: "Id"`).
 
@@ -424,22 +463,18 @@ defmodule Creatio.OData3 do
         ) :: Enumerable.t()
   def stream(client_or_req, entity_or_query, opts \\ [])
 
-  def stream(%Creatio.OData.Query{} = query, client_or_req, opts) do
-    stream(client_or_req, query, opts)
-  end
-
-  def stream(entity, client_or_req, opts)
-      when is_binary(entity) and
-             (is_struct(client_or_req, Client) or is_struct(client_or_req, Req.Request)) do
-    stream(client_or_req, entity, opts)
-  end
-
-  def stream(client_or_req, entity_or_query, opts) do
+  def stream(client_or_req, entity_or_query, opts) when is_client_or_req(client_or_req) do
     Util.paginate_stream(client_or_req, entity_or_query, opts, :odata3, &list/3)
   end
 
+  def stream(entity_or_query, client_or_req, opts) when is_client_or_req(client_or_req) do
+    stream(client_or_req, entity_or_query, opts)
+  end
+
   @doc """
-  Same as `stream/3`.
+  Returns a lazy `Stream` yielding plain `record` maps through an OData 3 entity collection.
+
+  Raises `Creatio.Error` if a page fetch fails mid-stream. Accepts the same options as `stream/3`.
   """
   @spec stream!(
           Client.t() | Req.Request.t() | Creatio.OData.Query.t() | String.t(),
@@ -448,18 +483,12 @@ defmodule Creatio.OData3 do
         ) :: Enumerable.t()
   def stream!(client_or_req, entity_or_query, opts \\ [])
 
-  def stream!(%Creatio.OData.Query{} = query, client_or_req, opts) do
-    stream!(client_or_req, query, opts)
+  def stream!(client_or_req, entity_or_query, opts) when is_client_or_req(client_or_req) do
+    Util.paginate_stream!(client_or_req, entity_or_query, opts, :odata3, &list/3)
   end
 
-  def stream!(entity, client_or_req, opts)
-      when is_binary(entity) and
-             (is_struct(client_or_req, Client) or is_struct(client_or_req, Req.Request)) do
-    stream!(client_or_req, entity, opts)
-  end
-
-  def stream!(client_or_req, entity_or_query, opts) do
-    stream(client_or_req, entity_or_query, opts)
+  def stream!(entity_or_query, client_or_req, opts) when is_client_or_req(client_or_req) do
+    stream!(client_or_req, entity_or_query, opts)
   end
 
   @doc """
@@ -470,42 +499,45 @@ defmodule Creatio.OData3 do
   def create(client_or_req, entity, attrs, opts \\ []) do
     client = Client.ensure_client(client_or_req)
 
-    if client.read_only do
-      {:error,
-       Creatio.Error.new(
-         status: 403,
-         code: "ReadOnlyMode",
-         message: "Client is in read-only mode"
-       )}
-    else
-      collection_name = collection_name(entity)
-      url = "#{@base_path}/#{collection_name}"
+    Telemetry.span(
+      :odata3,
+      %{protocol: :odata3, action: :create, entity: entity, base_url: client.base_url},
+      fn ->
+        if client.read_only do
+          {:error,
+           Creatio.Error.new(
+             status: 403,
+             code: "ReadOnlyMode",
+             message: "Client is in read-only mode"
+           )}
+        else
+          collection_name = collection_name(entity)
+          url = "#{@base_path}/#{collection_name}"
 
-      req =
-        client.req
-        |> Req.Request.put_header("content-type", "application/json; odata=verbose")
-        |> Req.Request.put_header("accept", "application/json; odata=verbose")
+          req =
+            client.req
+            |> Req.Request.put_header("content-type", "application/json; odata=verbose")
+            |> Req.Request.put_header("accept", "application/json; odata=verbose")
 
-      case Req.post(req, url: url, json: attrs, params: normalize_params(opts)) do
-        {:ok, %{status: 201, body: %{"d" => record}}} ->
-          {:ok, record}
+          case Req.post(req, url: url, json: attrs, params: normalize_params(opts)) do
+            {:ok, %Req.Response{} = raw_resp} ->
+              case Util.normalize_json_response(raw_resp) do
+                %{status: status, body: %{"d" => record}} when status in [200, 201] ->
+                  {:ok, record}
 
-        {:ok, %{status: 201, body: body}} ->
-          {:ok, body}
+                %{status: status, body: %{} = body} when status in [200, 201] ->
+                  {:ok, body}
 
-        {:ok, %{status: 200, body: %{"d" => record}}} ->
-          {:ok, record}
+                %Req.Response{} = resp ->
+                  {:error, Error.from_response(resp)}
+              end
 
-        {:ok, %{status: 200, body: body}} ->
-          {:ok, body}
-
-        {:ok, %Req.Response{} = resp} ->
-          {:error, Error.from_response(resp)}
-
-        {:error, exception} ->
-          Error.wrap_error(exception)
+            {:error, exception} ->
+              Error.wrap_error(exception)
+          end
+        end
       end
-    end
+    )
   end
 
   @doc """
@@ -527,40 +559,49 @@ defmodule Creatio.OData3 do
   def update(client_or_req, entity, id, attrs, opts \\ []) do
     client = Client.ensure_client(client_or_req)
 
-    if client.read_only do
-      {:error,
-       Creatio.Error.new(
-         status: 403,
-         code: "ReadOnlyMode",
-         message: "Client is in read-only mode"
-       )}
-    else
-      collection_name = collection_name(entity)
-      clean_id = Util.clean_guid(id)
-      url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')"
+    Telemetry.span(
+      :odata3,
+      %{protocol: :odata3, action: :update, entity: entity, base_url: client.base_url},
+      fn ->
+        if client.read_only do
+          {:error,
+           Creatio.Error.new(
+             status: 403,
+             code: "ReadOnlyMode",
+             message: "Client is in read-only mode"
+           )}
+        else
+          collection_name = collection_name(entity)
+          clean_id = Util.clean_guid(id)
+          url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')"
 
-      req =
-        client.req
-        |> Req.Request.put_header("content-type", "application/json; odata=verbose")
-        |> Req.Request.put_header("accept", "application/json; odata=verbose")
+          req =
+            client.req
+            |> Req.Request.put_header("content-type", "application/json; odata=verbose")
+            |> Req.Request.put_header("accept", "application/json; odata=verbose")
 
-      case Req.patch(req, url: url, json: attrs, params: normalize_params(opts)) do
-        {:ok, %{status: 204}} ->
-          :ok
+          case Req.patch(req, url: url, json: attrs, params: normalize_params(opts)) do
+            {:ok, %Req.Response{status: 204}} ->
+              :ok
 
-        {:ok, %{status: 200, body: %{"d" => record}}} ->
-          {:ok, record}
+            {:ok, %Req.Response{} = raw_resp} ->
+              resp = Util.normalize_json_response(raw_resp)
 
-        {:ok, %{status: 200, body: body}} ->
-          {:ok, body}
+              if resp.status == 200 and not Util.html_or_xml_response?(resp) do
+                case resp.body do
+                  %{"d" => record} -> {:ok, record}
+                  body -> {:ok, body}
+                end
+              else
+                {:error, Error.from_response(resp)}
+              end
 
-        {:ok, %Req.Response{} = resp} ->
-          {:error, Error.from_response(resp)}
-
-        {:error, exception} ->
-          Error.wrap_error(exception)
+            {:error, exception} ->
+              Error.wrap_error(exception)
+          end
+        end
       end
-    end
+    )
   end
 
   @doc """
@@ -584,32 +625,38 @@ defmodule Creatio.OData3 do
   def delete(client_or_req, entity, id, opts \\ []) do
     client = Client.ensure_client(client_or_req)
 
-    if client.read_only do
-      {:error,
-       Creatio.Error.new(
-         status: 403,
-         code: "ReadOnlyMode",
-         message: "Client is in read-only mode"
-       )}
-    else
-      collection_name = collection_name(entity)
-      clean_id = Util.clean_guid(id)
-      url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')"
+    Telemetry.span(
+      :odata3,
+      %{protocol: :odata3, action: :delete, entity: entity, base_url: client.base_url},
+      fn ->
+        if client.read_only do
+          {:error,
+           Creatio.Error.new(
+             status: 403,
+             code: "ReadOnlyMode",
+             message: "Client is in read-only mode"
+           )}
+        else
+          collection_name = collection_name(entity)
+          clean_id = Util.clean_guid(id)
+          url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')"
 
-      case Req.delete(client.req, url: url, params: normalize_params(opts)) do
-        {:ok, %{status: 204}} ->
-          :ok
+          case Req.delete(client.req, url: url, params: normalize_params(opts)) do
+            {:ok, %{status: 204}} ->
+              :ok
 
-        {:ok, %{status: 200}} ->
-          :ok
+            {:ok, %{status: 200}} ->
+              :ok
 
-        {:ok, %Req.Response{} = resp} ->
-          {:error, Error.from_response(resp)}
+            {:ok, %Req.Response{} = resp} ->
+              {:error, Error.from_response(resp)}
 
-        {:error, exception} ->
-          Error.wrap_error(exception)
+            {:error, exception} ->
+              Error.wrap_error(exception)
+          end
+        end
       end
-    end
+    )
   end
 
   @doc """
@@ -642,5 +689,15 @@ defmodule Creatio.OData3 do
 
   defp normalize_params(opts) do
     Util.normalize_odata_params(opts, %{}, {"$inlinecount", "allpages"})
+  end
+
+  defp require_query_entity!(query) do
+    case Query.entity(query) do
+      "" ->
+        raise ArgumentError, "Creatio.OData.Query must specify a non-empty entity name"
+
+      entity ->
+        entity
+    end
   end
 end

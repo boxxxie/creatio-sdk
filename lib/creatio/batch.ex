@@ -5,6 +5,9 @@ defmodule Creatio.Batch do
   Supports both JSON batch format (standard in OData 4) and multipart/mixed MIME format,
   atomicity groups (changesets), `Prefer: continue-on-error`, and `Prefer: return=minimal`.
 
+  `Creatio.Batch.t()` is an `@opaque` builder struct; inspect or serialize it via
+  `size/1`, `requests/1`, `to_payload/1`, `to_multipart/2`, and `to_multipart_iodata/2`.
+
   ## Examples
 
   ### JSON Batch (Default)
@@ -22,7 +25,7 @@ defmodule Creatio.Batch do
       {:ok, responses} = Creatio.Batch.execute(client, batch, format: :multipart)
   """
 
-  alias Creatio.{Client, Error, Util}
+  alias Creatio.{Client, Error, Telemetry, Util}
 
   defmodule Response do
     @moduledoc """
@@ -66,13 +69,13 @@ defmodule Creatio.Batch do
 
   defstruct requests: [], ops: [], count: 0, continue_on_error: false, return: nil
 
-  @type t :: %__MODULE__{
-          requests: [map()],
-          ops: [map()],
-          count: non_neg_integer(),
-          continue_on_error: boolean(),
-          return: :minimal | :representation | nil
-        }
+  @opaque t :: %__MODULE__{
+            requests: [map()],
+            ops: [map()],
+            count: non_neg_integer(),
+            continue_on_error: boolean(),
+            return: :minimal | :representation | nil
+          }
 
   @doc """
   Initializes a new batch request.
@@ -190,6 +193,31 @@ defmodule Creatio.Batch do
   end
 
   @doc """
+  Returns the number of queued operations in the batch.
+
+  ## Examples
+
+      iex> batch = Creatio.Batch.new() |> Creatio.Batch.add_get("Contact", "1")
+      iex> Creatio.Batch.size(batch)
+      1
+
+  """
+  @spec size(t()) :: non_neg_integer()
+  def size(%__MODULE__{count: count}), do: count
+
+  @doc """
+  Returns the queued operations in insertion order.
+
+  ## Examples
+
+      iex> batch = Creatio.Batch.new() |> Creatio.Batch.add_get("Contact", "1")
+      iex> [%{"method" => "GET", "url" => "Contact(1)"}] = Creatio.Batch.requests(batch)
+
+  """
+  @spec requests(t()) :: [map()]
+  def requests(%__MODULE__{} = batch), do: ordered_requests(batch)
+
+  @doc """
   Converts the batch to the JSON payload map expected by `/0/odata/$batch`.
   """
   @spec to_payload(t()) :: map()
@@ -240,29 +268,36 @@ defmodule Creatio.Batch do
   def execute(client_or_req, %__MODULE__{} = batch, opts) do
     client = Client.ensure_client(client_or_req)
     requests = ordered_requests(batch)
+    raw_format = Keyword.get(opts, :format, :json)
+    format = if raw_format == :multipart, do: :multipart, else: :json
 
-    if client.read_only and has_mutation?(requests) do
-      {:error,
-       Error.new(
-         status: 403,
-         code: "ReadOnlyMode",
-         message: "Client is in read-only mode. Batch contains mutation requests."
-       )}
-    else
-      url = Keyword.get(opts, :url, "/0/odata/$batch")
-      format = Keyword.get(opts, :format, :json)
+    Telemetry.span(
+      :batch,
+      %{format: format, operation_count: length(requests), base_url: client.base_url},
+      fn ->
+        if client.read_only and has_mutation?(requests) do
+          {:error,
+           Error.new(
+             status: 403,
+             code: "ReadOnlyMode",
+             message: "Client is in read-only mode. Batch contains mutation requests."
+           )}
+        else
+          url = Keyword.get(opts, :url, "/0/odata/$batch")
 
-      prefer =
-        build_prefer(
-          batch.continue_on_error or Keyword.get(opts, :continue_on_error, false),
-          Keyword.get(opts, :return, batch.return)
-        )
+          prefer =
+            build_prefer(
+              batch.continue_on_error or Keyword.get(opts, :continue_on_error, false),
+              Keyword.get(opts, :return, batch.return)
+            )
 
-      case format do
-        :multipart -> execute_multipart(client, requests, url, prefer, opts)
-        _ -> execute_json(client, requests, url, prefer)
+          case format do
+            :multipart -> execute_multipart(client, requests, url, prefer, opts)
+            :json -> execute_json(client, requests, url, prefer)
+          end
+        end
       end
-    end
+    )
   end
 
   def execute(client_or_req, %{"requests" => requests}, opts) when is_list(requests) do
@@ -289,29 +324,35 @@ defmodule Creatio.Batch do
   def execute(client_or_req, body, opts) when is_binary(body) do
     client = Client.ensure_client(client_or_req)
 
-    if client.read_only do
-      {:error,
-       Error.new(
-         status: 403,
-         code: "ReadOnlyMode",
-         message:
-           "Client is in read-only mode. Binary batch requests are not supported in read-only mode."
-       )}
-    else
-      url = Keyword.get(opts, :url, "/0/odata/$batch")
-      boundary = Keyword.get(opts, :boundary) || extract_boundary(body) || "batch_default"
+    Telemetry.span(
+      :batch,
+      %{format: :multipart, operation_count: 0, base_url: client.base_url},
+      fn ->
+        if client.read_only do
+          {:error,
+           Error.new(
+             status: 403,
+             code: "ReadOnlyMode",
+             message:
+               "Client is in read-only mode. Binary batch requests are not supported in read-only mode."
+           )}
+        else
+          url = Keyword.get(opts, :url, "/0/odata/$batch")
+          boundary = Keyword.get(opts, :boundary) || extract_boundary(body) || "batch_default"
 
-      req =
-        client.req
-        |> Req.Request.put_header(
-          "content-type",
-          "multipart/mixed; boundary=#{boundary}; IEEE754Compatible=true"
-        )
-        |> Req.Request.put_header("accept", "application/json")
+          req =
+            client.req
+            |> Req.Request.put_header(
+              "content-type",
+              "multipart/mixed; boundary=#{boundary}; IEEE754Compatible=true"
+            )
+            |> Req.Request.put_header("accept", "application/json")
 
-      Req.post(req, url: url, body: body)
-      |> handle_batch_response()
-    end
+          Req.post(req, url: url, body: body)
+          |> handle_batch_response()
+        end
+      end
+    )
   end
 
   defp execute_json(client, requests, url, prefer) do
@@ -398,7 +439,9 @@ defmodule Creatio.Batch do
   end
 
   defp parse_json_batch_response(%Req.Response{body: body_str} = resp) when is_binary(body_str) do
-    case Jason.decode(body_str, strings: :copy) do
+    cleaned_body = String.trim_leading(body_str, "\uFEFF")
+
+    case Jason.decode(cleaned_body, strings: :copy) do
       {:ok, %{"responses" => _} = map} ->
         parse_json_batch_response(%Req.Response{resp | body: map})
 
@@ -406,8 +449,8 @@ defmodule Creatio.Batch do
         parse_json_batch_response(%Req.Response{resp | body: entity})
 
       _ ->
-        if String.starts_with?(String.trim_leading(body_str), "--") do
-          parse_multipart_response(body_str, nil)
+        if String.starts_with?(String.trim_leading(cleaned_body), "--") do
+          parse_multipart_response(cleaned_body, nil)
         else
           {:error,
            Error.new(

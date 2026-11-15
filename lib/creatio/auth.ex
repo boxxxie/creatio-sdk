@@ -6,7 +6,7 @@ defmodule Creatio.Auth do
   and OAuth 2.0 (Identity Service client credentials grant).
   """
 
-  alias Creatio.{Client, Error}
+  alias Creatio.{Client, Error, Telemetry, Util}
 
   @doc """
   Logs into Creatio using Forms authentication (Username & Password).
@@ -25,18 +25,20 @@ defmodule Creatio.Auth do
   def login_forms(client_or_req, username, password, opts \\ [])
 
   def login_forms(%Client{} = client, username, password, opts) do
-    url = Keyword.get(opts, :url, "/ServiceModel/AuthService.svc/Login")
-    body = %{"UserName" => username, "UserPassword" => password}
+    Telemetry.span(:auth, %{auth_mode: :forms, base_url: client.base_url}, fn ->
+      url = Keyword.get(opts, :url, "/ServiceModel/AuthService.svc/Login")
+      body = %{"UserName" => username, "UserPassword" => password}
 
-    req = Req.Request.put_header(client.req, "content-type", "application/json; charset=utf-8")
+      req = Req.Request.put_header(client.req, "content-type", "application/json; charset=utf-8")
 
-    case Req.post(req, url: url, json: body) do
-      {:ok, %Req.Response{} = resp} ->
-        handle_forms_login_result(resp, client)
+      case Req.post(req, url: url, json: body) do
+        {:ok, %Req.Response{} = resp} ->
+          handle_forms_login_result(resp, client)
 
-      {:error, exception} ->
-        Error.wrap_error(exception)
-    end
+        {:error, exception} ->
+          Error.wrap_error(exception)
+      end
+    end)
   end
 
   def login_forms(%Req.Request{} = req, username, password, opts) do
@@ -46,9 +48,9 @@ defmodule Creatio.Auth do
 
   defp handle_forms_login_result(%Req.Response{status: 200, body: body_str} = resp, client)
        when is_binary(body_str) do
-    case Jason.decode(body_str) do
-      {:ok, %{} = decoded} ->
-        handle_forms_login_result(%Req.Response{resp | body: decoded}, client)
+    case Util.normalize_json_response(resp) do
+      %Req.Response{body: %{}} = normalized ->
+        handle_forms_login_result(normalized, client)
 
       _ ->
         {:error, Error.from_response(resp)}
@@ -117,61 +119,76 @@ defmodule Creatio.Auth do
 
     full_token_url? = String.starts_with?(token_path, ["http://", "https://"])
 
-    cond do
-      is_nil(client_id) or client_id == "" ->
-        {:error, Error.new(message: "Missing :client_id for OAuth 2.0 authentication")}
+    span_meta = %{
+      auth_mode: :oauth,
+      base_url: client.base_url,
+      identity_service_url: if(identity_url != "", do: identity_url, else: nil)
+    }
 
-      is_nil(client_secret) or client_secret == "" ->
-        {:error, Error.new(message: "Missing :client_secret for OAuth 2.0 authentication")}
+    Telemetry.span(:auth, span_meta, fn ->
+      cond do
+        is_nil(client_id) or client_id == "" ->
+          {:error, Error.new(message: "Missing :client_id for OAuth 2.0 authentication")}
 
-      not full_token_url? and identity_url == "" ->
-        {:error, Error.new(message: "Missing :identity_service_url for OAuth 2.0 authentication")}
+        is_nil(client_secret) or client_secret == "" ->
+          {:error, Error.new(message: "Missing :client_secret for OAuth 2.0 authentication")}
 
-      true ->
-        full_token_url =
-          if full_token_url? do
-            token_path
-          else
-            normalized_path =
-              if String.starts_with?(token_path, "/"), do: token_path, else: "/#{token_path}"
+        not full_token_url? and identity_url == "" ->
+          {:error,
+           Error.new(message: "Missing :identity_service_url for OAuth 2.0 authentication")}
 
-            "#{identity_url}#{normalized_path}"
+        true ->
+          full_token_url =
+            if full_token_url? do
+              token_path
+            else
+              normalized_path =
+                if String.starts_with?(token_path, "/"), do: token_path, else: "/#{token_path}"
+
+              "#{identity_url}#{normalized_path}"
+            end
+
+          form_data = [
+            grant_type: "client_credentials",
+            client_id: client_id,
+            client_secret: client_secret
+          ]
+
+          extra_req_opts = Keyword.get(opts, :req_options, [])
+
+          token_req =
+            client
+            |> identity_base_req()
+            |> Req.merge([url: full_token_url, form: form_data] ++ extra_req_opts)
+
+          case Req.post(token_req) do
+            {:ok, %Req.Response{} = raw_resp} ->
+              case Util.normalize_json_response(raw_resp) do
+                %{status: 200, body: %{"access_token" => token} = token_body} ->
+                  updated_client =
+                    %Client{
+                      client
+                      | client_id: client_id,
+                        client_secret: client_secret,
+                        identity_service_url:
+                          if(identity_url != "",
+                            do: identity_url,
+                            else: client.identity_service_url
+                          )
+                    }
+                    |> Client.put_bearer_token(token)
+
+                  {:ok, updated_client, token_body}
+
+                %Req.Response{} = resp ->
+                  {:error, Error.from_response(resp)}
+              end
+
+            {:error, exception} ->
+              Error.wrap_error(exception)
           end
-
-        form_data = [
-          grant_type: "client_credentials",
-          client_id: client_id,
-          client_secret: client_secret
-        ]
-
-        extra_req_opts = Keyword.get(opts, :req_options, [])
-
-        token_req =
-          client
-          |> identity_base_req()
-          |> Req.merge([url: full_token_url, form: form_data] ++ extra_req_opts)
-
-        case Req.post(token_req) do
-          {:ok, %{status: 200, body: %{"access_token" => token} = token_body}} ->
-            updated_client =
-              %Client{
-                client
-                | client_id: client_id,
-                  client_secret: client_secret,
-                  identity_service_url:
-                    if(identity_url != "", do: identity_url, else: client.identity_service_url)
-              }
-              |> Client.put_bearer_token(token)
-
-            {:ok, updated_client, token_body}
-
-          {:ok, %Req.Response{} = resp} ->
-            {:error, Error.from_response(resp)}
-
-          {:error, exception} ->
-            Error.wrap_error(exception)
-        end
-    end
+      end
+    end)
   end
 
   @doc """
@@ -182,18 +199,23 @@ defmodule Creatio.Auth do
   @spec oauth_health_check(Client.t(), keyword()) ::
           {:ok, map() | String.t()} | {:error, Error.t()}
   def oauth_health_check(%Client{} = client, opts \\ []) do
-    url = Keyword.get(opts, :url, "/0/api/OAuthHealthCheck")
+    Telemetry.span(:auth, %{auth_mode: :health_check, base_url: client.base_url}, fn ->
+      url = Keyword.get(opts, :url, "/0/api/OAuthHealthCheck")
 
-    case Req.get(client.req, url: url) do
-      {:ok, %{status: 200, body: body}} ->
-        {:ok, body}
+      case Req.get(client.req, url: url) do
+        {:ok, %Req.Response{} = raw_resp} ->
+          resp = Util.normalize_json_response(raw_resp)
 
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
+          if resp.status == 200 and not Util.html_or_xml_response?(resp) do
+            {:ok, resp.body}
+          else
+            {:error, Error.from_response(resp)}
+          end
 
-      {:error, exception} ->
-        Error.wrap_error(exception)
-    end
+        {:error, exception} ->
+          Error.wrap_error(exception)
+      end
+    end)
   end
 
   @doc """
@@ -204,45 +226,60 @@ defmodule Creatio.Auth do
   def openid_configuration(client_or_url, opts \\ [])
 
   def openid_configuration(%Client{} = client, opts) do
-    base = client.identity_service_url || (client.base_url || "") <> "/identity"
+    Telemetry.span(:auth, %{auth_mode: :openid_configuration, base_url: client.base_url}, fn ->
+      base = client.identity_service_url || (client.base_url || "") <> "/identity"
 
-    url =
-      Keyword.get(opts, :url) ||
-        "#{String.trim_trailing(base, "/")}/.well-known/openid-configuration"
+      url =
+        Keyword.get(opts, :url) ||
+          "#{String.trim_trailing(base, "/")}/.well-known/openid-configuration"
 
-    extra_req_opts = Keyword.get(opts, :req_options, [])
+      extra_req_opts = Keyword.get(opts, :req_options, [])
 
-    req =
-      client
-      |> identity_base_req()
-      |> Req.merge([url: url] ++ extra_req_opts)
+      req =
+        client
+        |> identity_base_req()
+        |> Req.merge([url: url] ++ extra_req_opts)
 
-    case Req.get(req) do
-      {:ok, %{status: 200, body: body}} ->
-        {:ok, body}
-
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
-
-      {:error, exception} ->
-        Error.wrap_error(exception)
-    end
+      handle_openid_response(Req.get(req))
+    end)
   end
 
   def openid_configuration(url, opts) when is_binary(url) do
-    req_opts = Keyword.get(opts, :req_options, [])
+    Telemetry.span(
+      :auth,
+      %{auth_mode: :openid_configuration, base_url: origin_from_url(url)},
+      fn ->
+        req_opts = Keyword.get(opts, :req_options, [])
 
-    case Req.get(url, req_opts) do
-      {:ok, %{status: 200, body: body}} ->
-        {:ok, body}
+        req =
+          [url: url]
+          |> Keyword.merge(req_opts)
+          |> Req.new()
+          |> Telemetry.attach_req_steps()
 
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
+        handle_openid_response(Req.get(req))
+      end
+    )
+  end
 
-      {:error, exception} ->
-        Error.wrap_error(exception)
+  defp origin_from_url(url) do
+    case URI.parse(url) do
+      %URI{scheme: scheme, host: host} when is_binary(scheme) and is_binary(host) ->
+        "#{scheme}://#{host}"
+
+      _ ->
+        ""
     end
   end
+
+  defp handle_openid_response({:ok, %Req.Response{} = raw_resp}) do
+    case Util.normalize_json_response(raw_resp) do
+      %{status: 200, body: %{} = body} -> {:ok, body}
+      %Req.Response{} = resp -> {:error, Error.from_response(resp)}
+    end
+  end
+
+  defp handle_openid_response({:error, exception}), do: Error.wrap_error(exception)
 
   # Reuses client.req (Finch pool, TLS, retry, :plug) without leaking CRM session headers
   defp identity_base_req(%Client{req: %Req.Request{} = req}) do

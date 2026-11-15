@@ -165,6 +165,22 @@ defmodule Creatio.TestDSL.SafetyDSL do
     end
   end
 
+  defmacro stream_emitted_error(ctx, opts \\ []) do
+    quote line: __CALLER__.line do
+      ctx = unquote(ctx)
+      expected = unquote(opts)
+
+      assert {:ok, items} = Map.fetch!(ctx, :result)
+      assert {:error, %Error{} = err} = List.last(items)
+
+      if Keyword.has_key?(expected, :status) do
+        assert err.status == Keyword.fetch!(expected, :status)
+      end
+
+      ctx
+    end
+  end
+
   defmacro operation_returned_error(ctx, opts \\ []) do
     quote line: __CALLER__.line do
       ctx = unquote(ctx)

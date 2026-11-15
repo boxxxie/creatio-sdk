@@ -288,15 +288,17 @@ defmodule Creatio.TestDrivers.CRMClientDriver do
   def odata_stream(ctx, entity_or_query, opts \\ []) do
     target = current_target(ctx)
     {take_n, stream_opts} = Keyword.pop(opts, :take)
+    {bang?, stream_opts} = Keyword.pop(stream_opts, :bang, false)
     {query_first?, stream_opts} = Keyword.pop(stream_opts, :query_first, false)
 
     result =
       capture_bang(fn ->
         stream =
-          if query_first? do
-            OData.stream(entity_or_query, target, stream_opts)
-          else
-            OData.stream(target, entity_or_query, stream_opts)
+          cond do
+            bang? and query_first? -> OData.stream!(entity_or_query, target, stream_opts)
+            bang? -> OData.stream!(target, entity_or_query, stream_opts)
+            query_first? -> OData.stream(entity_or_query, target, stream_opts)
+            true -> OData.stream(target, entity_or_query, stream_opts)
           end
 
         if is_integer(take_n), do: Enum.take(stream, take_n), else: Enum.to_list(stream)
@@ -718,7 +720,22 @@ defmodule Creatio.TestDrivers.CRMClientDriver do
           Creatio.openid_configuration(url, req_options: req_opts)
 
         {:facade_stream!, entity} ->
-          capture_bang(fn -> Creatio.stream(client, entity) |> Enum.to_list() end)
+          capture_bang(fn -> Creatio.stream!(client, entity) |> Enum.to_list() end)
+
+        {:facade_odata3_stream!, entity} ->
+          capture_bang(fn -> Creatio.odata3_stream!(client, entity) |> Enum.to_list() end)
+
+        {:stream_error_odata_query_first, entity} ->
+          {:ok, OData.stream(Query.new(entity), client, []) |> Enum.to_list()}
+
+        {:stream_error_odata3_query_first, entity} ->
+          {:ok, OData3.stream(Query.new(entity), client, []) |> Enum.to_list()}
+
+        {:stream_error_facade, entity} ->
+          {:ok, Creatio.stream(client, entity) |> Enum.to_list()}
+
+        {:stream_error_facade_odata3, entity} ->
+          {:ok, Creatio.odata3_stream(client, entity) |> Enum.to_list()}
 
         {:bang_odata_list, entity} ->
           capture_bang(fn -> OData.list!(client, entity) end)
@@ -763,7 +780,7 @@ defmodule Creatio.TestDrivers.CRMClientDriver do
           OData.count(client, entity, strategy: :top_zero)
 
         {:bang_odata_stream_query_first, entity} ->
-          capture_bang(fn -> OData.stream(Query.new(entity), client, []) |> Enum.to_list() end)
+          capture_bang(fn -> OData.stream!(Query.new(entity), client, []) |> Enum.to_list() end)
 
         {:bang_odata3_list, entity} ->
           capture_bang(fn -> OData3.list!(client, entity) end)
@@ -785,9 +802,6 @@ defmodule Creatio.TestDrivers.CRMClientDriver do
 
         {:bang_odata3_delete, entity, id} ->
           capture_bang(fn -> OData3.delete!(client, entity, id) end)
-
-        {:bang_odata3_stream, entity} ->
-          capture_bang(fn -> OData3.stream(Query.new(entity), client, []) |> Enum.to_list() end)
 
         {:bang_odata3_stream!, entity} ->
           capture_bang(fn -> OData3.stream!(Query.new(entity), client, []) |> Enum.to_list() end)

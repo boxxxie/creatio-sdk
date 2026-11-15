@@ -258,11 +258,14 @@ defmodule Creatio.RegressionsTest do
       # stream honors opts[:skip] over Query.skip and total top: 3 with page_size: 2
       q_skip = Query.new("Contact") |> Query.skip(99) |> Query.top(3)
 
-      assert [%{"Id" => 6}, %{"Id" => 7}, %{"Id" => 8}] =
+      assert [{:ok, %{"Id" => 6}}, {:ok, %{"Id" => 7}}, {:ok, %{"Id" => 8}}] =
                OData.stream(client, q_skip, page_size: 2, skip: 5) |> Enum.to_list()
 
+      assert [%{"Id" => 6}, %{"Id" => 7}, %{"Id" => 8}] =
+               OData.stream!(client, q_skip, page_size: 2, skip: 5) |> Enum.to_list()
+
       # stream continues past 20,000 cap when page_size: 25_000 and stops cleanly on empty page
-      assert [%{"Id" => 1}, %{"Id" => 2}] =
+      assert [{:ok, %{"Id" => 1}}, {:ok, %{"Id" => 2}}] =
                OData.stream(client, "Contact", page_size: 25_000) |> Enum.to_list()
     end
 
@@ -281,11 +284,15 @@ defmodule Creatio.RegressionsTest do
       assert [%{"Id" => "o4"}] = Creatio.list!("Contact", client)
       assert {:ok, [%{"Id" => "o4"}]} = Creatio.execute("Contact", client)
       assert [%{"Id" => "o4"}] = Creatio.execute!("Contact", client)
-      assert [%{"Id" => "o4"}] = Creatio.stream("Contact", client) |> Enum.take(1)
+      assert [{:ok, %{"Id" => "o4"}}] = Creatio.stream("Contact", client) |> Enum.take(1)
+      assert [%{"Id" => "o4"}] = Creatio.stream!("Contact", client) |> Enum.take(1)
 
       assert {:ok, [%{"Id" => "o3"}]} = Creatio.odata3_list("Contact", client)
       assert [%{"Id" => "o3"}] = Creatio.odata3_list!("Contact", client)
-      assert [%{"Id" => "o3"}] = Creatio.odata3_stream("Contact", client) |> Enum.take(1)
+
+      assert [{:ok, %{"Id" => "o3"}}] =
+               Creatio.odata3_stream("Contact", client) |> Enum.take(1)
+
       assert [%{"Id" => "o3"}] = Creatio.odata3_stream!("Contact", client) |> Enum.take(1)
     end
   end
@@ -377,11 +384,23 @@ defmodule Creatio.RegressionsTest do
 
       q4 = Query.new("Contact") |> Query.filter_eq("Active", true)
 
-      assert [%{"Id" => ^id1}, %{"Id" => ^id2}, %{"Id" => ^id3}] =
+      assert [{:ok, %{"Id" => ^id1}}, {:ok, %{"Id" => ^id2}}, {:ok, %{"Id" => ^id3}}] =
                OData.stream(client, q4, page_size: 2, cursor_field: "Id") |> Enum.to_list()
 
-      assert [%{"Id" => ^id2}, %{"Id" => ^id3}] =
+      assert [%{"Id" => ^id1}, %{"Id" => ^id2}, %{"Id" => ^id3}] =
+               OData.stream!(client, q4, page_size: 2, cursor_field: "Id") |> Enum.to_list()
+
+      assert [{:ok, %{"Id" => ^id2}}, {:ok, %{"Id" => ^id3}}] =
                OData3.stream(client, "Contact",
+                 page_size: 2,
+                 cursor_field: "Id",
+                 after_cursor: id1,
+                 filter: "Active eq true"
+               )
+               |> Enum.to_list()
+
+      assert [%{"Id" => ^id2}, %{"Id" => ^id3}] =
+               OData3.stream!(client, "Contact",
                  page_size: 2,
                  cursor_field: "Id",
                  after_cursor: id1,
@@ -437,6 +456,90 @@ defmodule Creatio.RegressionsTest do
       assert :ok = OData.update_field(client, "SysFile", "1", "Data", upload_stream)
     end
 
+    test "get_field_value/5 forwards :headers, :req_options, and query params while keeping decode_body: false" do
+      tmp_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "creatio_sdk_field_value_#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(tmp_dir)
+      on_exit(fn -> File.rm_rf(tmp_dir) end)
+      parent = self()
+
+      plug = fn conn ->
+        send(parent, {
+          :seen_field_value_req,
+          conn.request_path,
+          Plug.Conn.fetch_query_params(conn).query_params,
+          Plug.Conn.get_req_header(conn, "x-trace"),
+          Plug.Conn.get_req_header(conn, "range")
+        })
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, ~s({"raw":"bytes"}))
+      end
+
+      client = Client.new(base_url: "https://crm.test", req_options: [plug: plug])
+      o4_path = Path.join(tmp_dir, "o4.bin")
+      o3_path = Path.join(tmp_dir, "o3.bin")
+
+      assert {:ok, %File.Stream{}} =
+               Creatio.get_field_value(client, "SysFile", "1", "Data",
+                 headers: [{"range", "bytes=0-4"}, {"x-trace", "o4-kw"}],
+                 req_options: [decode_body: true, params: %{"from_req" => "yes"}],
+                 params: %{"download" => "1"},
+                 select: ["Name"],
+                 into: File.stream!(o4_path)
+               )
+
+      assert File.read!(o4_path) == ~s({"raw":"bytes"})
+
+      assert_receive {:seen_field_value_req, "/0/odata/SysFile(1)/Data/$value", o4_params,
+                      ["o4-kw"], ["bytes=0-4"]}
+
+      assert o4_params["$select"] == "Name"
+      assert o4_params["download"] == "1"
+      assert o4_params["from_req"] == "yes"
+
+      # Trying to override decode_body: true via req_options still preserves decode_body: false
+      assert {:ok, ~s({"raw":"bytes"})} =
+               OData.get_field_value(client, "SysFile", "1", "Data", %{
+                 headers: %{"x-trace" => "o4-map"},
+                 req_options: [decode_body: true]
+               })
+
+      assert_receive {:seen_field_value_req, "/0/odata/SysFile(1)/Data/$value", _, ["o4-map"], []}
+
+      assert {:ok, %File.Stream{}} =
+               Creatio.odata3_get_field_value(client, "SysFile", "1", "Data", %{
+                 headers: %{"range" => "bytes=0-3", "x-trace" => "o3-map"},
+                 req_options: [decode_body: true, params: %{"from_req" => "o3"}],
+                 select: ["Data"],
+                 into: File.stream!(o3_path)
+               })
+
+      assert File.read!(o3_path) == ~s({"raw":"bytes"})
+
+      assert_receive {:seen_field_value_req,
+                      "/0/ServiceModel/EntityDataService.svc/SysFileCollection(guid'1')/Data/$value",
+                      o3_params, ["o3-map"], ["bytes=0-3"]}
+
+      assert o3_params["$select"] == "Data"
+      assert o3_params["from_req"] == "o3"
+
+      assert {:ok, ~s({"raw":"bytes"})} =
+               OData3.get_field_value(client, "SysFile", "1", "Data",
+                 headers: [{"x-trace", "o3-kw"}],
+                 req_options: [decode_body: true]
+               )
+
+      assert_receive {:seen_field_value_req,
+                      "/0/ServiceModel/EntityDataService.svc/SysFileCollection(guid'1')/Data/$value",
+                      _, ["o3-kw"], []}
+    end
+
     test "OData.create and update support return: :minimal and 204 odata-entityid" do
       plug = fn conn ->
         assert Plug.Conn.get_req_header(conn, "prefer") == ["return=minimal"]
@@ -457,10 +560,30 @@ defmodule Creatio.RegressionsTest do
 
       client = Client.new(base_url: "https://crm.test", req_options: [plug: plug])
 
-      assert {:ok, %{"@odata.id" => "https://crm.test/0/odata/Contact(abc)"}} =
+      assert {:ok,
+              %{
+                "@odata.id" => "https://crm.test/0/odata/Contact(abc)",
+                "Id" => "abc"
+              }} =
                OData.create(client, "Contact", %{"Name" => "Min"}, return: :minimal)
 
       assert :ok = OData.update(client, "Contact", "abc", %{"Name" => "Min2"}, return: :minimal)
+    end
+
+    test "extracts Id from mixed-case OData-EntityId or Location header on 204 return=minimal" do
+      guid = "12345678-1234-1234-1234-123456789abc"
+      entity_uri = "https://crm.test/0/odata/Contact({#{guid}})"
+
+      plug = fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("location", entity_uri)
+        |> Plug.Conn.send_resp(204, "")
+      end
+
+      client = Client.new(base_url: "https://crm.test", req_options: [plug: plug])
+
+      assert {:ok, %{"@odata.id" => ^entity_uri, "Id" => ^guid}} =
+               OData.create(client, "Contact", %{"Name" => "Loc"}, return: :minimal)
     end
 
     test "Query flattens chained and_filter expressions and preserves OR precedence" do
@@ -479,6 +602,163 @@ defmodule Creatio.RegressionsTest do
         |> Query.filter_eq("C", 3)
 
       assert Query.to_params(q_or_then_and)["$filter"] == "((A eq 1) or (B eq 2)) and C eq 3"
+    end
+  end
+
+  describe "IIS text/html JSON normalization and WAF HTML interstitial protection" do
+    test "decodes IIS text/html JSON responses across OData, OData3, Auth, and DataService" do
+      plug = fn conn ->
+        body =
+          case conn.request_path do
+            "/0/odata/Contact" when conn.method == "POST" ->
+              Jason.encode!(%{"Id" => "c-1", "Name" => "Created"})
+
+            "/0/odata/Contact" ->
+              Jason.encode!(%{"value" => [%{"Id" => "c-1"}]})
+
+            "/0/odata/Contact(c-1)" ->
+              Jason.encode!(%{"Id" => "c-1", "Name" => "Alice"})
+
+            "/0/odata/Contact(c-1)/Account" ->
+              Jason.encode!(%{"Id" => "a-1", "Name" => "Acme"})
+
+            "/0/odata/Contact(c-1)/Name" ->
+              Jason.encode!(%{"value" => "Alice"})
+
+            "/0/ServiceModel/EntityDataService.svc/ContactCollection" ->
+              Jason.encode!(%{"d" => %{"results" => [%{"Id" => "o3-1"}]}})
+
+            "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'o3-1')" ->
+              Jason.encode!(%{"d" => %{"Id" => "o3-1"}})
+
+            "/0/api/OAuthHealthCheck" ->
+              Jason.encode!(%{"HasProblem" => false})
+
+            "/.well-known/openid-configuration" ->
+              Jason.encode!(%{"issuer" => "https://id.test"})
+
+            "/0/DataService/json/SyncReply/SelectQuery" ->
+              Jason.encode!(%{"success" => true, "rows" => [%{"Id" => "ds-1"}]})
+
+            "/0/odata/$batch" ->
+              Jason.encode!(%{
+                "responses" => [%{"id" => "req_1", "status" => 200, "body" => %{}}]
+              })
+          end
+
+        status =
+          if conn.method == "POST" and conn.request_path == "/0/odata/Contact", do: 201, else: 200
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/html")
+        |> Plug.Conn.send_resp(status, "\uFEFF" <> body)
+      end
+
+      client =
+        Client.new(
+          base_url: "https://crm.test",
+          identity_service_url: "https://crm.test",
+          req_options: [plug: plug]
+        )
+
+      assert {:ok, %{"Id" => "c-1"}} = OData.create(client, "Contact", %{"Name" => "Created"})
+      assert {:ok, [%{"Id" => "c-1"}]} = OData.list(client, "Contact")
+      assert {:ok, %{"Id" => "c-1"}} = OData.get(client, "Contact", "c-1")
+      assert {:ok, %{"Id" => "a-1"}} = OData.get_navigation(client, "Contact", "c-1", "Account")
+      assert {:ok, "Alice"} = OData.get_field(client, "Contact", "c-1", "Name")
+      assert {:ok, [%{"Id" => "o3-1"}]} = OData3.list(client, "Contact")
+      assert {:ok, %{"Id" => "o3-1"}} = OData3.get(client, "Contact", "o3-1")
+      assert {:ok, %{"HasProblem" => false}} = Auth.oauth_health_check(client)
+      assert {:ok, %{"issuer" => "https://id.test"}} = Auth.openid_configuration(client)
+
+      assert {:ok, %{"success" => true}} =
+               DataService.select_query(client, %{"rootSchemaName" => "Contact"})
+
+      batch = Batch.new() |> Batch.add_get("Contact")
+      assert {:ok, [%Batch.Response{id: "req_1", status: 200}]} = Batch.execute(client, batch)
+    end
+
+    test "returns {:error, %Error{}} when HTTP 200/201 returns an HTML WAF/login interstitial" do
+      incapsula_html = """
+      <html style="height:100%"><head><meta name="ROBOTS" content="NOINDEX, NOFOLLOW"></head>
+      <body style="margin:0"><iframe id="main-iframe" src="/_Incapsula_Resource?SWUDNSAI=31"></iframe></body></html>
+      """
+
+      plug = fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/html")
+        |> Plug.Conn.send_resp(200, incapsula_html)
+      end
+
+      client =
+        Client.new(
+          base_url: "https://crm.test",
+          identity_service_url: "https://crm.test",
+          client_id: "cid",
+          client_secret: "csec",
+          req_options: [plug: plug]
+        )
+
+      assert {:error, %Error{status: 200}} = OData.list(client, "Contact")
+      assert {:error, %Error{status: 200}} = OData.get(client, "Contact", "id-1")
+
+      assert {:error, %Error{status: 200}} =
+               OData.get_navigation(client, "Contact", "id-1", "Account")
+
+      assert {:error, %Error{status: 200}} = OData.get_field(client, "Contact", "id-1", "Name")
+      assert {:error, %Error{status: 200}} = OData.create(client, "Contact", %{"Name" => "X"})
+
+      assert {:error, %Error{status: 200}} =
+               OData.update(client, "Contact", "id-1", %{"Name" => "Y"})
+
+      assert {:error, %Error{status: 200}} = OData3.list(client, "Contact")
+      assert {:error, %Error{status: 200}} = OData3.get(client, "Contact", "id-1")
+
+      assert {:error, %Error{status: 200}} =
+               OData3.get_navigation(client, "Contact", "id-1", "Account")
+
+      assert {:error, %Error{status: 200}} = OData3.get_field(client, "Contact", "id-1", "Name")
+      assert {:error, %Error{status: 200}} = OData3.create(client, "Contact", %{"Name" => "X"})
+
+      assert {:error, %Error{status: 200}} =
+               OData3.update(client, "Contact", "id-1", %{"Name" => "Y"})
+
+      assert {:error, %Error{status: 200}} = Auth.login_oauth(client)
+      assert {:error, %Error{status: 200}} = Auth.oauth_health_check(client)
+      assert {:error, %Error{status: 200}} = Auth.openid_configuration(client)
+
+      assert {:error, %Error{status: 200}} =
+               Auth.openid_configuration("https://crm.test/.well-known/openid-configuration",
+                 req_options: [plug: plug]
+               )
+
+      assert {:error, %Error{status: 200}} =
+               DataService.select_query(client, %{"rootSchemaName" => "Contact"})
+
+      assert {:error, %Error{status: 200}} =
+               Batch.execute(client, Batch.new() |> Batch.add_get("Contact"))
+    end
+
+    test "CreatioServerDriver simulates IIS text/html JSON and 204 OData-EntityId headers" do
+      alias Creatio.TestDrivers.CreatioServerDriver, as: Server
+
+      ctx =
+        %{}
+        |> Server.ensure_server()
+        |> Server.stub_odata_list("Contact",
+          content_type: "text/html",
+          records: [%{"Id" => "d-1"}]
+        )
+        |> Server.stub_odata_create("Contact",
+          status: 204,
+          odata_entityid: "https://mycreatio.com/0/odata/Contact(d-2)"
+        )
+
+      client = Server.client(ctx)
+      assert {:ok, [%{"Id" => "d-1"}]} = OData.list(client, "Contact")
+
+      assert {:ok, %{"@odata.id" => "https://mycreatio.com/0/odata/Contact(d-2)", "Id" => "d-2"}} =
+               OData.create(client, "Contact", %{"Name" => "Driver"})
     end
   end
 end

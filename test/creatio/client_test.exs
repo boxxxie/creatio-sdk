@@ -54,6 +54,20 @@ defmodule Creatio.ClientTest do
       assert Client.ensure_client(req) == client
       assert Client.ensure_client(client) == client
     end
+
+    test "strips trailing slashes on identity_service_url in new/1 and from_req/2" do
+      client =
+        Client.new(
+          base_url: "https://mycreatio.com/",
+          identity_service_url: "https://id.mycreatio.com/0/"
+        )
+
+      assert client.identity_service_url == "https://id.mycreatio.com/0"
+
+      req = Req.new(base_url: "https://mycreatio.com")
+      from_req_client = Client.from_req(req, identity_service_url: "https://id.mycreatio.com/0/")
+      assert from_req_client.identity_service_url == "https://id.mycreatio.com/0"
+    end
   end
 
   describe "put_bearer_token/2" do
@@ -160,5 +174,45 @@ defmodule Creatio.ClientTest do
       assert {:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}} =
                Req.post(client.req, url: "/0/odata/Contact", json: %{})
     end
+  end
+end
+
+defmodule Creatio.ClientEnvTest do
+  use ExUnit.Case, async: false
+
+  alias Creatio.Client
+
+  setup do
+    previous = System.get_env("CREATIO_BASE_URL")
+
+    on_exit(fn ->
+      if is_binary(previous) do
+        System.put_env("CREATIO_BASE_URL", previous)
+      else
+        System.delete_env("CREATIO_BASE_URL")
+      end
+    end)
+
+    :ok
+  end
+
+  test "from_req/2 does not read CREATIO_BASE_URL from the environment while new/1 does" do
+    System.put_env("CREATIO_BASE_URL", "https://env.creatio.com")
+
+    req_without_base_url = Req.new()
+    client_from_req = Client.from_req(req_without_base_url)
+    assert client_from_req.base_url == ""
+
+    client_from_req_with_opt =
+      Client.from_req(req_without_base_url, base_url: "https://opt.creatio.com")
+
+    assert client_from_req_with_opt.base_url == "https://opt.creatio.com"
+
+    req_with_base_url = Req.new(base_url: "https://req.creatio.com")
+    client_from_req_url = Client.from_req(req_with_base_url)
+    assert client_from_req_url.base_url == "https://req.creatio.com"
+
+    client_from_new = Client.new()
+    assert client_from_new.base_url == "https://env.creatio.com"
   end
 end

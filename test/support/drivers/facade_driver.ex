@@ -164,8 +164,14 @@ defmodule Creatio.TestDrivers.FacadeDriver do
   defp dispatch(_ctx, client, {:stream, entity, opts}),
     do: {:ok, Creatio.stream(client, entity, opts) |> Enum.to_list()}
 
+  defp dispatch(_ctx, client, {:stream!, entity, opts}),
+    do: capture(fn -> Creatio.stream!(client, entity, opts) |> Enum.to_list() end)
+
   defp dispatch(_ctx, client, {:stream_query_first, entity, opts}),
     do: {:ok, Creatio.stream(Query.new(entity), client, opts) |> Enum.to_list()}
+
+  defp dispatch(_ctx, client, {:stream_query_first!, entity, opts}),
+    do: capture(fn -> Creatio.stream!(Query.new(entity), client, opts) |> Enum.to_list() end)
 
   defp dispatch(_ctx, client, {:select_query, payload}), do: Creatio.select_query(client, payload)
 
@@ -322,7 +328,7 @@ defmodule Creatio.TestDrivers.FacadeDriver do
   defp dispatch(_ctx, _client, {:query_helper, entity, fields}) do
     q = Creatio.query(entity) |> Query.select(fields)
     select_fields = (Query.to_params(q)["$select"] || "") |> String.split(",", trim: true)
-    {:ok, %{entity: q.entity, select: select_fields}}
+    {:ok, %{entity: Query.entity(q), select: select_fields}}
   end
 
   defp dispatch(_ctx, _client, {:new_client, base_url}),

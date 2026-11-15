@@ -41,8 +41,12 @@ defmodule Creatio.Features.SdkFacadeAndResilienceTest do
     {"OData update_field!/5", {:update_field!, "Contact", "1", "Photo", "bin"}, {:ok, :ok}},
     {"OData delete_field/4", {:delete_field, "Contact", "1", "Photo"}, :ok},
     {"OData delete_field!/4", {:delete_field!, "Contact", "1", "Photo"}, {:ok, :ok}},
-    {"OData stream/3", {:stream, "Contact", []}, {:ok, [%{"Id" => "1", "Name" => "Test"}]}},
+    {"OData stream/3", {:stream, "Contact", []},
+     {:ok, [{:ok, %{"Id" => "1", "Name" => "Test"}}]}},
+    {"OData stream!/3", {:stream!, "Contact", []}, {:ok, [%{"Id" => "1", "Name" => "Test"}]}},
     {"OData stream/3 query-first", {:stream_query_first, "Contact", []},
+     {:ok, [{:ok, %{"Id" => "1", "Name" => "Test"}}]}},
+    {"OData stream!/3 query-first", {:stream_query_first!, "Contact", []},
      {:ok, [%{"Id" => "1", "Name" => "Test"}]}},
     {"DataService select_query/2", {:select_query, %{}},
      {:ok, %{"rows" => [%{"Name" => "Corp"}], "success" => true}}},
@@ -96,10 +100,10 @@ defmodule Creatio.Features.SdkFacadeAndResilienceTest do
     {"OData 3 update!/4", {:odata3_update!, "Contact", "1", %{"Name" => "U"}}, {:ok, :ok}},
     {"OData 3 delete/3", {:odata3_delete, "Contact", "1"}, :ok},
     {"OData 3 delete!/3", {:odata3_delete!, "Contact", "1"}, {:ok, :ok}},
-    {"OData 3 stream/3", {:odata3_stream, "Contact", []}, {:ok, [%{"Name" => "Legacy"}]}},
+    {"OData 3 stream/3", {:odata3_stream, "Contact", []}, {:ok, [{:ok, %{"Name" => "Legacy"}}]}},
     {"OData 3 stream!/3", {:odata3_stream!, "Contact", []}, {:ok, [%{"Name" => "Legacy"}]}},
     {"OData 3 stream/3 query-first", {:odata3_stream_query_first, "Contact", []},
-     {:ok, [%{"Name" => "Legacy"}]}},
+     {:ok, [{:ok, %{"Name" => "Legacy"}}]}},
     {"OData 3 stream!/3 query-first", {:odata3_stream_query_first!, "Contact", []},
      {:ok, [%{"Name" => "Legacy"}]}},
     {"Batch execute/2", {:batch_get, "Contact", "1"}, {:batch_response_count, 1}},
@@ -133,7 +137,7 @@ defmodule Creatio.Features.SdkFacadeAndResilienceTest do
     {"OData delete!", {:bang_odata_delete, "Contact", "123"}},
     {"OData update_field!", {:bang_odata_update_field, "Contact", "123", "Name", "X"}},
     {"OData delete_field!", {:bang_odata_delete_field, "Contact", "123", "Name"}},
-    {"OData stream query-first", {:bang_odata_stream_query_first, "Contact"}},
+    {"OData stream! query-first", {:bang_odata_stream_query_first, "Contact"}},
     {"OData 3 list!", {:bang_odata3_list, "Contact"}},
     {"OData 3 list! query-first", {:bang_odata3_list_query_first, "Contact"}},
     {"OData 3 get!", {:bang_odata3_get, "Contact", "123"}},
@@ -144,7 +148,6 @@ defmodule Creatio.Features.SdkFacadeAndResilienceTest do
     {"OData 3 create!", {:bang_odata3_create, "Contact", %{}}},
     {"OData 3 update!", {:bang_odata3_update, "Contact", "123", %{}}},
     {"OData 3 delete!", {:bang_odata3_delete, "Contact", "123"}},
-    {"OData 3 stream query-first", {:bang_odata3_stream, "Contact"}},
     {"OData 3 stream! query-first", {:bang_odata3_stream!, "Contact"}},
     {"DataService select_query!", {:bang_data_service_select, %{}}},
     {"DataService insert_query!", {:bang_data_service_insert, %{}}},
@@ -156,7 +159,15 @@ defmodule Creatio.Features.SdkFacadeAndResilienceTest do
     {"CustomService 5-arg bang",
      {:bang_custom_service_5, "CustomSvc", "Echo", %{"a" => 1}, [method: :post]}},
     {"Creatio batch! with empty requests", {:facade_batch_empty!}},
-    {"Creatio stream!", {:facade_stream!, "Contact"}}
+    {"Creatio stream!", {:facade_stream!, "Contact"}},
+    {"Creatio odata3_stream!", {:facade_odata3_stream!, "Contact"}}
+  ]
+
+  @stream_error_operations [
+    {"OData stream/3 query-first", {:stream_error_odata_query_first, "Contact"}},
+    {"OData 3 stream/3 query-first", {:stream_error_odata3_query_first, "Contact"}},
+    {"Creatio stream/3", {:stream_error_facade, "Contact"}},
+    {"Creatio odata3_stream/3", {:stream_error_facade_odata3, "Contact"}}
   ]
 
   @normalized_params [
@@ -259,6 +270,14 @@ defmodule Creatio.Features.SdkFacadeAndResilienceTest do
   end
 
   describe "Tuple Error Propagation & Parameter Normalization" do
+    for {label, operation} <- @stream_error_operations do
+      scenario "emits {:error, %Creatio.Error{}} and halts on 500 server failure for #{label}" do
+        @given crm_server_failing_with_status(500, %{})
+        @upon attempting_operation(unquote(Macro.escape(operation)))
+        @then stream_emitted_error(status: 500)
+      end
+    end
+
     for {label, operation} <- @tuple_error_operations do
       scenario "returns Creatio.Error tuple for #{label}" do
         @given crm_server_failing_with_status(500, %{})

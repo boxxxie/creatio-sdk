@@ -261,11 +261,18 @@ defmodule Creatio.Features.ODataEntitiesTest do
              ])
       @upon streaming_entities("Contact", page_size: 2)
       @then streamed_entities_match([
+              {:ok, %{"Id" => "1", "Name" => "Page1-A"}},
+              {:ok, %{"Id" => "2", "Name" => "Page1-B"}},
+              {:ok, %{"Id" => "3", "Name" => "Page2-A"}}
+            ])
+      @then query_parameters_mapped(skip: 2, top: 2)
+
+      @upon streaming_entities("Contact", page_size: 2, bang: true)
+      @then streamed_entities_match([
               %{"Id" => "1", "Name" => "Page1-A"},
               %{"Id" => "2", "Name" => "Page1-B"},
               %{"Id" => "3", "Name" => "Page2-A"}
             ])
-      @then query_parameters_mapped(skip: 2, top: 2)
     end
 
     scenario "streams a Query struct lazily and supports early take" do
@@ -281,7 +288,7 @@ defmodule Creatio.Features.ODataEntitiesTest do
               page_size: 2,
               take: 2
             )
-      @then streamed_entities_match([%{"Id" => "1"}, %{"Id" => "2"}])
+      @then streamed_entities_match([{:ok, %{"Id" => "1"}}, {:ok, %{"Id" => "2"}}])
       @then query_parameters_mapped(filter: "Active eq true", skip: 0, top: 2)
     end
 
@@ -302,7 +309,7 @@ defmodule Creatio.Features.ODataEntitiesTest do
               query_first: true,
               page_size: 2
             )
-      @then streamed_entities_match([%{"Id" => "3"}])
+      @then streamed_entities_match([{:ok, %{"Id" => "3"}}])
       @then query_parameters_mapped(skip: 2, top: 2)
     end
   end

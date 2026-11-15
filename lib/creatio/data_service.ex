@@ -6,7 +6,7 @@ defmodule Creatio.DataService do
   and calling custom REST service endpoints.
   """
 
-  alias Creatio.{Client, Error}
+  alias Creatio.{Client, Error, Telemetry, Util}
 
   @doc """
   Executes a SelectQuery against `/0/DataService/json/SyncReply/SelectQuery`.
@@ -142,11 +142,21 @@ defmodule Creatio.DataService do
   def execute_query(client_or_req, action, query_payload, opts \\ []) do
     client = Client.ensure_client(client_or_req)
 
-    if client.read_only and action != "SelectQuery" do
-      {:error, read_only_error()}
-    else
-      do_execute_query(client, action, query_payload, opts)
-    end
+    Telemetry.span(
+      :data_service,
+      %{
+        action: action,
+        entity: extract_root_schema(query_payload),
+        base_url: client.base_url
+      },
+      fn ->
+        if client.read_only and action != "SelectQuery" do
+          {:error, read_only_error()}
+        else
+          do_execute_query(client, action, query_payload, opts)
+        end
+      end
+    )
   end
 
   @doc """
@@ -207,13 +217,7 @@ defmodule Creatio.DataService do
   end
 
   defp execute_mutation_query(client_or_req, action, query_payload, opts) do
-    client = Client.ensure_client(client_or_req)
-
-    if client.read_only do
-      {:error, read_only_error()}
-    else
-      do_execute_query(client, action, query_payload, opts)
-    end
+    execute_query(client_or_req, action, query_payload, opts)
   end
 
   defp do_execute_query(%Client{} = client, action, query_payload, opts) do
@@ -222,32 +226,27 @@ defmodule Creatio.DataService do
     req = Req.Request.put_header(client.req, "content-type", "application/json; charset=utf-8")
 
     case Req.post(req, url: url, json: query_payload) do
-      {:ok, %Req.Response{status: status, body: %{} = body} = resp} when status in 200..299 ->
-        if body["success"] in [false, "false"] or body["Success"] in [false, "false"] do
-          {:error, Error.from_response(resp)}
-        else
-          {:ok, body}
-        end
+      {:ok, %Req.Response{} = raw_resp} ->
+        resp = Util.normalize_json_response(raw_resp)
 
-      {:ok, %Req.Response{status: status, body: body_str} = resp}
-      when status in 200..299 and is_binary(body_str) ->
-        case Jason.decode(body_str) do
-          {:ok, %{} = decoded} ->
-            if decoded["success"] in [false, "false"] or decoded["Success"] in [false, "false"] do
-              {:error, Error.from_response(%Req.Response{resp | body: decoded})}
+        cond do
+          resp.status in 200..299 and Util.html_or_xml_response?(resp) ->
+            {:error, Error.from_response(resp)}
+
+          resp.status in 200..299 and is_map(resp.body) ->
+            if resp.body["success"] in [false, "false"] or
+                 resp.body["Success"] in [false, "false"] do
+              {:error, Error.from_response(resp)}
             else
-              {:ok, decoded}
+              {:ok, resp.body}
             end
 
-          _ ->
-            {:ok, body_str}
+          resp.status in 200..299 ->
+            {:ok, resp.body}
+
+          true ->
+            {:error, Error.from_response(resp)}
         end
-
-      {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
-        {:ok, body}
-
-      {:ok, %Req.Response{} = resp} ->
-        {:error, Error.from_response(resp)}
 
       {:error, exception} ->
         Error.wrap_error(exception)
@@ -258,49 +257,70 @@ defmodule Creatio.DataService do
     client = Client.ensure_client(client_or_req)
     {http_method, req_opts} = Keyword.pop(opts, :method, :post)
 
-    if client.read_only and http_method not in [:get, :head, :options] do
-      {:error, read_only_error()}
-    else
-      url = "/0/rest/#{service_name}/#{endpoint}"
-
-      {params, req_opts} = Keyword.pop(req_opts, :params, %{})
-      {custom_headers, req_opts} = Keyword.pop(req_opts, :headers, %{})
-      {extra_req_opts, req_opts} = Keyword.pop(req_opts, :req_options, [])
-      req_opts = Keyword.merge(req_opts, extra_req_opts)
-
-      req = apply_custom_headers(client.req, custom_headers)
-
-      {final_payload, final_params} =
-        resolve_custom_payload_and_params(http_method, payload, params)
-
-      req_opts = Keyword.merge(req_opts, url: url, params: final_params, method: http_method)
-
-      final_payload =
-        if is_list(final_payload) and final_payload != [] and Keyword.keyword?(final_payload) do
-          Map.new(final_payload)
+    Telemetry.span(
+      :data_service,
+      %{
+        action: :custom_service,
+        service: service_name,
+        endpoint: endpoint,
+        method: http_method,
+        base_url: client.base_url
+      },
+      fn ->
+        if client.read_only and http_method not in [:get, :head, :options] do
+          {:error, read_only_error()}
         else
-          final_payload
+          url = "/0/rest/#{service_name}/#{endpoint}"
+
+          {params, req_opts} = Keyword.pop(req_opts, :params, %{})
+          {custom_headers, req_opts} = Keyword.pop(req_opts, :headers, %{})
+          {extra_req_opts, req_opts} = Keyword.pop(req_opts, :req_options, [])
+          req_opts = Keyword.merge(req_opts, extra_req_opts)
+
+          req = apply_custom_headers(client.req, custom_headers)
+
+          {final_payload, final_params} =
+            resolve_custom_payload_and_params(http_method, payload, params)
+
+          req_opts = Keyword.merge(req_opts, url: url, params: final_params, method: http_method)
+
+          final_payload =
+            if is_list(final_payload) and final_payload != [] and Keyword.keyword?(final_payload) do
+              Map.new(final_payload)
+            else
+              final_payload
+            end
+
+          req_opts =
+            cond do
+              is_nil(final_payload) -> req_opts
+              is_binary(final_payload) -> Keyword.put(req_opts, :body, final_payload)
+              true -> Keyword.put(req_opts, :json, final_payload)
+            end
+
+          case Req.request(req, req_opts) do
+            {:ok, %{status: status, body: body}} when status in 200..299 ->
+              {:ok, body}
+
+            {:ok, %Req.Response{} = resp} ->
+              {:error, Error.from_response(resp)}
+
+            {:error, exception} ->
+              Error.wrap_error(exception)
+          end
         end
-
-      req_opts =
-        cond do
-          is_nil(final_payload) -> req_opts
-          is_binary(final_payload) -> Keyword.put(req_opts, :body, final_payload)
-          true -> Keyword.put(req_opts, :json, final_payload)
-        end
-
-      case Req.request(req, req_opts) do
-        {:ok, %{status: status, body: body}} when status in 200..299 ->
-          {:ok, body}
-
-        {:ok, %Req.Response{} = resp} ->
-          {:error, Error.from_response(resp)}
-
-        {:error, exception} ->
-          Error.wrap_error(exception)
       end
-    end
+    )
   end
+
+  defp extract_root_schema(payload) when is_map(payload) do
+    payload["RootSchemaName"] ||
+      payload["rootSchemaName"] ||
+      payload[:RootSchemaName] ||
+      payload[:rootSchemaName]
+  end
+
+  defp extract_root_schema(_), do: nil
 
   defp resolve_custom_payload_and_params(http_method, payload, params)
        when http_method in [:get, :head] do

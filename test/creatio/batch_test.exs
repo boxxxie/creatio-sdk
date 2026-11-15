@@ -246,5 +246,25 @@ defmodule Creatio.BatchTest do
       assert {:error, %Error{status: 200}} =
                Batch.execute(html_client, Batch.new() |> Batch.add_get("Contact", "1"))
     end
+
+    test "exposes opaque encapsulation helpers size/1 and requests/1" do
+      empty = Batch.new()
+      assert Batch.size(empty) == 0
+      assert Batch.requests(empty) == []
+
+      batch =
+        empty
+        |> Batch.add_get("Contact", "00000000-0000-0000-0000-000000000001")
+        |> Batch.add_create("Account", %{"Name" => "Acme"})
+
+      assert Batch.size(batch) == 2
+
+      assert [
+               %{"method" => "GET", "url" => url1},
+               %{"method" => "POST", "url" => "Account", "body" => %{"Name" => "Acme"}}
+             ] = Batch.requests(batch)
+
+      assert String.contains?(url1, "Contact(00000000-0000-0000-0000-000000000001)")
+    end
   end
 end

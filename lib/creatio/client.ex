@@ -6,6 +6,8 @@ defmodule Creatio.Client do
   read-only safety guards, and content negotiation required by Creatio.
   """
 
+  alias Creatio.Telemetry
+
   @enforce_keys [:base_url]
   defstruct [
     :base_url,
@@ -75,10 +77,11 @@ defmodule Creatio.Client do
     bpmcsrf = Keyword.get(opts, :bpmcsrf)
 
     identity_service_url =
-      Keyword.get(opts, :identity_service_url) ||
-        Application.get_env(:creatio, :identity_service_url) ||
-        System.get_env("CREATIO_IDENTITY_URL") ||
-        System.get_env("CREATIO_IDENTITY_SERVICE_URL")
+      (Keyword.get(opts, :identity_service_url) ||
+         Application.get_env(:creatio, :identity_service_url) ||
+         System.get_env("CREATIO_IDENTITY_URL") ||
+         System.get_env("CREATIO_IDENTITY_SERVICE_URL"))
+      |> normalize_optional_url()
 
     client_id =
       Keyword.get(opts, :client_id) ||
@@ -128,14 +131,16 @@ defmodule Creatio.Client do
 
   @doc """
   Builds a `Creatio.Client` from an existing `Req.Request`.
+
+  Uses `:base_url` from `opts` if provided, falling back to `req.options[:base_url]`
+  or `""`. Unlike `new/1`, does not read `CREATIO_BASE_URL` from the environment.
   """
   @spec from_req(Req.Request.t(), keyword() | map()) :: t()
   def from_req(%Req.Request{} = req, opts \\ []) do
     opts_list = if is_map(opts), do: Map.to_list(opts), else: opts
 
     base_url =
-      Keyword.get(opts_list, :base_url) || req.options[:base_url] ||
-        System.get_env("CREATIO_BASE_URL") || ""
+      Keyword.get(opts_list, :base_url) || req.options[:base_url] || ""
 
     auth_token = Keyword.get(opts_list, :auth_token)
     cookie = Keyword.get(opts_list, :cookie)
@@ -162,7 +167,8 @@ defmodule Creatio.Client do
       auth_mode: auth_mode,
       cookie: cookie,
       bpmcsrf: bpmcsrf,
-      identity_service_url: Keyword.get(opts_list, :identity_service_url),
+      identity_service_url:
+        opts_list |> Keyword.get(:identity_service_url) |> normalize_optional_url(),
       client_id: Keyword.get(opts_list, :client_id),
       client_secret: Keyword.get(opts_list, :client_secret),
       read_only: read_only,
@@ -257,6 +263,14 @@ defmodule Creatio.Client do
       end
 
     req =
+      req
+      |> Req.Request.put_private(:creatio_client_meta, %{
+        base_url: client.base_url,
+        auth_mode: client.auth_mode
+      })
+      |> Telemetry.attach_req_steps()
+
+    req =
       if client.read_only and not Keyword.has_key?(req.request_steps, :read_only_guard) do
         Req.Request.append_request_steps(req, read_only_guard: &read_only_guard/1)
       else
@@ -310,4 +324,13 @@ defmodule Creatio.Client do
 
   defp put_or_delete_header(req, name, nil), do: Req.Request.delete_header(req, name)
   defp put_or_delete_header(req, name, value), do: Req.Request.put_header(req, name, value)
+
+  defp normalize_optional_url(url) when is_binary(url) do
+    case url |> String.trim() |> String.trim_trailing("/") do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp normalize_optional_url(_), do: nil
 end

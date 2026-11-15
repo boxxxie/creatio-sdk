@@ -312,6 +312,7 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
     records = Keyword.get(opts, :records, [])
     count = Keyword.get(opts, :count)
     bare_array? = Keyword.get(opts, :bare_array, false)
+    content_type = Keyword.get(opts, :content_type, "application/json")
 
     payload =
       cond do
@@ -332,9 +333,11 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
       ctx,
       fn req -> req.method == "GET" and req.request_path == "/0/odata/#{entity}" end,
       fn conn, _req ->
+        raw_payload = if is_binary(payload), do: payload, else: Jason.encode!(payload)
+
         conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(status, Jason.encode!(payload))
+        |> put_resp_content_type(content_type)
+        |> send_resp(status, raw_payload)
       end
     )
   end
@@ -364,14 +367,17 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   def stub_odata_get(ctx, entity, id, opts \\ []) do
     status = Keyword.get(opts, :status, 200)
     body = Keyword.get(opts, :body) || Keyword.get(opts, :record, %{"Id" => id})
+    content_type = Keyword.get(opts, :content_type, "application/json")
 
     add_route(
       ctx,
       fn req -> req.method == "GET" and req.request_path == "/0/odata/#{entity}(#{id})" end,
       fn conn, _req ->
+        raw_body = if is_binary(body), do: body, else: Jason.encode!(body)
+
         conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(status, Jason.encode!(body))
+        |> put_resp_content_type(content_type)
+        |> send_resp(status, raw_body)
       end
     )
   end
@@ -461,20 +467,43 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   def stub_odata_create(ctx, entity, opts \\ []) do
     status = Keyword.get(opts, :status, 201)
     assigned_id = Keyword.get(opts, :assigned_id, "new-uuid-1")
+    content_type = Keyword.get(opts, :content_type, "application/json")
+    entity_id_header = Keyword.get(opts, :odata_entityid)
+    location_header = Keyword.get(opts, :location)
 
     add_route(
       ctx,
       fn req -> req.method == "POST" and req.request_path == "/0/odata/#{entity}" end,
       fn conn, req ->
-        created =
-          case Keyword.get(opts, :body) do
-            nil -> Map.put(req.decoded_body || %{}, "Id", assigned_id)
-            explicit -> explicit
+        conn =
+          if entity_id_header do
+            put_resp_header(conn, "odata-entityid", entity_id_header)
+          else
+            conn
           end
 
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(status, Jason.encode!(created))
+        conn =
+          if location_header do
+            put_resp_header(conn, "location", location_header)
+          else
+            conn
+          end
+
+        if status == 204 do
+          send_resp(conn, 204, "")
+        else
+          created =
+            case Keyword.get(opts, :body) do
+              nil -> Map.put(req.decoded_body || %{}, "Id", assigned_id)
+              explicit -> explicit
+            end
+
+          raw_body = if is_binary(created), do: created, else: Jason.encode!(created)
+
+          conn
+          |> put_resp_content_type(content_type)
+          |> send_resp(status, raw_body)
+        end
       end
     )
   end

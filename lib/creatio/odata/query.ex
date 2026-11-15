@@ -6,6 +6,9 @@ defmodule Creatio.OData.Query do
   Provides chainable filter helpers for standard OData functions and operators
   (`eq`, `ne`, `gt`, `ge`, `lt`, `le`, `contains`, `startswith`, `endswith`, `day`, `length`, `not`, `in`).
 
+  `Creatio.OData.Query.t()` is an `@opaque` builder struct; inspect or serialize it via
+  `entity/1`, `get_top/1`, `get_skip/1`, `to_params/1`, and `to_query_string/1`.
+
   ## Examples
 
       query =
@@ -26,12 +29,8 @@ defmodule Creatio.OData.Query do
 
   defstruct [
     :entity,
-    :filter,
-    :select,
-    :orderby,
     :top,
     :skip,
-    :expand,
     count: false,
     custom_params: %{},
     filters_rev: [],
@@ -40,21 +39,17 @@ defmodule Creatio.OData.Query do
     expand_rev: []
   ]
 
-  @type t :: %__MODULE__{
-          entity: String.t(),
-          filter: String.t() | nil,
-          select: [String.t()] | String.t() | nil,
-          orderby: [String.t()] | String.t() | nil,
-          top: non_neg_integer() | nil,
-          skip: non_neg_integer() | nil,
-          expand: [String.t()] | String.t() | nil,
-          count: boolean(),
-          custom_params: map(),
-          filters_rev: [String.t()],
-          select_rev: [String.t()],
-          orderby_rev: [String.t()],
-          expand_rev: [String.t()]
-        }
+  @opaque t :: %__MODULE__{
+            entity: String.t(),
+            top: non_neg_integer() | nil,
+            skip: non_neg_integer() | nil,
+            count: boolean(),
+            custom_params: %{optional(String.t()) => String.t()},
+            filters_rev: [String.t()],
+            select_rev: [String.t()],
+            orderby_rev: [String.t()],
+            expand_rev: [String.t()]
+          }
 
   @valid_comparison_ops ~w(eq ne gt ge lt le)
 
@@ -71,10 +66,9 @@ defmodule Creatio.OData.Query do
   Can be called multiple times to accumulate fields.
   """
   @spec select(t(), [String.t() | atom()] | String.t() | atom()) :: t()
-  def select(%__MODULE__{} = query, fields) when is_list(fields) do
-    acc = seed_list_rev(query.select_rev, query.select, true)
-    next_rev = Enum.reduce(fields, acc, &prepend_split_tokens(&1, &2))
-    %__MODULE__{query | select: nil, select_rev: next_rev}
+  def select(%__MODULE__{select_rev: rev} = query, fields) when is_list(fields) do
+    next_rev = Enum.reduce(fields, rev, &prepend_split_tokens(&1, &2))
+    %__MODULE__{query | select_rev: next_rev}
   end
 
   def select(%__MODULE__{} = query, field) when is_binary(field) or is_atom(field) do
@@ -88,8 +82,7 @@ defmodule Creatio.OData.Query do
   def filter(%__MODULE__{} = query, filter_expr) when is_binary(filter_expr) do
     %__MODULE__{
       query
-      | filter: nil,
-        filters_rev: if(filter_expr == "", do: [], else: [filter_expr])
+      | filters_rev: if(filter_expr == "", do: [], else: [filter_expr])
     }
   end
 
@@ -109,9 +102,9 @@ defmodule Creatio.OData.Query do
     query
   end
 
-  def and_filter(%__MODULE__{} = query, filter_expr) when is_binary(filter_expr) do
-    acc = seed_filter_rev(query)
-    %__MODULE__{query | filter: nil, filters_rev: [filter_expr | acc]}
+  def and_filter(%__MODULE__{filters_rev: rev} = query, filter_expr)
+      when is_binary(filter_expr) do
+    %__MODULE__{query | filters_rev: [filter_expr | rev]}
   end
 
   @doc """
@@ -124,8 +117,8 @@ defmodule Creatio.OData.Query do
 
   def or_filter(%__MODULE__{} = query, filter_expr) when is_binary(filter_expr) do
     case compile_filter(query) do
-      nil -> %__MODULE__{query | filter: nil, filters_rev: [filter_expr]}
-      lhs -> %__MODULE__{query | filter: nil, filters_rev: ["(#{lhs}) or (#{filter_expr})"]}
+      nil -> %__MODULE__{query | filters_rev: [filter_expr]}
+      lhs -> %__MODULE__{query | filters_rev: ["(#{lhs}) or (#{filter_expr})"]}
     end
   end
 
@@ -346,7 +339,7 @@ defmodule Creatio.OData.Query do
   def filter_not(%__MODULE__{} = query, nil) do
     case compile_filter(query) do
       nil -> query
-      current -> %__MODULE__{query | filter: nil, filters_rev: ["not (#{current})"]}
+      current -> %__MODULE__{query | filters_rev: ["not (#{current})"]}
     end
   end
 
@@ -422,22 +415,19 @@ defmodule Creatio.OData.Query do
   Can be called multiple times to append ordering clauses.
   """
   @spec order_by(t(), [String.t() | atom() | tuple()] | String.t() | atom()) :: t()
-  def order_by(%__MODULE__{} = query, order_expr) when is_list(order_expr) do
-    acc = seed_list_rev(query.orderby_rev, query.orderby, false)
-
+  def order_by(%__MODULE__{orderby_rev: rev} = query, order_expr) when is_list(order_expr) do
     next_rev =
-      Enum.reduce(order_expr, acc, fn
+      Enum.reduce(order_expr, rev, fn
         {col, dir}, a -> ["#{col} #{dir}" | a]
         col, a -> prepend_non_empty(to_string(col), a)
       end)
 
-    %__MODULE__{query | orderby: nil, orderby_rev: next_rev}
+    %__MODULE__{query | orderby_rev: next_rev}
   end
 
-  def order_by(%__MODULE__{} = query, order_expr)
+  def order_by(%__MODULE__{orderby_rev: rev} = query, order_expr)
       when is_binary(order_expr) or is_atom(order_expr) do
-    acc = seed_list_rev(query.orderby_rev, query.orderby, false)
-    %__MODULE__{query | orderby: nil, orderby_rev: prepend_non_empty(to_string(order_expr), acc)}
+    %__MODULE__{query | orderby_rev: prepend_non_empty(to_string(order_expr), rev)}
   end
 
   @doc """
@@ -470,10 +460,9 @@ defmodule Creatio.OData.Query do
   Can be called multiple times to accumulate properties.
   """
   @spec expand(t(), [String.t() | atom()] | String.t() | atom()) :: t()
-  def expand(%__MODULE__{} = query, nav_props) when is_list(nav_props) do
-    acc = seed_list_rev(query.expand_rev, query.expand, true)
-    next_rev = Enum.reduce(nav_props, acc, &prepend_split_tokens(&1, &2))
-    %__MODULE__{query | expand: nil, expand_rev: next_rev}
+  def expand(%__MODULE__{expand_rev: rev} = query, nav_props) when is_list(nav_props) do
+    next_rev = Enum.reduce(nav_props, rev, &prepend_split_tokens(&1, &2))
+    %__MODULE__{query | expand_rev: next_rev}
   end
 
   def expand(%__MODULE__{} = query, nav_prop) when is_binary(nav_prop) or is_atom(nav_prop) do
@@ -497,6 +486,59 @@ defmodule Creatio.OData.Query do
   end
 
   @doc """
+  Returns the target OData entity collection name configured on the query.
+
+  ## Examples
+
+      iex> Creatio.OData.Query.new("Contact") |> Creatio.OData.Query.entity()
+      "Contact"
+
+  """
+  @spec entity(t()) :: String.t()
+  def entity(%__MODULE__{entity: entity}), do: entity
+
+  @doc """
+  Returns the configured `$top` limit on the query, or `nil` if unset.
+
+  ## Examples
+
+      iex> Creatio.OData.Query.new("Contact") |> Creatio.OData.Query.top(25) |> Creatio.OData.Query.get_top()
+      25
+
+  """
+  @spec get_top(t()) :: non_neg_integer() | nil
+  def get_top(%__MODULE__{top: top_val}), do: top_val
+
+  @doc """
+  Returns the configured `$skip` offset on the query, or `nil` if unset.
+
+  ## Examples
+
+      iex> Creatio.OData.Query.new("Contact") |> Creatio.OData.Query.skip(50) |> Creatio.OData.Query.get_skip()
+      50
+
+  """
+  @spec get_skip(t()) :: non_neg_integer() | nil
+  def get_skip(%__MODULE__{skip: skip_val}), do: skip_val
+
+  @doc """
+  Clears pagination and inline count state (`top`, `skip`, and `count`) so a query
+  can serve as a reusable per-page template during streaming.
+  """
+  @spec reset_stream_target(t()) :: t()
+  def reset_stream_target(%__MODULE__{} = query) do
+    %__MODULE__{query | count: false, top: nil, skip: nil}
+  end
+
+  @doc """
+  Clears accumulated `$filter` and `$orderby` clauses from the query.
+  """
+  @spec strip_filter_and_order(t()) :: t()
+  def strip_filter_and_order(%__MODULE__{} = query) do
+    %__MODULE__{query | filters_rev: [], orderby_rev: []}
+  end
+
+  @doc """
   Returns the URL query string representation for the query.
   """
   @spec to_query_string(t()) :: String.t()
@@ -510,33 +552,23 @@ defmodule Creatio.OData.Query do
   @spec to_params(t()) :: map()
   def to_params(%__MODULE__{} = query) do
     %{}
-    |> maybe_put_csv("$select", finalize_list(query.select_rev, query.select, true))
+    |> maybe_put_csv("$select", finalize_list(query.select_rev))
     |> maybe_put_str("$filter", compile_filter(query))
-    |> maybe_put_csv("$orderby", finalize_list(query.orderby_rev, query.orderby, false))
+    |> maybe_put_csv("$orderby", finalize_list(query.orderby_rev))
     |> maybe_put_str("$top", query.top && to_string(query.top))
     |> maybe_put_str("$skip", query.skip && to_string(query.skip))
-    |> maybe_put_csv("$expand", finalize_list(query.expand_rev, query.expand, true))
+    |> maybe_put_csv("$expand", finalize_list(query.expand_rev))
     |> maybe_put_str("$count", if(query.count, do: "true", else: nil))
     |> Map.merge(query.custom_params)
   end
 
-  defp compile_filter(%__MODULE__{filter: direct, filters_rev: []}) when is_binary(direct) do
-    if direct == "", do: nil, else: direct
-  end
-
   defp compile_filter(%__MODULE__{filters_rev: []}), do: nil
+  defp compile_filter(%__MODULE__{filters_rev: [single]}), do: single
 
-  defp compile_filter(%__MODULE__{filter: direct, filters_rev: rev}) do
-    clauses =
-      case direct do
-        s when is_binary(s) and s != "" -> [s | Enum.reverse(rev)]
-        _ -> Enum.reverse(rev)
-      end
-
-    case clauses do
-      [single] -> single
-      many -> Enum.map_join(many, " and ", &wrap_if_contains_or/1)
-    end
+  defp compile_filter(%__MODULE__{filters_rev: rev}) do
+    rev
+    |> Enum.reverse()
+    |> Enum.map_join(" and ", &wrap_if_contains_or/1)
   end
 
   defp wrap_if_contains_or(expr) do
@@ -568,45 +600,50 @@ defmodule Creatio.OData.Query do
 
   defp paren_depth_closes_at_end?(<<>>, _depth), do: false
 
-  defp seed_filter_rev(%__MODULE__{filter: direct, filters_rev: rev})
-       when is_binary(direct) and direct != "" do
-    rev ++ [direct]
-  end
-
-  defp seed_filter_rev(%__MODULE__{filters_rev: rev}), do: rev
-
-  defp seed_list_rev(rev, nil, _split_commas?), do: rev
-  defp seed_list_rev(rev, [], _split_commas?), do: rev
-  defp seed_list_rev(rev, "", _split_commas?), do: rev
-
-  defp seed_list_rev(rev, legacy, split_commas?) when is_list(legacy) do
-    seeded =
-      if split_commas? do
-        Enum.reduce(legacy, [], &prepend_split_tokens(&1, &2))
-      else
-        Enum.reduce(legacy, [], &prepend_non_empty(to_string(&1), &2))
-      end
-
-    rev ++ seeded
-  end
-
-  defp seed_list_rev(rev, legacy, split_commas?) when is_binary(legacy) do
-    seed_list_rev(rev, [legacy], split_commas?)
-  end
-
   defp prepend_split_tokens(item, acc) do
     item
     |> to_string()
-    |> String.split(",", trim: true)
-    |> Enum.reduce(acc, fn tok, a -> prepend_non_empty(String.trim(tok), a) end)
+    |> split_top_level_commas()
+    |> Enum.reduce(acc, fn tok, a -> prepend_non_empty(tok, a) end)
+  end
+
+  defp split_top_level_commas(""), do: []
+
+  defp split_top_level_commas(str) when is_binary(str) do
+    do_split_top_level_commas(str, 0, 0, 0, [])
+  end
+
+  defp do_split_top_level_commas(str, pos, start, _depth, acc) when pos == byte_size(str) do
+    tail = str |> binary_part(start, pos - start) |> String.trim()
+    acc = if tail == "", do: acc, else: [tail | acc]
+    Enum.reverse(acc)
+  end
+
+  defp do_split_top_level_commas(str, pos, start, depth, acc) do
+    byte = :binary.at(str, pos)
+
+    cond do
+      byte == ?( ->
+        do_split_top_level_commas(str, pos + 1, start, depth + 1, acc)
+
+      byte == ?) ->
+        do_split_top_level_commas(str, pos + 1, start, max(depth - 1, 0), acc)
+
+      byte == ?, and depth == 0 ->
+        chunk = str |> binary_part(start, pos - start) |> String.trim()
+        next_acc = if chunk == "", do: acc, else: [chunk | acc]
+        do_split_top_level_commas(str, pos + 1, pos + 1, 0, next_acc)
+
+      true ->
+        do_split_top_level_commas(str, pos + 1, start, depth, acc)
+    end
   end
 
   defp prepend_non_empty("", acc), do: acc
   defp prepend_non_empty(str, acc), do: [str | acc]
 
-  defp finalize_list(rev, legacy, split_commas?) do
+  defp finalize_list(rev) do
     rev
-    |> seed_list_rev(legacy, split_commas?)
     |> Enum.reverse()
     |> Enum.uniq()
   end

@@ -157,7 +157,13 @@ defmodule Creatio.OData.QueryTest do
     end
 
     test "omits empty select, filter, orderby, and expand options from serialized params" do
-      q = %Query{entity: "Contact", select: [], filter: "", orderby: [], expand: []}
+      q =
+        Query.new("Contact")
+        |> Query.select([])
+        |> Query.filter("")
+        |> Query.order_by([])
+        |> Query.expand([])
+
       p = Query.to_params(q)
 
       assert p == %{}
@@ -355,7 +361,6 @@ defmodule Creatio.OData.QueryTest do
 
     test "handles empty filter_not, nil via or_filter_eq/or_filter_in, order_by/3, and false literals" do
       empty_not = Query.new("Contact") |> Query.filter_not()
-      assert empty_not.filter == nil
       refute Map.has_key?(Query.to_params(empty_not), "$filter")
 
       or_nil_only = Query.new("Contact") |> Query.or_filter_eq("MiddleName", nil)
@@ -375,6 +380,85 @@ defmodule Creatio.OData.QueryTest do
                "((Active eq false) or (MiddleName eq null)) or (Suffix eq null)"
 
       assert params["$orderby"] == "Name asc,CreatedOn desc"
+    end
+
+    test "expand preserves inner commas inside parentheses and splits only top-level clauses" do
+      nested = "Account($expand=Type($select=Name);$select=Id,Name,Web,PrimaryContact)"
+
+      q =
+        Query.new("Contact")
+        |> Query.expand("#{nested}, Owner($select=Id,Name,Title)")
+
+      params = Query.to_params(q)
+
+      assert params["$expand"] ==
+               "#{nested},Owner($select=Id,Name,Title)"
+
+      q_accumulated =
+        Query.new("Contact")
+        |> Query.expand(["Account($select=Id,Name,Web)", "City($select=Id,Name,Country)"])
+        |> Query.expand("Account($select=Id,Name,Web)")
+
+      assert Query.to_params(q_accumulated)["$expand"] ==
+               "Account($select=Id,Name,Web),City($select=Id,Name,Country)"
+    end
+  end
+
+  describe "encapsulation accessors & stream helpers" do
+    test "entity/1, get_top/1, get_skip/1 expose builder state without struct access" do
+      base = Query.new("Contact")
+      assert Query.entity(base) == "Contact"
+      assert Query.get_top(base) == nil
+      assert Query.get_skip(base) == nil
+
+      limited = base |> Query.top(25) |> Query.skip(50)
+      assert Query.entity(limited) == "Contact"
+      assert Query.get_top(limited) == 25
+      assert Query.get_skip(limited) == 50
+    end
+
+    test "reset_stream_target/1 clears top and skip while preserving query clauses" do
+      q =
+        Query.new("Contact")
+        |> Query.select(["Id", "Name"])
+        |> Query.filter_eq("Active", true)
+        |> Query.order_by("Name asc")
+        |> Query.expand("Account($select=Id)")
+        |> Query.top(10)
+        |> Query.skip(20)
+
+      reset = Query.reset_stream_target(q)
+      assert Query.get_top(reset) == nil
+      assert Query.get_skip(reset) == nil
+
+      params = Query.to_params(reset)
+      assert params["$select"] == "Id,Name"
+      assert params["$filter"] == "Active eq true"
+      assert params["$orderby"] == "Name asc"
+      assert params["$expand"] == "Account($select=Id)"
+      refute Map.has_key?(params, "$top")
+      refute Map.has_key?(params, "$skip")
+    end
+
+    test "strip_filter_and_order/1 clears filter and orderby while keeping select, expand, top, and skip" do
+      q =
+        Query.new("Contact")
+        |> Query.select(["Id", "Name"])
+        |> Query.filter_eq("Active", true)
+        |> Query.order_by("Name desc")
+        |> Query.expand("Account($select=Id)")
+        |> Query.top(15)
+        |> Query.skip(5)
+
+      stripped = Query.strip_filter_and_order(q)
+      params = Query.to_params(stripped)
+
+      assert params["$select"] == "Id,Name"
+      assert params["$expand"] == "Account($select=Id)"
+      assert params["$top"] == "15"
+      assert params["$skip"] == "5"
+      refute Map.has_key?(params, "$filter")
+      refute Map.has_key?(params, "$orderby")
     end
   end
 end
