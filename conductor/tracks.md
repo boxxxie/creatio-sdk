@@ -4,15 +4,15 @@ This file tracks all major tracks for getting `creatio` (`creatio-sdk`) from `v0
 
 ---
 
-- [ ] **Track: Live Creatio Integration & Wire Verification**
+- [x] **Track: Live Creatio Integration & Wire Verification**
   *Link: [./tracks/live_wire_verification_20261115/](./tracks/live_wire_verification_20261115/)*
 
 ---
 
-- [ ] **Track: Public Contract, Struct Encapsulation & Dependency Bounds**
+- [x] **Track: Public Contract, Struct Encapsulation & Dependency Bounds**
   *Link: [./tracks/public_contract_hardening_20261115/](./tracks/public_contract_hardening_20261115/)*
 
 ---
 
-- [ ] **Track: 1.0 Polish, Telemetry & Release Readiness**
+- [x] **Track: 1.0 Polish, Telemetry & Release Readiness**
   *Link: [./tracks/v1_polish_and_release_20261115/](./tracks/v1_polish_and_release_20261115/)*

@@ -5,9 +5,9 @@
 - **OTP:** Standard Erlang/OTP paired with Elixir 1.15+
 
 ## Runtime Dependencies (`mix.exs`)
-- **HTTP Client:** `req` (currently `>= 0.5.0`; Track 2 tightens to `~> 0.5` for `Req.Request` struct compatibility)
+- **HTTP Client:** `req` (`~> 0.5` for `Req.Request` struct compatibility)
 - **JSON Codec:** `jason ~> 1.4`
-- **Telemetry (planned in Track 3):** `:telemetry ~> 1.2` (for request/auth/batch instrumentation events)
+- **Telemetry:** `telemetry ~> 1.2` (HTTP request hooks plus full domain-level `:telemetry.span/3` events across `OData`, `OData3`, `DataService`, `Auth`, and `Batch`)
 
 ## Development & Test Tooling
 - **HTTP Stubbing:** `plug ~> 1.15` (`only: :test`, powers `Req` test plugs in `test/support/drivers/`)

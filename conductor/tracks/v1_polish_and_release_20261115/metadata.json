@@ -1,8 +1,8 @@
 {
   "track_id": "v1_polish_and_release_20261115",
   "type": "feature",
-  "status": "new",
+  "status": "completed",
   "created_at": "2026-11-15T08:05:00Z",
-  "updated_at": "2026-11-15T08:05:00Z",
+  "updated_at": "2026-11-15T18:11:00Z",
   "description": "1.0 Polish, Telemetry & Release Readiness (telemetry events, Util coverage, get_field_value opts, usage-rules.md, 1.0.0 release)"
 }
