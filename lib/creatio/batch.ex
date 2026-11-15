@@ -425,8 +425,8 @@ defmodule Creatio.Batch do
      [
        %Response{
          id: entity["Id"] || entity["id"] || "1",
-         status: resp.status || 200,
-         headers: resp.headers || %{},
+         status: resp.status,
+         headers: resp.headers,
          body: entity,
          atomicity_group: nil
        }
