@@ -65,7 +65,7 @@ defmodule Creatio do
       {:ok, responses} = Creatio.batch(client, batch)
   """
 
-  alias Creatio.{Auth, Batch, Client, DataService, OData, OData3}
+  alias Creatio.{Auth, Batch, Client, DataService, Error, OData, OData3}
   alias Creatio.OData.Query
 
   @doc """
@@ -113,11 +113,13 @@ defmodule Creatio do
   @doc """
   Initializes a new `Creatio.OData.Query` builder.
   """
+  @spec query(String.t()) :: Query.t()
   def query(entity) when is_binary(entity), do: Query.new(entity)
 
   @doc """
   Initializes a new `Creatio.Batch` request.
   """
+  @spec batch_new(keyword()) :: Batch.t()
   def batch_new(opts \\ []), do: Batch.new(opts)
 
   @doc """
@@ -134,39 +136,97 @@ defmodule Creatio do
 
   @doc """
   Queries an entity collection (`GET /0/odata/{Entity}`).
+
+  Supports both client-first (`Creatio.list(client, "Contact", opts)`) and
+  pipe/query-first (`Creatio.query("Contact") |> Creatio.list(client, opts)` or
+  `Creatio.list("Contact", client, opts)`) argument order.
   """
-  def list(query_or_entity, client, opts \\ [])
-  def list(%Creatio.OData.Query{} = query, client, opts), do: OData.list(client, query, opts)
-  def list(client, entity_or_query, opts), do: OData.list(client, entity_or_query, opts)
+  @spec list(
+          Client.t() | Req.Request.t() | Query.t() | String.t(),
+          String.t() | Query.t() | Client.t() | Req.Request.t(),
+          keyword() | map()
+        ) :: {:ok, list() | map()} | {:error, Error.t()}
+  def list(client_or_query, entity_or_client, opts \\ [])
+
+  def list(%Query{} = query, client_or_req, opts),
+    do: OData.list(client_or_req, query, opts)
+
+  def list(entity, client_or_req, opts)
+      when is_binary(entity) and
+             (is_struct(client_or_req, Client) or is_struct(client_or_req, Req.Request)),
+      do: OData.list(client_or_req, entity, opts)
+
+  def list(client_or_req, entity_or_query, opts),
+    do: OData.list(client_or_req, entity_or_query, opts)
 
   @doc """
   Same as `list/3`, raising `Creatio.Error` on failure.
+
+  Supports both client-first and pipe/query-first argument order.
   """
-  def list!(query_or_entity, client, opts \\ [])
-  def list!(%Creatio.OData.Query{} = query, client, opts), do: OData.list!(client, query, opts)
-  def list!(client, entity_or_query, opts), do: OData.list!(client, entity_or_query, opts)
+  @spec list!(
+          Client.t() | Req.Request.t() | Query.t() | String.t(),
+          String.t() | Query.t() | Client.t() | Req.Request.t(),
+          keyword() | map()
+        ) :: list() | map()
+  def list!(client_or_query, entity_or_client, opts \\ [])
+
+  def list!(%Query{} = query, client_or_req, opts),
+    do: OData.list!(client_or_req, query, opts)
+
+  def list!(entity, client_or_req, opts)
+      when is_binary(entity) and
+             (is_struct(client_or_req, Client) or is_struct(client_or_req, Req.Request)),
+      do: OData.list!(client_or_req, entity, opts)
+
+  def list!(client_or_req, entity_or_query, opts),
+    do: OData.list!(client_or_req, entity_or_query, opts)
 
   @doc """
   Executes an OData query or entity listing. Alias for `list/3`.
+
+  Supports both client-first and pipe/query-first argument order.
   """
-  def execute(query_or_entity, client, opts \\ [])
+  @spec execute(
+          Client.t() | Req.Request.t() | Query.t() | String.t(),
+          String.t() | Query.t() | Client.t() | Req.Request.t(),
+          keyword() | map()
+        ) :: {:ok, list() | map()} | {:error, Error.t()}
+  def execute(client_or_query, entity_or_client, opts \\ [])
 
-  def execute(%Creatio.OData.Query{} = query, client, opts),
-    do: OData.execute(client, query, opts)
+  def execute(%Query{} = query, client_or_req, opts),
+    do: OData.execute(client_or_req, query, opts)
 
-  def execute(client, entity_or_query, opts),
-    do: OData.execute(client, entity_or_query, opts)
+  def execute(entity, client_or_req, opts)
+      when is_binary(entity) and
+             (is_struct(client_or_req, Client) or is_struct(client_or_req, Req.Request)),
+      do: OData.execute(client_or_req, entity, opts)
+
+  def execute(client_or_req, entity_or_query, opts),
+    do: OData.execute(client_or_req, entity_or_query, opts)
 
   @doc """
   Same as `execute/3`, raising `Creatio.Error` on failure.
+
+  Supports both client-first and pipe/query-first argument order.
   """
-  def execute!(query_or_entity, client, opts \\ [])
+  @spec execute!(
+          Client.t() | Req.Request.t() | Query.t() | String.t(),
+          String.t() | Query.t() | Client.t() | Req.Request.t(),
+          keyword() | map()
+        ) :: list() | map()
+  def execute!(client_or_query, entity_or_client, opts \\ [])
 
-  def execute!(%Creatio.OData.Query{} = query, client, opts),
-    do: OData.execute!(client, query, opts)
+  def execute!(%Query{} = query, client_or_req, opts),
+    do: OData.execute!(client_or_req, query, opts)
 
-  def execute!(client, entity_or_query, opts),
-    do: OData.execute!(client, entity_or_query, opts)
+  def execute!(entity, client_or_req, opts)
+      when is_binary(entity) and
+             (is_struct(client_or_req, Client) or is_struct(client_or_req, Req.Request)),
+      do: OData.execute!(client_or_req, entity, opts)
+
+  def execute!(client_or_req, entity_or_query, opts),
+    do: OData.execute!(client_or_req, entity_or_query, opts)
 
   @doc """
   Retrieves a single entity by its primary ID (`GET /0/odata/{Entity}({id})`).
@@ -290,9 +350,23 @@ defmodule Creatio do
     * `:orderby` - Ordering expression string.
     * `:expand` - Relations to expand.
   """
-  def stream(query_or_entity, client, opts \\ [])
-  def stream(%Creatio.OData.Query{} = query, client, opts), do: OData.stream(client, query, opts)
-  def stream(client, entity, opts), do: OData.stream(client, entity, opts)
+  @spec stream(
+          Client.t() | Req.Request.t() | Query.t() | String.t(),
+          String.t() | Query.t() | Client.t() | Req.Request.t(),
+          keyword() | map()
+        ) :: Enumerable.t()
+  def stream(client_or_query, entity_or_client, opts \\ [])
+
+  def stream(%Query{} = query, client_or_req, opts),
+    do: OData.stream(client_or_req, query, opts)
+
+  def stream(entity, client_or_req, opts)
+      when is_binary(entity) and
+             (is_struct(client_or_req, Client) or is_struct(client_or_req, Req.Request)),
+      do: OData.stream(client_or_req, entity, opts)
+
+  def stream(client_or_req, entity_or_query, opts),
+    do: OData.stream(client_or_req, entity_or_query, opts)
 
   # ---------------------------------------------------------------------------
   # DataService & Custom WebServices Delegates
@@ -380,25 +454,49 @@ defmodule Creatio do
 
   @doc """
   Queries an entity collection via legacy OData 3 (`/0/ServiceModel/EntityDataService.svc/`).
+
+  Supports both client-first and pipe/query-first argument order.
   """
-  def odata3_list(query_or_entity, client, opts \\ [])
+  @spec odata3_list(
+          Client.t() | Req.Request.t() | Query.t() | String.t(),
+          String.t() | Query.t() | Client.t() | Req.Request.t(),
+          keyword() | map()
+        ) :: {:ok, list() | map()} | {:error, Error.t()}
+  def odata3_list(client_or_query, entity_or_client, opts \\ [])
 
-  def odata3_list(%Creatio.OData.Query{} = query, client, opts),
-    do: OData3.list(client, query, opts)
+  def odata3_list(%Query{} = query, client_or_req, opts),
+    do: OData3.list(client_or_req, query, opts)
 
-  def odata3_list(client, entity_or_query, opts),
-    do: OData3.list(client, entity_or_query, opts)
+  def odata3_list(entity, client_or_req, opts)
+      when is_binary(entity) and
+             (is_struct(client_or_req, Client) or is_struct(client_or_req, Req.Request)),
+      do: OData3.list(client_or_req, entity, opts)
+
+  def odata3_list(client_or_req, entity_or_query, opts),
+    do: OData3.list(client_or_req, entity_or_query, opts)
 
   @doc """
   Same as `odata3_list/3`, raising `Creatio.Error` on failure.
+
+  Supports both client-first and pipe/query-first argument order.
   """
-  def odata3_list!(query_or_entity, client, opts \\ [])
+  @spec odata3_list!(
+          Client.t() | Req.Request.t() | Query.t() | String.t(),
+          String.t() | Query.t() | Client.t() | Req.Request.t(),
+          keyword() | map()
+        ) :: list() | map()
+  def odata3_list!(client_or_query, entity_or_client, opts \\ [])
 
-  def odata3_list!(%Creatio.OData.Query{} = query, client, opts),
-    do: OData3.list!(client, query, opts)
+  def odata3_list!(%Query{} = query, client_or_req, opts),
+    do: OData3.list!(client_or_req, query, opts)
 
-  def odata3_list!(client, entity_or_query, opts),
-    do: OData3.list!(client, entity_or_query, opts)
+  def odata3_list!(entity, client_or_req, opts)
+      when is_binary(entity) and
+             (is_struct(client_or_req, Client) or is_struct(client_or_req, Req.Request)),
+      do: OData3.list!(client_or_req, entity, opts)
+
+  def odata3_list!(client_or_req, entity_or_query, opts),
+    do: OData3.list!(client_or_req, entity_or_query, opts)
 
   @doc """
   Retrieves an entity by ID via legacy OData 3.
@@ -495,6 +593,8 @@ defmodule Creatio do
   @doc """
   Returns a lazy `Stream` that paginates through records of a legacy OData 3 entity collection.
 
+  Supports both client-first and pipe/query-first argument order.
+
   ## Options
 
     * `:page_size` - Records per request (default: 100).
@@ -504,22 +604,44 @@ defmodule Creatio do
     * `:orderby` - Ordering expression.
     * `:expand` - Relations to expand.
   """
-  def odata3_stream(query_or_entity, client, opts \\ [])
+  @spec odata3_stream(
+          Client.t() | Req.Request.t() | Query.t() | String.t(),
+          String.t() | Query.t() | Client.t() | Req.Request.t(),
+          keyword() | map()
+        ) :: Enumerable.t()
+  def odata3_stream(client_or_query, entity_or_client, opts \\ [])
 
-  def odata3_stream(%Creatio.OData.Query{} = query, client, opts),
-    do: OData3.stream(client, query, opts)
+  def odata3_stream(%Query{} = query, client_or_req, opts),
+    do: OData3.stream(client_or_req, query, opts)
 
-  def odata3_stream(client, entity_or_query, opts),
-    do: OData3.stream(client, entity_or_query, opts)
+  def odata3_stream(entity, client_or_req, opts)
+      when is_binary(entity) and
+             (is_struct(client_or_req, Client) or is_struct(client_or_req, Req.Request)),
+      do: OData3.stream(client_or_req, entity, opts)
+
+  def odata3_stream(client_or_req, entity_or_query, opts),
+    do: OData3.stream(client_or_req, entity_or_query, opts)
 
   @doc """
   Same as `odata3_stream/3`.
+
+  Supports both client-first and pipe/query-first argument order.
   """
-  def odata3_stream!(query_or_entity, client, opts \\ [])
+  @spec odata3_stream!(
+          Client.t() | Req.Request.t() | Query.t() | String.t(),
+          String.t() | Query.t() | Client.t() | Req.Request.t(),
+          keyword() | map()
+        ) :: Enumerable.t()
+  def odata3_stream!(client_or_query, entity_or_client, opts \\ [])
 
-  def odata3_stream!(%Creatio.OData.Query{} = query, client, opts),
-    do: OData3.stream!(client, query, opts)
+  def odata3_stream!(%Query{} = query, client_or_req, opts),
+    do: OData3.stream!(client_or_req, query, opts)
 
-  def odata3_stream!(client, entity_or_query, opts),
-    do: OData3.stream!(client, entity_or_query, opts)
+  def odata3_stream!(entity, client_or_req, opts)
+      when is_binary(entity) and
+             (is_struct(client_or_req, Client) or is_struct(client_or_req, Req.Request)),
+      do: OData3.stream!(client_or_req, entity, opts)
+
+  def odata3_stream!(client_or_req, entity_or_query, opts),
+    do: OData3.stream!(client_or_req, entity_or_query, opts)
 end
