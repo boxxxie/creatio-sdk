@@ -28,10 +28,7 @@ defmodule Creatio.Auth do
     url = Keyword.get(opts, :url, "/ServiceModel/AuthService.svc/Login")
     body = %{"UserName" => username, "UserPassword" => password}
 
-    req =
-      client.req
-      |> Req.Request.put_header("forceusesession", "true")
-      |> Req.Request.put_header("content-type", "application/json; charset=utf-8")
+    req = Req.Request.put_header(client.req, "content-type", "application/json; charset=utf-8")
 
     case Req.post(req, url: url, json: body) do
       {:ok, %Req.Response{} = resp} ->
@@ -150,21 +147,21 @@ defmodule Creatio.Auth do
         extra_req_opts = Keyword.get(opts, :req_options, [])
 
         token_req =
-          client.req
-          |> strip_auth_headers()
-          |> Req.merge([base_url: nil, url: full_token_url, form: form_data] ++ extra_req_opts)
+          client
+          |> identity_base_req()
+          |> Req.merge([url: full_token_url, form: form_data] ++ extra_req_opts)
 
         case Req.post(token_req) do
           {:ok, %{status: 200, body: %{"access_token" => token} = token_body}} ->
             updated_client =
-              client
+              %Client{
+                client
+                | client_id: client_id,
+                  client_secret: client_secret,
+                  identity_service_url:
+                    if(identity_url != "", do: identity_url, else: client.identity_service_url)
+              }
               |> Client.put_bearer_token(token)
-              |> Map.put(:client_id, client_id)
-              |> Map.put(:client_secret, client_secret)
-              |> Map.put(
-                :identity_service_url,
-                if(identity_url != "", do: identity_url, else: client.identity_service_url)
-              )
 
             {:ok, updated_client, token_body}
 
@@ -216,9 +213,9 @@ defmodule Creatio.Auth do
     extra_req_opts = Keyword.get(opts, :req_options, [])
 
     req =
-      client.req
-      |> strip_auth_headers()
-      |> Req.merge([base_url: nil, url: url] ++ extra_req_opts)
+      client
+      |> identity_base_req()
+      |> Req.merge([url: url] ++ extra_req_opts)
 
     case Req.get(req) do
       {:ok, %{status: 200, body: body}} ->
@@ -247,11 +244,15 @@ defmodule Creatio.Auth do
     end
   end
 
-  defp strip_auth_headers(req) do
+  # Reuses client.req (Finch pool, TLS, retry, :plug) without leaking CRM session headers
+  defp identity_base_req(%Client{req: %Req.Request{} = req}) do
     req
+    |> Req.Request.put_option(:base_url, nil)
     |> Req.Request.delete_header("authorization")
     |> Req.Request.delete_header("cookie")
     |> Req.Request.delete_header("bpmcsrf")
+    |> Req.Request.delete_header("forceusesession")
+    |> Req.Request.put_header("accept", "application/json")
   end
 
   defp extract_cookies(headers) when is_map(headers) do
@@ -300,11 +301,13 @@ defmodule Creatio.Auth do
 
   defp extract_bpmcsrf(cookies, headers) when is_list(cookies) do
     from_cookies =
-      Enum.find_value(cookies, fn cookie ->
+      cookies
+      |> Enum.reverse()
+      |> Enum.find_value(fn cookie ->
         cookie = String.trim(cookie)
 
         case Regex.run(~r/^bpmcsrf=(.*)$/i, cookie) do
-          [_, val] -> safe_uri_decode(val)
+          [_, val] when val != "" -> safe_uri_decode(val)
           _ -> nil
         end
       end)

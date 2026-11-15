@@ -219,10 +219,7 @@ defmodule Creatio.DataService do
   defp do_execute_query(%Client{} = client, action, query_payload, opts) do
     url = Keyword.get(opts, :url, "/0/DataService/json/SyncReply/#{action}")
 
-    req =
-      client.req
-      |> Req.Request.put_header("content-type", "application/json; charset=utf-8")
-      |> Req.Request.put_header("forceusesession", "true")
+    req = Req.Request.put_header(client.req, "content-type", "application/json; charset=utf-8")
 
     case Req.post(req, url: url, json: query_payload) do
       {:ok, %Req.Response{status: status, body: %{} = body} = resp} when status in 200..299 ->
@@ -271,10 +268,7 @@ defmodule Creatio.DataService do
       {extra_req_opts, req_opts} = Keyword.pop(req_opts, :req_options, [])
       req_opts = Keyword.merge(req_opts, extra_req_opts)
 
-      req =
-        client.req
-        |> Req.Request.put_header("forceusesession", "true")
-        |> apply_custom_headers(custom_headers)
+      req = apply_custom_headers(client.req, custom_headers)
 
       {final_payload, final_params} =
         resolve_custom_payload_and_params(http_method, payload, params)

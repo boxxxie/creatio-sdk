@@ -153,8 +153,8 @@ defmodule Creatio.Client do
 
     configured_req =
       req
-      |> Req.Request.put_header("accept", "application/json; odata.metadata=minimal")
-      |> Req.Request.put_header("forceusesession", "true")
+      |> put_header_if_absent("accept", "application/json; odata.metadata=minimal")
+      |> put_header_if_absent("forceusesession", "true")
 
     client = %__MODULE__{
       base_url: String.trim_trailing(base_url, "/"),
@@ -271,9 +271,9 @@ defmodule Creatio.Client do
       req
     else
       path =
-        case URI.parse(req.url |> to_string()) do
-          %URI{path: nil} -> ""
-          %URI{path: p} -> p
+        case req.url do
+          %URI{path: p} -> p || ""
+          other -> URI.parse(to_string(other)).path || ""
         end
 
       allowed_suffixes = [
@@ -300,6 +300,13 @@ defmodule Creatio.Client do
 
   defp maybe_put_header(req, _name, nil), do: req
   defp maybe_put_header(req, name, value), do: Req.Request.put_header(req, name, value)
+
+  defp put_header_if_absent(req, name, value) do
+    case Req.Request.get_header(req, name) do
+      [] -> Req.Request.put_header(req, name, value)
+      _ -> req
+    end
+  end
 
   defp put_or_delete_header(req, name, nil), do: Req.Request.delete_header(req, name)
   defp put_or_delete_header(req, name, value), do: Req.Request.put_header(req, name, value)
