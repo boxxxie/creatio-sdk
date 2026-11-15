@@ -3,7 +3,7 @@ defmodule Creatio.Batch do
   Constructs and executes OData 4 batch requests (`/0/odata/$batch`).
 
   Supports both JSON batch format (standard in OData 4) and multipart/mixed MIME format,
-  atomicity groups (changesets), and `Prefer: continue-on-error`.
+  atomicity groups (changesets), `Prefer: continue-on-error`, and `Prefer: return=minimal`.
 
   ## Examples
 
@@ -32,7 +32,7 @@ defmodule Creatio.Batch do
 
     @type t :: %__MODULE__{
             id: String.t() | nil,
-            status: integer(),
+            status: integer() | String.t() | nil,
             headers: map(),
             body: any(),
             atomicity_group: String.t() | nil
@@ -64,13 +64,14 @@ defmodule Creatio.Batch do
     end
   end
 
-  defstruct requests: [], continue_on_error: false, reversed?: false, count: 0
+  defstruct requests: [], ops: [], count: 0, continue_on_error: false, return: nil
 
   @type t :: %__MODULE__{
           requests: [map()],
+          ops: [map()],
+          count: non_neg_integer(),
           continue_on_error: boolean(),
-          reversed?: boolean(),
-          count: non_neg_integer()
+          return: :minimal | :representation | nil
         }
 
   @doc """
@@ -79,14 +80,13 @@ defmodule Creatio.Batch do
   ## Options
 
     * `:continue_on_error` - boolean. If `true`, adds header `Prefer: continue-on-error`.
+    * `:return` - `:minimal` or `:representation`. Sets `Prefer: return=minimal` or `return=representation`.
   """
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
     %__MODULE__{
-      requests: [],
       continue_on_error: Keyword.get(opts, :continue_on_error, false),
-      reversed?: true,
-      count: 0
+      return: Keyword.get(opts, :return)
     }
   end
 
@@ -95,57 +95,45 @@ defmodule Creatio.Batch do
   """
   @spec add(t(), String.t() | atom(), String.t(), keyword()) :: t()
   def add(%__MODULE__{} = batch, method, url, opts \\ []) do
-    {reversed_reqs, current_count} =
-      if batch.reversed? do
-        {batch.requests, batch.count}
+    base_count =
+      if batch.count == 0 and batch.requests != [] do
+        length(batch.requests)
       else
-        {Enum.reverse(batch.requests), length(batch.requests)}
+        batch.count
       end
 
-    next_count = current_count + 1
+    next_count = base_count + 1
     id = Keyword.get(opts, :id) || "req_#{next_count}"
     body = Keyword.get(opts, :body)
     atomicity_group = Keyword.get(opts, :atomicity_group)
+    method_str = method |> to_string() |> String.upcase()
 
-    default_headers =
-      if batch.continue_on_error or Keyword.get(opts, :continue_on_error, false) do
-        %{
-          "Content-Type" => "application/json;odata=verbose",
-          "Accept" => "application/json;odata=verbose",
-          "Prefer" => "continue-on-error"
-        }
-      else
-        %{
-          "Content-Type" => "application/json;odata=verbose",
-          "Accept" => "application/json;odata=verbose"
-        }
-      end
+    prefer =
+      build_prefer(
+        batch.continue_on_error or Keyword.get(opts, :continue_on_error, false),
+        Keyword.get(opts, :return, batch.return)
+      )
 
-    user_headers = Keyword.get(opts, :headers)
+    base_headers =
+      %{
+        "Accept" => "application/json; odata.metadata=minimal"
+      }
+      |> maybe_put_body_content_type(body)
+      |> maybe_put("Prefer", prefer)
 
-    headers =
-      if user_headers do
-        normalized_user = Map.new(user_headers, fn {k, v} -> {to_string(k), to_string(v)} end)
-        user_downcased = MapSet.new(normalized_user, fn {k, _v} -> String.downcase(k) end)
-
-        default_headers
-        |> Map.reject(fn {k, _v} -> MapSet.member?(user_downcased, String.downcase(k)) end)
-        |> Map.merge(normalized_user)
-      else
-        default_headers
-      end
+    headers = merge_headers_case_insensitive(base_headers, Keyword.get(opts, :headers))
 
     item =
       %{
         "id" => to_string(id),
-        "method" => method |> to_string() |> String.upcase(),
+        "method" => method_str,
         "url" => url,
         "headers" => headers
       }
       |> maybe_put("body", body)
       |> maybe_put("atomicityGroup", atomicity_group)
 
-    %{batch | requests: [item | reversed_reqs], reversed?: true, count: next_count}
+    %__MODULE__{batch | ops: [item | batch.ops], count: next_count}
   end
 
   @doc """
@@ -210,16 +198,25 @@ defmodule Creatio.Batch do
   end
 
   @doc """
+  Serializes the batch into `{boundary, iodata}` without copying intermediate payload buffers.
+  """
+  @spec to_multipart_iodata(t(), keyword()) :: {String.t(), iodata()}
+  def to_multipart_iodata(%__MODULE__{} = batch, opts \\ []) do
+    batch_boundary = Keyword.get(opts, :boundary) || "batch_#{random_id()}"
+    requests = ordered_requests(batch)
+    parts = build_multipart_iodata(requests, batch_boundary)
+    iodata = [Enum.intersperse(parts, "\r\n"), "\r\n--", batch_boundary, "--\r\n"]
+    {batch_boundary, iodata}
+  end
+
+  @doc """
   Serializes the batch to a multipart/mixed MIME body string.
   Returns `{boundary, body}`.
   """
   @spec to_multipart(t(), keyword()) :: {String.t(), String.t()}
   def to_multipart(%__MODULE__{} = batch, opts \\ []) do
-    batch_boundary = Keyword.get(opts, :boundary) || "batch_#{random_id()}"
-    parts = build_multipart_parts(ordered_requests(batch), batch_boundary)
-    body = Enum.join(parts, "\r\n") <> "\r\n--#{batch_boundary}--\r\n"
-
-    {batch_boundary, body}
+    {boundary, iodata} = to_multipart_iodata(batch, opts)
+    {boundary, IO.iodata_to_binary(iodata)}
   end
 
   @doc """
@@ -229,6 +226,7 @@ defmodule Creatio.Batch do
 
     * `:format` - `:json` (default) or `:multipart`.
     * `:continue_on_error` - boolean. If `true`, sets `Prefer: continue-on-error`.
+    * `:return` - `:minimal` or `:representation`. Sets `Prefer: return=minimal` or `return=representation`.
     * `:url` - Overrides endpoint URL (defaults to `"/0/odata/$batch"`).
 
   When the client is in read-only mode (`client.read_only == true`), batches containing
@@ -243,7 +241,7 @@ defmodule Creatio.Batch do
     client = Client.ensure_client(client_or_req)
     requests = ordered_requests(batch)
 
-    if client.read_only and Enum.any?(requests, &mutation_request?/1) do
+    if client.read_only and has_mutation?(requests) do
       {:error,
        Error.new(
          status: 403,
@@ -251,45 +249,38 @@ defmodule Creatio.Batch do
          message: "Client is in read-only mode. Batch contains mutation requests."
        )}
     else
-      normalized_batch = %{batch | requests: requests, reversed?: false}
       url = Keyword.get(opts, :url, "/0/odata/$batch")
       format = Keyword.get(opts, :format, :json)
 
-      continue_on_error =
-        batch.continue_on_error or Keyword.get(opts, :continue_on_error, false)
+      prefer =
+        build_prefer(
+          batch.continue_on_error or Keyword.get(opts, :continue_on_error, false),
+          Keyword.get(opts, :return, batch.return)
+        )
 
       case format do
-        :multipart ->
-          execute_multipart(client, normalized_batch, url, continue_on_error, opts)
-
-        _ ->
-          execute_json(client, normalized_batch, url, continue_on_error)
+        :multipart -> execute_multipart(client, requests, url, prefer, opts)
+        _ -> execute_json(client, requests, url, prefer)
       end
     end
   end
 
   def execute(client_or_req, %{"requests" => requests}, opts) when is_list(requests) do
-    batch = %__MODULE__{
-      requests: Enum.map(requests, &normalize_raw_request/1),
-      continue_on_error: Keyword.get(opts, :continue_on_error, false)
-    }
-
-    execute(client_or_req, batch, opts)
+    execute(client_or_req, requests, opts)
   end
 
   def execute(client_or_req, %{requests: requests}, opts) when is_list(requests) do
-    batch = %__MODULE__{
-      requests: Enum.map(requests, &normalize_raw_request/1),
-      continue_on_error: Keyword.get(opts, :continue_on_error, false)
-    }
-
-    execute(client_or_req, batch, opts)
+    execute(client_or_req, requests, opts)
   end
 
   def execute(client_or_req, requests, opts) when is_list(requests) do
+    normalized = Enum.map(requests, &normalize_raw_request/1)
+
     batch = %__MODULE__{
-      requests: Enum.map(requests, &normalize_raw_request/1),
-      continue_on_error: Keyword.get(opts, :continue_on_error, false)
+      requests: normalized,
+      count: length(normalized),
+      continue_on_error: Keyword.get(opts, :continue_on_error, false),
+      return: Keyword.get(opts, :return)
     }
 
     execute(client_or_req, batch, opts)
@@ -308,11 +299,7 @@ defmodule Creatio.Batch do
        )}
     else
       url = Keyword.get(opts, :url, "/0/odata/$batch")
-
-      boundary =
-        Keyword.get(opts, :boundary) ||
-          extract_boundary(body) ||
-          "batch_default"
+      boundary = Keyword.get(opts, :boundary) || extract_boundary(body) || "batch_default"
 
       req =
         client.req
@@ -321,54 +308,42 @@ defmodule Creatio.Batch do
           "multipart/mixed; boundary=#{boundary}; IEEE754Compatible=true"
         )
         |> Req.Request.put_header("accept", "application/json")
-        |> Req.Request.put_header("forceusesession", "true")
 
-      handle_batch_response(Req.post(req, url: url, body: body))
+      Req.post(req, url: url, body: body)
+      |> handle_batch_response()
     end
   end
 
-  defp execute_json(client, batch, url, continue_on_error) do
-    payload = to_payload(batch)
-
+  defp execute_json(client, requests, url, prefer) do
     req =
       client.req
       |> Req.Request.put_header(
         "content-type",
-        "application/json; odata=verbose; IEEE754Compatible=true"
+        "application/json; odata.metadata=minimal; IEEE754Compatible=true"
       )
       |> Req.Request.put_header("accept", "application/json")
-      |> Req.Request.put_header("forceusesession", "true")
+      |> maybe_put_req_header("prefer", prefer)
 
-    req =
-      if continue_on_error do
-        Req.Request.put_header(req, "prefer", "continue-on-error")
-      else
-        req
-      end
-
-    handle_batch_response(Req.post(req, url: url, json: payload))
+    Req.post(req, url: url, json: %{"requests" => requests})
+    |> handle_batch_response()
   end
 
-  defp execute_multipart(client, batch, url, continue_on_error, opts) do
-    {boundary, body} = to_multipart(batch, opts)
+  defp execute_multipart(client, requests, url, prefer, opts) do
+    batch_boundary = Keyword.get(opts, :boundary) || "batch_#{random_id()}"
+    parts = build_multipart_iodata(requests, batch_boundary)
+    iodata = [Enum.intersperse(parts, "\r\n"), "\r\n--", batch_boundary, "--\r\n"]
 
     req =
       client.req
       |> Req.Request.put_header(
         "content-type",
-        "multipart/mixed; boundary=#{boundary}; IEEE754Compatible=true"
+        "multipart/mixed; boundary=#{batch_boundary}; IEEE754Compatible=true"
       )
       |> Req.Request.put_header("accept", "application/json")
-      |> Req.Request.put_header("forceusesession", "true")
+      |> maybe_put_req_header("prefer", prefer)
 
-    req =
-      if continue_on_error do
-        Req.Request.put_header(req, "prefer", "continue-on-error")
-      else
-        req
-      end
-
-    handle_batch_response(Req.post(req, url: url, body: body))
+    Req.post(req, url: url, body: iodata)
+    |> handle_batch_response()
   end
 
   defp handle_batch_response(
@@ -384,8 +359,7 @@ defmodule Creatio.Batch do
 
     cond do
       String.contains?(content_type, "multipart/mixed") ->
-        resp_boundary = extract_boundary_from_header(content_type)
-        parse_multipart_response(resp_body, resp_boundary)
+        parse_multipart_response(resp_body, extract_boundary_from_header(content_type))
 
       String.trim(resp_body) == "" ->
         {:ok, []}
@@ -411,24 +385,9 @@ defmodule Creatio.Batch do
   defp parse_json_batch_response(%Req.Response{body: %{"responses" => raw_responses}}) do
     responses =
       Enum.map(raw_responses, fn r ->
-        status =
-          case r["status"] do
-            s when is_integer(s) ->
-              s
-
-            s when is_binary(s) ->
-              case Integer.parse(s) do
-                {int, _} -> int
-                _ -> s
-              end
-
-            other ->
-              other
-          end
-
         %Response{
           id: r["id"],
-          status: status,
+          status: parse_status_code(r["status"]),
           headers: r["headers"] || %{},
           body: r["body"],
           atomicity_group: r["atomicityGroup"]
@@ -439,7 +398,7 @@ defmodule Creatio.Batch do
   end
 
   defp parse_json_batch_response(%Req.Response{body: body_str} = resp) when is_binary(body_str) do
-    case Jason.decode(body_str) do
+    case Jason.decode(body_str, strings: :copy) do
       {:ok, %{"responses" => _} = map} ->
         parse_json_batch_response(%Req.Response{resp | body: map})
 
@@ -447,13 +406,17 @@ defmodule Creatio.Batch do
         parse_json_batch_response(%Req.Response{resp | body: entity})
 
       _ ->
-        {:error,
-         Error.new(
-           status: resp.status,
-           message: "Unexpected non-JSON batch response",
-           details: body_str,
-           response: resp
-         )}
+        if String.starts_with?(String.trim_leading(body_str), "--") do
+          parse_multipart_response(body_str, nil)
+        else
+          {:error,
+           Error.new(
+             status: resp.status,
+             message: "Unexpected non-JSON batch response",
+             details: :binary.copy(body_str),
+             response: resp
+           )}
+        end
     end
   end
 
@@ -477,7 +440,7 @@ defmodule Creatio.Batch do
           {:ok, [Response.t()]} | {:error, Error.t()}
   def parse_multipart_response(body, boundary \\ nil) when is_binary(body) do
     detected_boundary =
-      if boundary && String.trim(boundary) != "" do
+      if is_binary(boundary) and String.trim(boundary) != "" do
         clean_boundary_str(boundary)
       else
         extract_boundary(body)
@@ -486,108 +449,70 @@ defmodule Creatio.Batch do
     if is_nil(detected_boundary) or detected_boundary == "" do
       {:ok, []}
     else
-      responses = do_parse_multipart(body, detected_boundary, nil)
-      {:ok, responses}
+      {:ok, do_parse_multipart(body, detected_boundary, nil)}
     end
   end
 
   defp do_parse_multipart(body, boundary, current_group) do
     clean_boundary = clean_boundary_str(boundary)
 
-    case String.split(body, "--#{clean_boundary}") do
+    case String.split(body, "--" <> clean_boundary) do
       [_preamble | parts] ->
-        Enum.flat_map(parts, fn part ->
-          stripped = strip_boundary_framing(part)
-          trimmed_check = String.trim(stripped)
-
-          cond do
-            trimmed_check == "" or trimmed_check == "--" or
-                String.starts_with?(trimmed_check, "--") ->
-              []
-
-            true ->
-              {mime_headers, _mime_body} = split_mime_headers(stripped)
-
-              case Regex.run(
-                     ~r/Content-Type:\s*multipart\/mixed;\s*boundary="?([^";\s\r\n]+)"?/i,
-                     mime_headers
-                   ) do
-                [_, inner_boundary] ->
-                  clean_inner = clean_boundary_str(inner_boundary)
-                  group = extract_group_name(clean_inner)
-                  do_parse_multipart(stripped, clean_inner, group)
-
-                nil ->
-                  parse_http_response_part(stripped, current_group)
-              end
-          end
-        end)
+        Enum.flat_map(parts, &parse_multipart_part(&1, current_group))
 
       _ ->
         []
     end
   end
 
-  defp strip_boundary_framing(part) do
-    part
-    |> String.replace_prefix("\r\n", "")
-    |> String.replace_prefix("\n", "")
-    |> then(fn s ->
-      cond do
-        String.ends_with?(s, "\r\n") -> String.replace_suffix(s, "\r\n", "")
-        String.ends_with?(s, "\n") -> String.replace_suffix(s, "\n", "")
-        true -> s
-      end
-    end)
-  end
+  defp parse_multipart_part(raw_part, current_group) do
+    part = strip_part_crlf(raw_part)
 
-  defp split_mime_headers(part) do
-    case String.split(part, ~r/\r?\n\r?\n/, parts: 2) do
-      [headers, body] -> {headers, body}
-      [headers] -> {headers, ""}
-    end
-  end
+    if part == "" or String.starts_with?(part, "--") do
+      []
+    else
+      {mime_head, mime_body} = split_blank_line(part)
+      mime_headers = parse_headers(mime_head)
+      mime_ct = mime_headers["content-type"] || ""
 
-  defp extract_group_name(boundary) do
-    case Regex.run(~r/changeset_([A-Za-z0-9]+)_[A-Za-z0-9]+/i, boundary) do
-      [_, group] ->
-        group
+      if String.contains?(String.downcase(mime_ct), "multipart/mixed") do
+        case extract_boundary_from_header(mime_ct) do
+          nil ->
+            []
 
-      _ ->
-        case Regex.run(~r/changeset_([A-Za-z0-9_]+)/i, boundary) do
-          [_, group] -> group
-          _ -> "changeset"
+          inner_boundary ->
+            group = extract_group_name(inner_boundary)
+            do_parse_multipart(mime_body || "", inner_boundary, group)
         end
+      else
+        parse_http_response_part(mime_headers, mime_body || "", current_group)
+      end
     end
   end
 
-  defp parse_http_response_part(part, current_group) do
-    case Regex.run(~r/HTTP\/(?:1\.[01]|2(?:\.0)?)\s+(\d{3})[^\r\n]*/i, part) do
-      [status_line, status_str] ->
-        status = String.to_integer(status_str)
-        [mime_headers_part, rest] = String.split(part, status_line, parts: 2)
-        {headers, body} = split_http_headers_body(rest)
+  defp parse_http_response_part(mime_headers, http_payload, current_group) do
+    {http_head, http_body} = split_blank_line(http_payload)
+    {status_line, raw_headers} = split_first_line(http_head)
 
-        id =
-          headers["content-id"] ||
-            case Regex.run(~r/(?i)content-id:\s*([^\r\n]+)/, mime_headers_part) do
-              [_, val] -> String.trim(val)
-              _ -> nil
-            end
+    case parse_http_status_line(status_line) do
+      {:ok, status} ->
+        headers = parse_headers(raw_headers)
+        raw_id = headers["content-id"] || mime_headers["content-id"]
+        id = if is_binary(raw_id), do: :binary.copy(raw_id), else: nil
 
         parsed_body =
           cond do
-            is_nil(body) or body == "" ->
+            is_nil(http_body) or http_body == "" ->
               nil
 
-            String.contains?(headers["content-type"] || "", "application/json") ->
-              case Jason.decode(body) do
+            String.contains?(String.downcase(headers["content-type"] || ""), "application/json") ->
+              case Jason.decode(http_body, strings: :copy) do
                 {:ok, json} -> json
-                _ -> body
+                _ -> :binary.copy(http_body)
               end
 
             true ->
-              body
+              :binary.copy(http_body)
           end
 
         [
@@ -596,58 +521,107 @@ defmodule Creatio.Batch do
             status: status,
             headers: headers,
             body: parsed_body,
-            atomicity_group: current_group
+            atomicity_group: current_group && :binary.copy(current_group)
           }
         ]
 
-      _ ->
+      :error ->
         []
     end
   end
 
-  defp split_http_headers_body(text) do
-    clean_text =
-      text
-      |> String.replace_prefix("\r\n", "")
-      |> String.replace_prefix("\n", "")
+  # O(1) byte-level CRLF / LF trimming around boundary delimiters (zero UTF-8 grapheme scan)
+  defp strip_part_crlf(bin) do
+    bin =
+      case bin do
+        <<"\r\n", rest::binary>> -> rest
+        <<"\n", rest::binary>> -> rest
+        other -> other
+      end
 
-    case String.split(clean_text, ~r/\r?\n\r?\n/, parts: 2) do
-      [raw_headers, body] ->
-        headers = parse_headers(raw_headers)
-        {headers, body}
+    size = byte_size(bin)
 
-      [raw_headers] ->
-        headers = parse_headers(raw_headers)
-        {headers, nil}
+    cond do
+      size >= 2 and binary_part(bin, size - 2, 2) == "\r\n" ->
+        binary_part(bin, 0, size - 2)
+
+      size >= 1 and :binary.last(bin) == ?\n ->
+        binary_part(bin, 0, size - 1)
+
+      true ->
+        bin
     end
   end
 
-  defp parse_headers(raw) do
-    raw
-    |> String.split(~r/\r?\n/)
-    |> Enum.map(fn line ->
-      case String.split(line, ":", parts: 2) do
-        [k, v] -> {String.downcase(String.trim(k)), String.trim(v)}
-        _ -> nil
-      end
-    end)
-    |> Enum.reject(&is_nil/1)
-    |> Map.new()
+  # Splits at the first header/body blank line using compiled binary search (never scans into body)
+  defp split_blank_line(bin) do
+    case :binary.match(bin, ["\r\n\r\n", "\n\n"]) do
+      {pos, len} ->
+        head = binary_part(bin, 0, pos)
+        body_start = pos + len
+        body = binary_part(bin, body_start, byte_size(bin) - body_start)
+        {head, body}
+
+      :nomatch ->
+        {bin, nil}
+    end
   end
 
-  defp build_multipart_parts(requests, batch_boundary) do
-    # Preserve request order:
-    # - Read requests (GET/HEAD/OPTIONS) are always direct top-level batch parts
-    #   (OData 4 forbids read operations inside changesets).
-    # - Grouped writes sharing an explicit `atomicityGroup` are emitted together in a
-    #   changeset at the position of their first occurrence.
-    # - Ungrouped writes each receive their own single-request changeset so they execute
-    #   independently (matching JSON batch semantics).
+  defp split_first_line(bin) do
+    case :binary.match(bin, ["\r\n", "\n"]) do
+      {pos, len} ->
+        first = binary_part(bin, 0, pos)
+        rest_start = pos + len
+        {first, binary_part(bin, rest_start, byte_size(bin) - rest_start)}
+
+      :nomatch ->
+        {bin, ""}
+    end
+  end
+
+  defp parse_http_status_line(<<"HTTP/", rest::binary>>) do
+    case String.split(rest, " ", parts: 3, trim: true) do
+      [_ver, code_str | _] ->
+        case Integer.parse(code_str) do
+          {code, ""} when code in 100..599 -> {:ok, code}
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp parse_http_status_line(_), do: :error
+
+  defp parse_headers(""), do: %{}
+
+  defp parse_headers(raw) do
+    raw
+    |> String.split(["\r\n", "\n"], trim: true)
+    |> Enum.reduce(%{}, fn line, acc ->
+      case :binary.split(line, ":") do
+        [k, v] ->
+          key = k |> String.trim() |> String.downcase() |> :binary.copy()
+          val = v |> String.trim() |> :binary.copy()
+          Map.put(acc, key, val)
+
+        _ ->
+          acc
+      end
+    end)
+  end
+
+  # Preserves request order; reads stay top-level, grouped writes share a changeset at first occurrence
+  defp build_multipart_iodata(requests, batch_boundary) do
     {entries, group_buckets} =
       Enum.reduce(requests, {[], %{}}, fn req, {acc, groups} ->
         if mutation_request?(req) do
-          case req["atomicityGroup"] do
+          case req["atomicityGroup"] || req[:atomicityGroup] do
             nil ->
+              {[{:single_changeset, req} | acc], groups}
+
+            "" ->
               {[{:single_changeset, req} | acc], groups}
 
             group_name ->
@@ -666,114 +640,89 @@ defmodule Creatio.Batch do
     |> Enum.reverse()
     |> Enum.map(fn
       {:direct, req} ->
-        build_http_request_block(req, batch_boundary)
+        [
+          "--",
+          batch_boundary,
+          "\r\nContent-Type: application/http\r\nContent-Transfer-Encoding: binary\r\n\r\n",
+          build_raw_http_iodata(req)
+        ]
 
       {:single_changeset, req} ->
-        build_changeset_block("op_#{req["id"] || random_id()}", [req], batch_boundary)
+        group_name = "op_#{req["id"] || req[:id] || random_id()}"
+        build_changeset_iodata(group_name, [req], batch_boundary)
 
       {:group, group_name} ->
         group_reqs = group_buckets |> Map.fetch!(group_name) |> Enum.reverse()
-        build_changeset_block(group_name, group_reqs, batch_boundary)
+        build_changeset_iodata(group_name, group_reqs, batch_boundary)
     end)
   end
 
-  defp build_changeset_block(group_name, reqs, batch_boundary) do
-    changeset_boundary = "changeset_#{group_name}_#{random_id()}"
+  defp build_changeset_iodata(group_name, reqs, batch_boundary) do
+    cs_boundary = "changeset_#{group_name}_#{random_id()}"
 
-    inner_blocks =
+    inner =
       Enum.map(reqs, fn req ->
-        "--#{changeset_boundary}\r\n" <>
-          "Content-Type: application/http\r\n" <>
-          "Content-Transfer-Encoding: binary\r\n\r\n" <>
-          build_raw_http_message(req)
+        [
+          "--",
+          cs_boundary,
+          "\r\nContent-Type: application/http\r\nContent-Transfer-Encoding: binary\r\n\r\n",
+          build_raw_http_iodata(req)
+        ]
       end)
 
-    changeset_content =
-      Enum.join(inner_blocks, "\r\n") <> "\r\n--#{changeset_boundary}--\r\n"
-
-    "--#{batch_boundary}\r\n" <>
-      "Content-Type: multipart/mixed; boundary=#{changeset_boundary}\r\n\r\n" <>
-      changeset_content
+    [
+      "--",
+      batch_boundary,
+      "\r\nContent-Type: multipart/mixed; boundary=",
+      cs_boundary,
+      "\r\n\r\n",
+      Enum.intersperse(inner, "\r\n"),
+      "\r\n--",
+      cs_boundary,
+      "--\r\n"
+    ]
   end
 
-  defp build_http_request_block(req, batch_boundary) do
-    "--#{batch_boundary}\r\n" <>
-      "Content-Type: application/http\r\n" <>
-      "Content-Transfer-Encoding: binary\r\n\r\n" <>
-      build_raw_http_message(req)
-  end
+  defp build_raw_http_iodata(req) do
+    method = extract_method(req)
+    url = to_string(req["url"] || req[:url] || "")
+    id = req["id"] || req[:id]
+    body = req["body"] || req[:body]
+    req_headers = req["headers"] || req[:headers] || %{}
 
-  defp build_raw_http_message(req) do
-    method = req["method"]
-    url = req["url"]
-    id = req["id"]
-    body = req["body"]
-    req_headers = req["headers"] || %{}
-
-    body_str =
+    body_iodata =
       cond do
         is_nil(body) -> nil
         is_binary(body) -> body
-        true -> Jason.encode!(body)
+        true -> Jason.encode_to_iodata!(body)
       end
 
     headers_map =
-      req_headers
-      |> put_header_if_absent("Accept", "application/json;odata=verbose")
-      |> maybe_put_content_type(body_str)
+      %{"Accept" => "application/json; odata.metadata=minimal"}
+      |> maybe_put_body_content_type(body_iodata)
+      |> merge_headers_case_insensitive(req_headers)
+      |> maybe_put_content_id(id)
 
-    headers_map =
-      if id do
-        put_header_if_absent(headers_map, "Content-ID", id)
-      else
-        headers_map
-      end
+    header_iodata =
+      Enum.map(headers_map, fn {k, v} -> [k, ": ", v, "\r\n"] end)
 
-    rendered_headers =
-      Enum.map_join(headers_map, "\r\n", fn {k, v} -> "#{k}: #{v}" end)
-
-    header_block = if rendered_headers != "", do: rendered_headers <> "\r\n", else: ""
-
-    "#{method} #{url} HTTP/1.1\r\n" <>
-      header_block <>
-      "\r\n" <>
-      (body_str || "")
+    [method, " ", url, " HTTP/1.1\r\n", header_iodata, "\r\n", body_iodata || ""]
   end
 
-  defp put_header_if_absent(map, name, value) do
-    downcased = String.downcase(name)
+  defp ordered_requests(%__MODULE__{requests: [], ops: ops}), do: Enum.reverse(ops)
+  defp ordered_requests(%__MODULE__{requests: reqs, ops: []}), do: reqs
+  defp ordered_requests(%__MODULE__{requests: reqs, ops: ops}), do: reqs ++ Enum.reverse(ops)
 
-    if Enum.any?(map, fn {k, _v} -> String.downcase(to_string(k)) == downcased end) do
-      map
-    else
-      Map.put(map, name, value)
-    end
-  end
-
-  defp maybe_put_content_type(map, nil), do: map
-
-  defp maybe_put_content_type(map, _body_str) do
-    put_header_if_absent(map, "Content-Type", "application/json;odata=verbose")
-  end
-
-  defp ordered_requests(%__MODULE__{requests: requests, reversed?: true}),
-    do: Enum.reverse(requests)
-
-  defp ordered_requests(%__MODULE__{requests: requests}), do: requests
+  defp has_mutation?(requests), do: Enum.any?(requests, &mutation_request?/1)
 
   defp mutation_request?(req) when is_map(req) do
-    method =
-      case Map.fetch(req, "method") do
-        {:ok, m} when not is_nil(m) -> m
-        _ -> Map.get(req, :method) || "GET"
-      end
+    extract_method(req) not in ["GET", "HEAD", "OPTIONS"]
+  end
 
-    normalized_method =
-      method
-      |> to_string()
-      |> String.upcase()
-
-    normalized_method not in ["GET", "HEAD", "OPTIONS"]
+  defp extract_method(r) when is_map(r) do
+    (r["method"] || r[:method] || "GET")
+    |> to_string()
+    |> String.upcase()
   end
 
   defp normalize_raw_request(req) when is_map(req) do
@@ -785,13 +734,84 @@ defmodule Creatio.Batch do
     end)
   end
 
-  defp extract_boundary(str_or_headers) when is_binary(str_or_headers) do
-    case Regex.run(~r/(?:^|\r?\n)--([A-Za-z0-9_.-]+)/, str_or_headers) do
-      [_, boundary] ->
-        clean_boundary_str(boundary)
+  defp build_prefer(continue_on_error?, return_pref) do
+    prefs = []
+    prefs = if continue_on_error?, do: ["continue-on-error" | prefs], else: prefs
+
+    prefs =
+      case return_pref do
+        :minimal -> ["return=minimal" | prefs]
+        :representation -> ["return=representation" | prefs]
+        _ -> prefs
+      end
+
+    case Enum.reverse(prefs) do
+      [] -> nil
+      list -> Enum.join(list, ", ")
+    end
+  end
+
+  defp maybe_put_body_content_type(headers, nil), do: headers
+
+  defp maybe_put_body_content_type(headers, _body) do
+    Map.put(
+      headers,
+      "Content-Type",
+      "application/json; odata.metadata=minimal; IEEE754Compatible=true"
+    )
+  end
+
+  defp maybe_put_content_id(headers, nil), do: headers
+
+  defp maybe_put_content_id(headers, id) do
+    if Enum.any?(headers, fn {k, _} -> String.downcase(k) == "content-id" end) do
+      headers
+    else
+      Map.put(headers, "Content-ID", to_string(id))
+    end
+  end
+
+  defp merge_headers_case_insensitive(base, nil), do: base
+
+  defp merge_headers_case_insensitive(base, overrides) do
+    Enum.reduce(overrides, base, fn {k, v}, acc ->
+      key_str = to_string(k)
+      down = String.downcase(key_str)
+
+      acc
+      |> Map.reject(fn {existing_k, _} -> String.downcase(existing_k) == down end)
+      |> Map.put(key_str, to_string(v))
+    end)
+  end
+
+  defp parse_status_code(s) when is_integer(s), do: s
+
+  defp parse_status_code(s) when is_binary(s) do
+    case Integer.parse(s) do
+      {int, _} -> int
+      _ -> s
+    end
+  end
+
+  defp parse_status_code(other), do: other
+
+  defp extract_group_name(boundary) do
+    case Regex.run(~r/changeset_([A-Za-z0-9]+)_[A-Za-z0-9]+/i, boundary) do
+      [_, group] ->
+        group
 
       _ ->
-        extract_boundary_from_header(str_or_headers)
+        case Regex.run(~r/changeset_([A-Za-z0-9_]+)/i, boundary) do
+          [_, group] -> group
+          _ -> "changeset"
+        end
+    end
+  end
+
+  defp extract_boundary(str) when is_binary(str) do
+    case Regex.run(~r/(?:^|\r?\n)--([A-Za-z0-9_.-]+)/, str) do
+      [_, boundary] -> clean_boundary_str(boundary)
+      _ -> extract_boundary_from_header(str)
     end
   end
 
@@ -802,14 +822,11 @@ defmodule Creatio.Batch do
     end
   end
 
-  defp clean_boundary_str(boundary) when is_binary(boundary) do
-    boundary
-    |> String.trim()
-    |> String.trim("\"")
-    |> String.trim("'")
+  defp clean_boundary_str(boundary) do
+    boundary |> String.trim() |> String.trim("\"") |> String.trim("'")
   end
 
-  defp get_resp_content_type(%{headers: headers}) when is_map(headers) do
+  defp get_resp_content_type(%Req.Response{headers: headers}) when is_map(headers) do
     case headers["content-type"] || headers["Content-Type"] || "" do
       [val | _] -> val
       val when is_binary(val) -> val
@@ -818,9 +835,12 @@ defmodule Creatio.Batch do
   end
 
   defp random_id do
-    :crypto.strong_rand_bytes(6) |> Base.hex_encode32(case: :lower, padding: false)
+    6 |> :crypto.strong_rand_bytes() |> Base.hex_encode32(case: :lower, padding: false)
   end
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, val), do: Map.put(map, key, val)
+
+  defp maybe_put_req_header(req, _key, nil), do: req
+  defp maybe_put_req_header(req, key, val), do: Req.Request.put_header(req, key, val)
 end
