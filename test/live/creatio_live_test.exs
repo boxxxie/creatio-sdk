@@ -134,46 +134,65 @@ defmodule Creatio.LiveTest do
     test "compares OData.stream/3 offset pagination with cursor_field keyset pagination" do
       LiveHelper.with_live_client([], fn client ->
         entity = LiveHelper.live_entity()
+        {seeded_id, cleanup_client} = maybe_seed_record_for_stream(client, entity)
 
-        offset_results =
-          OData.stream(client, entity, page_size: 2, max_records: 4, select: ["Id"])
-          |> Enum.to_list()
+        try do
+          offset_results =
+            OData.stream(client, entity,
+              page_size: 2,
+              max_records: 4,
+              orderby: "Id asc",
+              select: ["Id"]
+            )
+            |> Enum.to_list()
 
-        keyset_results =
-          OData.stream(client, entity,
-            page_size: 2,
-            max_records: 4,
-            cursor_field: "Id",
-            select: ["Id"]
-          )
-          |> Enum.to_list()
+          keyset_results =
+            OData.stream(client, entity,
+              page_size: 2,
+              max_records: 4,
+              cursor_field: "Id",
+              select: ["Id"]
+            )
+            |> Enum.to_list()
 
-        case {List.last(offset_results), List.last(keyset_results)} do
-          {{:error, %Error{} = err}, _} ->
-            LiveHelper.skip_or_fail!(err, "OData.stream/3")
+          case {List.last(offset_results), List.last(keyset_results)} do
+            {{:error, %Error{} = err}, _} ->
+              LiveHelper.skip_or_fail!(err, "OData.stream/3")
 
-          {_, {:error, %Error{} = err}} ->
-            LiveHelper.skip_or_fail!(err, "OData.stream/3")
+            {_, {:error, %Error{} = err}} ->
+              LiveHelper.skip_or_fail!(err, "OData.stream/3")
 
-          _ ->
-            offset_records = for {:ok, rec} <- offset_results, do: rec
-            keyset_records = for {:ok, rec} <- keyset_results, do: rec
+            _ ->
+              offset_records = for {:ok, rec} <- offset_results, do: rec
+              keyset_records = for {:ok, rec} <- keyset_results, do: rec
 
-            try do
-              bang_records =
-                OData.stream!(client, entity, page_size: 2, max_records: 2, select: ["Id"])
-                |> Enum.to_list()
+              try do
+                bang_records =
+                  OData.stream!(client, entity, page_size: 2, max_records: 2, select: ["Id"])
+                  |> Enum.to_list()
 
-              assert is_list(bang_records)
-            rescue
-              e in Error -> LiveHelper.skip_or_fail!(e, "OData.stream!/3")
-            end
+                assert is_list(bang_records)
+              rescue
+                e in Error -> LiveHelper.skip_or_fail!(e, "OData.stream!/3")
+              end
 
-            offset_ids = Enum.map(offset_records, & &1["Id"])
-            keyset_ids = Enum.map(keyset_records, & &1["Id"])
+              offset_ids = Enum.map(offset_records, & &1["Id"])
+              keyset_ids = Enum.map(keyset_records, & &1["Id"])
 
-            assert length(offset_ids) == length(Enum.uniq(offset_ids))
-            assert length(keyset_ids) == length(Enum.uniq(keyset_ids))
+              if offset_ids == [] and not LiveHelper.mutations_allowed?() do
+                LiveHelper.log_skip_once(
+                  "Entity #{entity} has no records to compare offset vs keyset pagination (set CREATIO_LIVE_ALLOW_MUTATIONS=true to seed a temporary record)"
+                )
+              else
+                assert offset_ids != []
+                assert offset_ids == keyset_ids
+                assert length(offset_ids) == length(Enum.uniq(offset_ids))
+              end
+          end
+        after
+          if seeded_id && cleanup_client do
+            _ = OData.delete(cleanup_client, entity, seeded_id)
+          end
         end
       end)
     end
@@ -288,12 +307,22 @@ defmodule Creatio.LiveTest do
               LiveHelper.register_cleanup(client, entity, rep_id)
 
               assert :ok ==
-                       OData.update(client, entity, rep_id, %{"JobTitle" => "SDK Verification"},
+                       OData.update(
+                         client,
+                         entity,
+                         rep_id,
+                         %{"Name" => "CreatioSDK LiveTest Updated #{suffix}"},
                          return: :minimal
                        )
 
               assert :ok ==
-                       OData.update_field(client, entity, rep_id, "JobTitle", "SDK Field Updated")
+                       OData.update_field(
+                         client,
+                         entity,
+                         rep_id,
+                         "Name",
+                         "CreatioSDK Field Updated #{suffix}"
+                       )
 
               assert :ok == OData.delete(client, entity, rep_id)
               assert {:error, %Error{status: 404}} = OData.get(client, entity, rep_id)
@@ -312,7 +341,10 @@ defmodule Creatio.LiveTest do
 
               changeset =
                 Batch.new()
-                |> Batch.add_update(entity, min_id, %{"JobTitle" => "Batch Updated"},
+                |> Batch.add_update(
+                  entity,
+                  min_id,
+                  %{"Name" => "CreatioSDK Batch Updated #{suffix}"},
                   atomicity_group: "live_g1"
                 )
                 |> Batch.add_delete(entity, min_id, atomicity_group: "live_g1")
@@ -332,6 +364,19 @@ defmodule Creatio.LiveTest do
           "Opt-in mutations disabled (set CREATIO_LIVE_ALLOW_MUTATIONS=true to enable Phase 3 CRUD/Batch changeset tests)"
         )
       end
+    end
+  end
+
+  defp maybe_seed_record_for_stream(client, entity) do
+    with {:ok, []} <- OData.list(client, entity, top: 1, select: ["Id"]),
+         true <- LiveHelper.mutations_allowed?(),
+         {:ok, mutable_client} <- LiveHelper.connect_live_client(mutable: true),
+         suffix = System.unique_integer([:positive]),
+         {:ok, %{"Id" => id}} <-
+           OData.create(mutable_client, entity, %{"Name" => "CreatioSDK StreamSeed #{suffix}"}) do
+      {id, mutable_client}
+    else
+      _ -> {nil, nil}
     end
   end
 

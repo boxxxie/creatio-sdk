@@ -96,17 +96,52 @@ defmodule Creatio.LiveHelper do
   """
   @spec with_live_client(keyword(), (Client.t() -> any())) :: any()
   def with_live_client(opts \\ [], fun) when is_function(fun, 1) do
+    requested_auth = Keyword.get(opts, :auth, :auto)
+    run_with_live_client(opts, requested_auth, fun, 0)
+  end
+
+  defp run_with_live_client(opts, requested_auth, fun, attempt) do
     case connect_live_client(opts) do
       {:ok, client} ->
-        try do
-          fun.(client)
-        catch
-          :throw, {:creatio_live_skip, _reason} -> :ok
+        case resolve_auth_mode(requested_auth) do
+          {:ok, mode} ->
+            prev_ctx = Process.get({__MODULE__, :active_session})
+            Process.put({__MODULE__, :active_session}, {mode, attempt})
+
+            try do
+              fun.(client)
+            catch
+              :throw, {:creatio_live_skip, _reason} ->
+                :ok
+
+              :throw, {:creatio_live_reauth, _err}
+              when attempt == 0 and mode in [:oauth, :forms] ->
+                evict_cached_session(mode)
+                run_with_live_client(opts, requested_auth, fun, attempt + 1)
+            after
+              if prev_ctx do
+                Process.put({__MODULE__, :active_session}, prev_ctx)
+              else
+                Process.delete({__MODULE__, :active_session})
+              end
+            end
+
+          {:error, _} ->
+            :ok
         end
 
       {:skip, _reason} ->
         :ok
     end
+  end
+
+  @doc """
+  Evicts any cached live session for the given auth mode (e.g. after a `401`).
+  """
+  @spec evict_cached_session(atom()) :: :ok
+  def evict_cached_session(mode) when mode in [:oauth, :forms, :bearer] do
+    :persistent_term.erase(session_cache_key(mode))
+    :ok
   end
 
   @doc """
@@ -170,7 +205,21 @@ defmodule Creatio.LiveHelper do
   Handles an unexpected WAF/network skip on secondary live endpoints during a test.
   """
   @spec skip_or_fail!(Error.t(), String.t()) :: no_return()
+  def skip_or_fail!(%Error{status: 401} = error, context) do
+    case Process.get({__MODULE__, :active_session}) do
+      {mode, 0} when mode in [:oauth, :forms] ->
+        throw({:creatio_live_reauth, error})
+
+      _ ->
+        do_skip_or_fail!(error, context)
+    end
+  end
+
   def skip_or_fail!(%Error{} = error, context) do
+    do_skip_or_fail!(error, context)
+  end
+
+  defp do_skip_or_fail!(%Error{} = error, context) do
     if waf_or_network_error?(error) do
       {:skip, reason} = handle_skip("#{context}: #{format_skip_error(error)}")
       throw({:creatio_live_skip, reason})
@@ -221,7 +270,7 @@ defmodule Creatio.LiveHelper do
   end
 
   defp connect_cached_session(mode, read_only?) do
-    cache_key = {__MODULE__, {:session, mode}}
+    cache_key = session_cache_key(mode)
 
     case :persistent_term.get(cache_key, nil) do
       {:ok, cached_client} ->
@@ -313,15 +362,45 @@ defmodule Creatio.LiveHelper do
   """
   @spec log_skip_once(String.t()) :: :ok
   def log_skip_once(reason) when is_binary(reason) do
-    key = {__MODULE__, :logged_skips}
-    seen = :persistent_term.get(key, MapSet.new())
+    key = {__MODULE__, :skip_logged, reason}
 
-    if not MapSet.member?(seen, reason) do
-      :persistent_term.put(key, MapSet.put(seen, reason))
+    if :persistent_term.get(key, false) == false do
+      :persistent_term.put(key, true)
       IO.puts(:stderr, "\n[live skipped] #{reason}")
     end
 
     :ok
+  end
+
+  defp session_cache_key(mode) do
+    base = base_url()
+    id_url = if mode == :oauth, do: identity_url() || (base && "#{base}/identity"), else: nil
+
+    cred_material =
+      case mode do
+        :oauth ->
+          [
+            System.get_env("CREATIO_CLIENT_ID") || "",
+            System.get_env("CREATIO_CLIENT_SECRET") || ""
+          ]
+
+        :forms ->
+          [
+            System.get_env("CREATIO_USERNAME") || "",
+            System.get_env("CREATIO_PASSWORD") || ""
+          ]
+
+        :bearer ->
+          [
+            System.get_env("CREATIO_BEARER_TOKEN") || System.get_env("CREATIO_AUTH_TOKEN") || ""
+          ]
+      end
+
+    cred_hash =
+      :crypto.hash(:sha256, Enum.join(cred_material, "\0"))
+      |> Base.encode16(case: :lower)
+
+    {__MODULE__, {:session, mode, base, id_url, cred_hash}}
   end
 
   defp handle_skip(reason) do
