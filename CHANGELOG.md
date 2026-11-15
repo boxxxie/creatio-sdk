@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-11-15
+
+### Added
+
+- **`:telemetry` Observability & Credential Redaction (`Creatio.Telemetry`)**:
+  - Added `{:telemetry, "~> 1.2"}` runtime dependency and `Creatio.Telemetry` with zero runtime GenServers.
+  - Emits `[:creatio, :request, :start | :stop | :exception]` via `Req` lifecycle steps attached by `Creatio.Client`.
+  - Emits domain-level `:telemetry.span/3` events across OData 4 (`[:creatio, :odata, *]`), OData 3 (`[:creatio, :odata3, *]`), DataService (`[:creatio, :data_service, *]`), Auth (`[:creatio, :auth, *]`), and Batch (`[:creatio, :batch, *]`).
+  - Automatically redacts sensitive headers (`authorization`, `cookie`, `set-cookie`, `bpmcsrf`, `x-api-key`, `proxy-authorization`) and credential metadata (`auth_token`, `client_secret`, `cookie`, `bpmcsrf`, passwords, OAuth tokens) to `"[REDACTED]"`.
+- **Exception-Raising Streams (`stream!/3`, `odata3_stream!/3`)**:
+  - Added `Creatio.stream!/3`, `Creatio.OData.stream!/3`, `Creatio.odata3_stream!/3`, and `Creatio.OData3.stream!/3` returning plain `record` maps and raising `%Creatio.Error{}` on failure.
+- **Field Value Transport Option Forwarding**:
+  - Extended `Creatio.get_field_value/5`, `Creatio.OData.get_field_value/5`, `Creatio.odata3_get_field_value/5`, and `Creatio.OData3.get_field_value/5` to forward `:headers`, `:req_options`, and query options alongside `:into` while preserving `decode_body: false`.
+- **Opaque Builder Public Accessors & Full Facade `@spec` Coverage**:
+  - Added public accessors `Creatio.Batch.size/1`, `Creatio.Batch.requests/1`, `Creatio.OData.Query.entity/1`, `Creatio.OData.Query.get_top/1`, `Creatio.OData.Query.get_skip/1`, `Creatio.OData.Query.reset_stream_target/1`, and `Creatio.OData.Query.strip_filter_and_order/1`.
+  - Added explicit `@spec` annotations across every `defdelegate` in `Creatio`.
+- **`usage-rules.md` & Opt-In Live Wire Verification**:
+  - Added `usage-rules.md` in the repository root and bundled it in the Hex package manifest and ExDoc extras.
+  - Added opt-in `@moduletag :live` wire integration suite (`test/live/`) and expanded unit/regression coverage (`mix test --cover`).
+
+### Changed
+
+- **Opaque Builder Contracts (`@opaque t`)**: Converted `Creatio.OData.Query.t()` and `Creatio.Batch.t()` from `@type` to `@opaque` so internal representation fields are excluded from the public SemVer contract.
+- **Tuple-Emitting Non-Bang Streams**: Updated `Creatio.stream/3`, `Creatio.OData.stream/3`, `Creatio.odata3_stream/3`, and `Creatio.OData3.stream/3` to yield `{:ok, record}` items and emit `{:error, %Creatio.Error{}}` before halting cleanly on failure instead of raising mid-stream.
+- **Explicit `from_req/2` Scoping**: Removed the implicit `System.get_env("CREATIO_BASE_URL")` fallback from `Creatio.Client.from_req/2` (it now uses `:base_url` from `opts` or `req.options[:base_url]`, defaulting to `""`). Environment/application config fallback remains exclusively in `Creatio.Client.new/1`.
+- **Tightened Dependency Upper Bound**: Updated `:req` dependency constraint from `>= 0.5.0` to `~> 0.5`.
+
+### Upgrading from 0.4.x to 1.0.0
+
+1. **`stream/3` and `odata3_stream/3` now emit `{:ok, record}` tuples:**
+   - Either pattern-match `{:ok, record}` / `{:error, error}` in consumers of `Creatio.stream/3` and `Creatio.odata3_stream/3`:
+     ```elixir
+     Creatio.stream(client, "Contact", page_size: 100)
+     |> Enum.reduce_while([], fn
+       {:ok, record}, acc -> {:cont, [record | acc]}
+       {:error, error}, acc -> {:halt, {:error, error, acc}}
+     end)
+     ```
+   - Or switch to `Creatio.stream!/3` / `Creatio.odata3_stream!/3` to preserve `0.4.x` behavior (plain `record` maps, raising `%Creatio.Error{}` on failure).
+2. **`Creatio.OData.Query` and `Creatio.Batch` structs are `@opaque`:**
+   - Replace any direct struct field access (e.g. `query.entity`, `query.top`, `query.skip`, `batch.requests`, `length(batch.ops)`) with public functions: `Query.entity/1`, `Query.get_top/1`, `Query.get_skip/1`, `Query.to_params/1`, `Batch.size/1`, `Batch.requests/1`, and `Batch.to_payload/1`.
+3. **`Creatio.Client.from_req/2` no longer reads `CREATIO_BASE_URL`:**
+   - Pass `base_url:` via `Req.new(base_url: ...)` or `Creatio.from_req(req, base_url: "...")`, or initialize with `Creatio.new/1` when relying on environment configuration.
+4. **Dependency updates:**
+   - `:creatio` `1.0.0` requires `{:req, "~> 0.5"}` and introduces `{:telemetry, "~> 1.2"}`.
+
 ## [0.4.0] - 2026-11-15
 
 ### Added

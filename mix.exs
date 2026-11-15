@@ -1,7 +1,7 @@
 defmodule Creatio.MixProject do
   use Mix.Project
 
-  @version "0.4.0"
+  @version "1.0.0"
   @source_url "https://gitlab.nvestiv.com/caasa/creatio-sdk"
 
   def project do
@@ -15,6 +15,7 @@ defmodule Creatio.MixProject do
         summary: [threshold: 84],
         ignore_modules: [
           Creatio.FeatureScenario,
+          Creatio.LiveHelper,
           ~r/^Creatio\.TestDSL\./,
           ~r/^Creatio\.TestDrivers\./
         ]
@@ -37,8 +38,9 @@ defmodule Creatio.MixProject do
 
   defp deps do
     [
-      {:req, ">= 0.5.0"},
+      {:req, "~> 0.5"},
       {:jason, "~> 1.4"},
+      {:telemetry, "~> 1.2"},
       {:plug, "~> 1.15", only: :test},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
@@ -55,7 +57,7 @@ defmodule Creatio.MixProject do
       name: "creatio",
       maintainers: ["Paul Iannazzo"],
       files:
-        ~w(lib docs/CREATIO_API_INTEGRATION.md docs/USE_CASES_SYNCING_USERS.md .formatter.exs mix.exs README.md CHANGELOG.md LICENSE),
+        ~w(lib docs/CREATIO_API_INTEGRATION.md docs/USE_CASES_SYNCING_USERS.md .formatter.exs mix.exs README.md CHANGELOG.md LICENSE usage-rules.md),
       licenses: ["MIT"],
       links: %{"GitLab" => @source_url}
     ]
@@ -69,6 +71,7 @@ defmodule Creatio.MixProject do
       extras: [
         "README.md",
         "CHANGELOG.md",
+        "usage-rules.md",
         "docs/CREATIO_API_INTEGRATION.md",
         "docs/USE_CASES_SYNCING_USERS.md",
         "LICENSE"

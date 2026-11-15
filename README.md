@@ -24,7 +24,7 @@ Built on top of [Req](https://github.com/wojtekmach/req), `Creatio` provides a c
   - Field-level operations and raw scalar/binary `$value` access with `into:` stream downloads (`decode_body: false`).
   - Binary stream / file uploads (`File.Stream`, `Stream`, or binary) via `PUT` with `application/octet-stream`.
   - Composable **O(1) Query Builder** (`Creatio.OData.Query`) with `OR`-precedence preservation.
-  - Lazy auto-paginated streaming (`Creatio.stream/3`) supporting both offset (`:skip`) and `$skip`-free keyset/cursor pagination (`:cursor_field`, `:after_cursor`, `:max_records`).
+  - Lazy auto-paginated streaming (`Creatio.stream/3` yielding `{:ok, record}` tuples and `Creatio.stream!/3` yielding plain maps) supporting both offset (`:skip`) and `$skip`-free keyset/cursor pagination (`:cursor_field`, `:after_cursor`, `:max_records`).
 - **OData 4 Batch Operations** (`/0/odata/$batch`):
   - O(1) batch assembly with JSON batch and zero-copy iodata multipart/mixed MIME serialization (`batch_to_multipart_iodata/2`).
   - Atomicity groups (changesets), `Prefer: continue-on-error`, `Prefer: return=minimal` / `:representation`, and byte-level multipart response parsing.
@@ -33,6 +33,8 @@ Built on top of [Req](https://github.com/wojtekmach/req), `Creatio` provides a c
   - Calling custom REST services (`/0/rest/...`).
 - **OData 3 Support**:
   - Legacy `EntityDataService.svc` endpoint compatibility with offset and keyset streaming plus `into:` field download streaming.
+- **Telemetry & Observability (`Creatio.Telemetry`)**:
+  - Emits `:telemetry` lifecycle events for HTTP requests (`[:creatio, :request, *]`) and domain spans (`:odata`, `:odata3`, `:data_service`, `:auth`, `:batch`) with automatic credential and header redaction.
 - **Test-Ready**:
   - Easily mockable using standard `Req` plug options (`req_options: [plug: ...]`).
 
@@ -45,7 +47,7 @@ Add `creatio` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:creatio, "~> 0.4.0"}
+    {:creatio, "~> 1.0"}
   ]
 end
 ```
@@ -205,25 +207,36 @@ The query builder supports all standard OData 4 filtration operators and functio
 
 ### Automatic Streaming / Pagination
 
-Stream records without loading all results into memory at once:
+Stream records without loading all results into memory at once.
+
+- `Creatio.stream/3` (and `Creatio.odata3_stream/3`) yields `{:ok, record}` tuples and emits `{:error, %Creatio.Error{}}` before halting cleanly if a page fails.
+- `Creatio.stream!/3` (and `Creatio.odata3_stream!/3`) yields plain `record` maps directly and raises `Creatio.Error` on failure.
 
 ```elixir
+# Safe tuple-emitting stream
 Creatio.stream(client, "Contact", page_size: 100, select: ["Id", "Name"])
-|> Stream.filter(fn contact -> contact["Name"] != nil end)
+|> Stream.flat_map(fn
+  {:ok, contact} -> if contact["Name"], do: [contact], else: []
+  {:error, _err} -> []
+end)
+|> Enum.take(500)
+
+# Or raise-on-error stream of plain record maps
+Creatio.stream!(client, "Contact", page_size: 100, select: ["Id", "Name"])
 |> Enum.take(500)
 ```
 
 #### Resuming Streams with Offset or Keyset Cursor Pagination
 
-`Creatio.stream/3` and `Creatio.odata3_stream/3` accept an initial `:skip` offset or `:cursor_field` for `$skip`-free keyset pagination on large tables:
+`Creatio.stream/3`, `Creatio.stream!/3`, `Creatio.odata3_stream/3`, and `Creatio.odata3_stream!/3` accept an initial `:skip` offset or `:cursor_field` for `$skip`-free keyset pagination on large tables:
 
 ```elixir
 # Resume offset streaming from offset 1,000
-Creatio.stream(client, "Contact", page_size: 100, skip: 1000, select: ["Id", "Name"])
+Creatio.stream!(client, "Contact", page_size: 100, skip: 1000, select: ["Id", "Name"])
 |> Enum.take(200)
 
 # Keyset / cursor pagination (avoids deep $skip overhead)
-Creatio.stream(client, "Contact",
+Creatio.stream!(client, "Contact",
   page_size: 200,
   cursor_field: "Id",
   after_cursor: last_synced_id,
@@ -342,23 +355,83 @@ Full compatibility with legacy Creatio `EntityDataService.svc` endpoints:
 :ok             = Creatio.odata3_update(client, "Contact", contact_id, %{"Name" => "Updated"})
 :ok             = Creatio.odata3_delete(client, "Contact", contact_id)
 
-# Legacy OData 3 streaming / auto-pagination
-Creatio.odata3_stream(client, "Contact", page_size: 100)
+# Legacy OData 3 streaming / auto-pagination (`odata3_stream!/3` for plain maps)
+Creatio.odata3_stream!(client, "Contact", page_size: 100)
 |> Enum.take(250)
+```
+
+---
+
+## Telemetry & Observability
+
+`Creatio` emits standard `:telemetry` events via `Creatio.Telemetry` with zero runtime GenServers:
+
+- **HTTP Requests (`Creatio.Client` via `Req` lifecycle steps)**:
+  - `[:creatio, :request, :start]` (`%{system_time: ...}`)
+  - `[:creatio, :request, :stop]` (`%{duration: ...}`, metadata includes `:method`, `:path`, `:base_url`, `:auth_mode`, `:status`, `:result`, and redacted `:headers`)
+  - `[:creatio, :request, :exception]` (`%{duration: ...}`, metadata includes `:kind`, `:reason`, `:error`, `:status`, `:result`)
+- **Domain Spans (`:telemetry.span/3`)**:
+  - `[:creatio, :odata, :start | :stop | :exception]` (`:protocol` `:odata4`, `:action`, `:entity`, `:result`)
+  - `[:creatio, :odata3, :start | :stop | :exception]` (`:protocol` `:odata3`, `:action`, `:entity`, `:result`)
+  - `[:creatio, :data_service, :start | :stop | :exception]` (`:action`, `:entity` / `:service` / `:endpoint`, `:result`)
+  - `[:creatio, :auth, :start | :stop | :exception]` (`:auth_mode`, `:result`)
+  - `[:creatio, :batch, :start | :stop | :exception]` (`:format`, `:operation_count`, `:status`, `:result`)
+
+Sensitive headers (`authorization`, `cookie`, `set-cookie`, `bpmcsrf`, `x-api-key`, `proxy-authorization`) and credential fields (`auth_token`, `bearer_token`, `access_token`, `refresh_token`, `client_secret`, `cookie`, `bpmcsrf`, passwords) are automatically replaced with `"[REDACTED]"` before dispatching events:
+
+```elixir
+:telemetry.attach_many(
+  "my-app-creatio-metrics",
+  Creatio.Telemetry.events(),
+  fn event, measurements, metadata, _config ->
+    Logger.debug("creatio event=#{inspect(event)} meas=#{inspect(measurements)} meta=#{inspect(metadata)}")
+  end,
+  nil
+)
 ```
 
 ---
 
 ## API Reference & Postman Collection
 
-Comprehensive API documentation and resources are available in the `docs/` directory:
+Comprehensive API documentation and resources are available in the repository:
 
-- [Changelog](CHANGELOG.md) — Release history and upgrade notes.
+- [Usage Rules](usage-rules.md) — Concise idioms, invariants, and gotchas for Elixir developers and coding agents.
+- [Changelog](CHANGELOG.md) — Release history and `0.4.x` -> `1.0.0` migration guide.
 - [Creatio API & Integration Guide](docs/CREATIO_API_INTEGRATION.md) — Authentication flows, OData 4 protocol endpoints, and entity mapping reference.
 - [Syncing Creatio Users Guide](docs/USE_CASES_SYNCING_USERS.md) — A step-by-step tutorial on building a resilient sync engine between Creatio and a local database.
 - [Postman Collection v2.0](docs/creatio_api_collection.json) — Full 1.8 MB offline Postman collection covering all Creatio endpoints (OAuth 2.0, OData 4 CRUD, streaming, batching, and OData 3).
 - [Online Creatio Postman Documentation](https://documenter.getpostman.com/view/10204500/SztHX5Qb?version=latest)
 - [Official Postman Environment](https://academy.creatio.com/sites/default/files/documents/downloads/SDK/Creatio.postman_environment.zip)
+
+---
+
+## Testing & Live Sandbox Verification
+
+All offline unit, regression, and ATDD feature tests run with `Req` test plugs and exclude `:live` tests by default:
+
+```bash
+mix test
+```
+
+### Live Sandbox Verification (`--only live`)
+
+To run end-to-end wire verification against a live Creatio sandbox without modifying CRM data:
+
+1. Copy `.env.example` to `.env` and populate your sandbox URL plus OAuth 2.0 (`CREATIO_IDENTITY_SERVICE_URL`, `CREATIO_CLIENT_ID`, `CREATIO_CLIENT_SECRET`) or Forms (`CREATIO_USERNAME`, `CREATIO_PASSWORD`) credentials.
+2. Run read-only live verification (`read_only: true` is enforced by default):
+
+```bash
+mix test --only live
+```
+
+To explicitly enable the opt-in CRUD & `$batch` changeset roundtrip test (which creates isolated synthetic test records and removes them in `on_exit/1`):
+
+```bash
+CREATIO_LIVE_ALLOW_MUTATIONS=true mix test --only live
+```
+
+Set `CREATIO_LIVE_STRICT=true` in CI to fail instead of skipping when sandbox credentials are absent or the endpoint is unreachable/WAF-gated.
 
 ---
 
