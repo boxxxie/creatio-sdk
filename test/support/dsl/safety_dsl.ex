@@ -171,6 +171,7 @@ defmodule Creatio.TestDSL.SafetyDSL do
       expected = unquote(opts)
 
       assert {:ok, items} = Map.fetch!(ctx, :result)
+      assert length(items) == Keyword.get(expected, :count, 1)
       assert {:error, %Error{} = err} = List.last(items)
 
       if Keyword.has_key?(expected, :status) do

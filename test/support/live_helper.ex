@@ -97,8 +97,15 @@ defmodule Creatio.LiveHelper do
   @spec with_live_client(keyword(), (Client.t() -> any())) :: any()
   def with_live_client(opts \\ [], fun) when is_function(fun, 1) do
     case connect_live_client(opts) do
-      {:ok, client} -> fun.(client)
-      {:skip, _reason} -> :ok
+      {:ok, client} ->
+        try do
+          fun.(client)
+        catch
+          :throw, {:creatio_live_skip, _reason} -> :ok
+        end
+
+      {:skip, _reason} ->
+        :ok
     end
   end
 
@@ -113,9 +120,17 @@ defmodule Creatio.LiveHelper do
 
     ExUnit.Callbacks.on_exit(fn ->
       case OData.delete(cleanup_client, entity, record_id) do
-        :ok -> :ok
-        {:error, %Error{status: 404}} -> :ok
-        {:error, _other} -> :ok
+        :ok ->
+          :ok
+
+        {:error, %Error{status: 404}} ->
+          :ok
+
+        {:error, %Error{} = err} ->
+          IO.puts(
+            :stderr,
+            "\n[live cleanup warning] Failed to delete #{entity}(#{record_id}): #{Exception.message(err)}"
+          )
       end
     end)
 
@@ -139,11 +154,13 @@ defmodule Creatio.LiveHelper do
       |> Enum.join(" ")
       |> String.downcase()
 
-    waf_or_html? =
-      String.contains?(raw, "_incapsula_resource") or
-        String.contains?(raw, "<!doctype html") or
-        String.contains?(raw, "<html") or
-        String.contains?(raw, "<iframe")
+    html_waf? =
+      status in [200, 403, 503] and
+        (String.contains?(raw, "<!doctype html") or
+           String.contains?(raw, "<html") or
+           String.contains?(raw, "<iframe"))
+
+    waf_or_html? = String.contains?(raw, "_incapsula_resource") or html_waf?
 
     transport? = is_nil(status) and is_exception(details)
     waf_or_html? or transport?
@@ -152,10 +169,11 @@ defmodule Creatio.LiveHelper do
   @doc """
   Handles an unexpected WAF/network skip on secondary live endpoints during a test.
   """
-  @spec skip_or_fail!(Error.t(), String.t()) :: :skip
+  @spec skip_or_fail!(Error.t(), String.t()) :: no_return()
   def skip_or_fail!(%Error{} = error, context) do
     if waf_or_network_error?(error) do
-      elem(handle_skip("#{context}: #{format_skip_error(error)}"), 0)
+      {:skip, reason} = handle_skip("#{context}: #{format_skip_error(error)}")
+      throw({:creatio_live_skip, reason})
     else
       ExUnit.Assertions.flunk("#{context} failed: #{Exception.message(error)}")
     end
@@ -225,7 +243,7 @@ defmodule Creatio.LiveHelper do
 
   defp authenticate_fresh(:oauth) do
     base = base_url()
-    id_url = identity_url() || "#{base}/0"
+    id_url = identity_url() || "#{base}/identity"
 
     client =
       Client.new(
@@ -266,27 +284,26 @@ defmodule Creatio.LiveHelper do
   end
 
   defp with_read_only(%Client{} = client, read_only?) do
-    base_opts = [
-      base_url: client.base_url,
-      identity_service_url: client.identity_service_url,
-      client_id: client.client_id,
-      client_secret: client.client_secret,
-      read_only: read_only?
-    ]
+    auth_opts =
+      case client.auth_mode do
+        :bearer -> [auth_token: client.auth_token]
+        :forms -> [cookie: client.cookie, bpmcsrf: client.bpmcsrf]
+        _ -> []
+      end
 
-    case client.auth_mode do
-      :bearer ->
-        Client.new(Keyword.put(base_opts, :auth_token, client.auth_token))
+    opts =
+      client.options
+      |> Keyword.merge(
+        base_url: client.base_url,
+        identity_service_url: client.identity_service_url,
+        client_id: client.client_id,
+        client_secret: client.client_secret,
+        auth_mode: client.auth_mode,
+        read_only: read_only?
+      )
+      |> Keyword.merge(auth_opts)
 
-      :forms ->
-        base_opts
-        |> Keyword.put(:cookie, client.cookie)
-        |> Keyword.put(:bpmcsrf, client.bpmcsrf)
-        |> Client.new()
-
-      _ ->
-        Client.new(base_opts)
-    end
+    Client.from_req(client.req, opts)
   end
 
   defp build_mutable_cleanup_client(%Client{} = client), do: with_read_only(client, false)

@@ -3,16 +3,15 @@ defmodule Creatio.LiveTest do
 
   @moduletag :live
 
-  alias Creatio.{Batch, Client, DataService, Error, LiveHelper, OData, OData3}
+  alias Creatio.{Batch, DataService, Error, LiveHelper, OData, OData3}
   alias Creatio.OData.Query
 
   describe "Phase 1: Live authentication & client setup" do
     test "initializes sandbox client with read_only: true enforced by default" do
-      if LiveHelper.base_url() do
-        client = Client.new()
+      LiveHelper.with_live_client([], fn client ->
         assert client.base_url == LiveHelper.base_url()
         assert client.read_only == true
-      end
+      end)
     end
 
     test "authenticates via OAuth 2.0 client credentials and probes identity endpoints" do
