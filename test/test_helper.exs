@@ -7,7 +7,7 @@ if File.exists?(env_file) do
   |> Enum.each(fn line ->
     line = String.trim(line)
 
-    unless String.starts_with?(line, "#") or line == "" do
+    if not (String.starts_with?(line, "#") or line == "") do
       case String.split(line, "=", parts: 2) do
         [key, val] ->
           clean_val = val |> String.trim() |> String.trim("\"") |> String.trim("'")
