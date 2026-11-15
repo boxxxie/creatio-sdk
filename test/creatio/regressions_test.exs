@@ -289,4 +289,196 @@ defmodule Creatio.RegressionsTest do
       assert [%{"Id" => "o3"}] = Creatio.odata3_stream!("Contact", client) |> Enum.take(1)
     end
   end
+
+  describe "Performance, Streaming, and Protocol Optimizations" do
+    test "Batch supports O(1) large builds, iodata multipart, minimal metadata, and return=minimal" do
+      batch =
+        Enum.reduce(1..2_000, Batch.new(continue_on_error: true, return: :minimal), fn i, acc ->
+          Batch.add_get(acc, "Contact", "id-#{i}")
+        end)
+
+      %{"requests" => requests} = Batch.to_payload(batch)
+      assert length(requests) == 2_000
+      assert hd(requests)["id"] == "req_1"
+      assert List.last(requests)["id"] == "req_2000"
+      assert hd(requests)["headers"]["Accept"] == "application/json; odata.metadata=minimal"
+      assert hd(requests)["headers"]["Prefer"] == "continue-on-error, return=minimal"
+      refute Map.has_key?(hd(requests)["headers"], "Content-Type")
+
+      small_batch =
+        Batch.new(return: :minimal)
+        |> Batch.add_create("Contact", %{"Name" => "José 🚀"})
+
+      {boundary, iodata} = Batch.to_multipart_iodata(small_batch, boundary: "b_io")
+      assert boundary == "b_io"
+      assert is_list(iodata)
+      bin_body = IO.iodata_to_binary(iodata)
+      assert bin_body =~ "--b_io\r\n"
+      assert bin_body =~ "Prefer: return=minimal\r\n"
+      assert bin_body =~ ~s({"Name":"José 🚀"})
+      assert bin_body =~ "--b_io--\r\n"
+
+      get_only = Batch.new() |> Batch.add_get("Contact", "1")
+
+      assert Batch.to_multipart(get_only, boundary: "b_get") ==
+               {"b_get",
+                get_only
+                |> Batch.to_multipart_iodata(boundary: "b_get")
+                |> elem(1)
+                |> IO.iodata_to_binary()}
+
+      # Multi-byte UTF-8 JSON body in multipart response parses cleanly with byte-level CRLF strip
+      raw_utf8 =
+        "--b_utf8\r\n" <>
+          "Content-Type: application/http\r\n" <>
+          "Content-ID: req_1\r\n\r\n" <>
+          "HTTP/1.1 201 Created\r\n" <>
+          "Content-Type: application/json; odata.metadata=minimal\r\n\r\n" <>
+          ~s({"Id":"u1","Name":"José 🚀"}) <>
+          "\r\n--b_utf8--\r\n"
+
+      assert {:ok, [%Batch.Response{id: "req_1", status: 201, body: %{"Name" => "José 🚀"}}]} =
+               Batch.parse_multipart_response(raw_utf8, "b_utf8")
+    end
+
+    test "OData and OData3 support cursor/keyset pagination without $skip" do
+      id1 = "11111111-1111-1111-1111-111111111111"
+      id2 = "22222222-2222-2222-2222-222222222222"
+      id3 = "33333333-3333-3333-3333-333333333333"
+      o3_filter_p1 = "(Active eq true) and (Id gt guid'#{id1}')"
+      o3_filter_p2 = "(Active eq true) and (Id gt guid'#{id3}')"
+      o4_filter_p2 = "(Active eq true) and (Id gt #{id2})"
+
+      plug = fn conn ->
+        q = URI.decode_query(conn.query_string)
+        refute Map.has_key?(q, "$skip")
+        assert q["$orderby"] == "Id asc"
+
+        if String.contains?(conn.request_path, "EntityDataService.svc") do
+          case q["$filter"] do
+            ^o3_filter_p1 ->
+              Req.Test.json(conn, %{"d" => %{"results" => [%{"Id" => id2}, %{"Id" => id3}]}})
+
+            ^o3_filter_p2 ->
+              Req.Test.json(conn, %{"d" => %{"results" => []}})
+          end
+        else
+          case q["$filter"] do
+            "Active eq true" ->
+              Req.Test.json(conn, %{"value" => [%{"Id" => id1}, %{"Id" => id2}]})
+
+            ^o4_filter_p2 ->
+              Req.Test.json(conn, %{"value" => [%{"Id" => id3}]})
+          end
+        end
+      end
+
+      client = Client.new(base_url: "https://crm.test", req_options: [plug: plug])
+
+      q4 = Query.new("Contact") |> Query.filter_eq("Active", true)
+
+      assert [%{"Id" => ^id1}, %{"Id" => ^id2}, %{"Id" => ^id3}] =
+               OData.stream(client, q4, page_size: 2, cursor_field: "Id") |> Enum.to_list()
+
+      assert [%{"Id" => ^id2}, %{"Id" => ^id3}] =
+               OData3.stream(client, "Contact",
+                 page_size: 2,
+                 cursor_field: "Id",
+                 after_cursor: id1,
+                 filter: "Active eq true"
+               )
+               |> Enum.to_list()
+    end
+
+    test "get_field_value supports decode_body: false and into: streaming, and update_field streams Enumerables" do
+      tmp_path =
+        Path.join(
+          System.tmp_dir!(),
+          "creatio_sdk_stream_test_#{System.unique_integer([:positive])}.bin"
+        )
+
+      on_exit(fn -> File.rm(tmp_path) end)
+
+      plug = fn conn ->
+        case conn.method do
+          "GET" ->
+            conn
+            |> Plug.Conn.put_resp_content_type("application/json")
+            |> Plug.Conn.send_resp(200, ~s({"raw":"bytes"}))
+
+          "PUT" ->
+            {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+            assert Plug.Conn.get_req_header(conn, "content-type") == [
+                     "application/octet-stream; IEEE754Compatible=true"
+                   ]
+
+            assert body == "chunk1chunk2"
+            Plug.Conn.send_resp(conn, 204, "")
+        end
+      end
+
+      client = Client.new(base_url: "https://crm.test", req_options: [plug: plug])
+
+      # decode_body: false returns raw binary instead of auto-decoding JSON
+      assert {:ok, ~s({"raw":"bytes"})} = OData.get_field_value(client, "SysFile", "1", "Data")
+      assert {:ok, ~s({"raw":"bytes"})} = OData3.get_field_value(client, "SysFile", "1", "Data")
+
+      # into: File.stream! streams download directly to file
+      assert {:ok, %File.Stream{}} =
+               Creatio.get_field_value(client, "SysFile", "1", "Data",
+                 into: File.stream!(tmp_path)
+               )
+
+      assert File.read!(tmp_path) == ~s({"raw":"bytes"})
+
+      # Stream upload body does not hit Jason.encode!
+      upload_stream = Stream.map(["chunk1", "chunk2"], & &1)
+      assert :ok = OData.update_field(client, "SysFile", "1", "Data", upload_stream)
+    end
+
+    test "OData.create and update support return: :minimal and 204 odata-entityid" do
+      plug = fn conn ->
+        assert Plug.Conn.get_req_header(conn, "prefer") == ["return=minimal"]
+
+        case conn.method do
+          "POST" ->
+            conn
+            |> Plug.Conn.put_resp_header(
+              "odata-entityid",
+              "https://crm.test/0/odata/Contact(abc)"
+            )
+            |> Plug.Conn.send_resp(204, "")
+
+          "PATCH" ->
+            Plug.Conn.send_resp(conn, 204, "")
+        end
+      end
+
+      client = Client.new(base_url: "https://crm.test", req_options: [plug: plug])
+
+      assert {:ok, %{"@odata.id" => "https://crm.test/0/odata/Contact(abc)"}} =
+               OData.create(client, "Contact", %{"Name" => "Min"}, return: :minimal)
+
+      assert :ok = OData.update(client, "Contact", "abc", %{"Name" => "Min2"}, return: :minimal)
+    end
+
+    test "Query flattens chained and_filter expressions and preserves OR precedence" do
+      q =
+        Query.new("Contact")
+        |> Query.filter_eq("A", 1)
+        |> Query.filter_eq("B", 2)
+        |> Query.filter_eq("C", 3)
+
+      assert Query.to_params(q)["$filter"] == "A eq 1 and B eq 2 and C eq 3"
+
+      q_or_then_and =
+        Query.new("Contact")
+        |> Query.filter_eq("A", 1)
+        |> Query.or_filter_eq("B", 2)
+        |> Query.filter_eq("C", 3)
+
+      assert Query.to_params(q_or_then_and)["$filter"] == "((A eq 1) or (B eq 2)) and C eq 3"
+    end
+  end
 end
