@@ -147,41 +147,60 @@ defmodule Creatio.ErrorTest do
   end
 
   test "from_response with legacy and alternative error payloads" do
-    payloads = [
-      %{"errorInfo" => %{"message" => "A", "errorCode" => "123"}},
-      %{"ErrorInfo" => %{"message" => "A", "errorCode" => "123"}},
-      %{"responseStatus" => %{"Message" => "A", "errorCode" => "123"}},
-      %{"ResponseStatus" => %{"Message" => "A", "ErrorCode" => "123"}},
-      %{"success" => false, "message" => "A"},
-      %{"success" => false, "errorInfo" => %{"message" => "A"}},
-      %{"success" => "false", "message" => "A"},
-      %{"error" => %{"message" => %{"value" => "nested"}}},
-      %{"error" => "string error"},
-      %{"error" => %{"message" => "msg", "code" => "123"}},
-      %{"error" => %{"code" => "123"}},
-      %{"error" => %{}},
-      %{"error" => nil},
-      %{"Success" => false, "Message" => "Failed", "ErrorCode" => "ERR"},
-      %{"Message" => "Just message"},
-      %{"ExceptionMessage" => "Just exception message"},
-      %{"message" => %{"value" => "string value"}},
-      %{"message" => "string value", "code" => "200"},
-      %{}
+    cases = [
+      {%{"errorInfo" => %{"message" => "A", "errorCode" => "123"}}, "123", "A"},
+      {%{"ErrorInfo" => %{"message" => "A", "errorCode" => "123"}}, "123", "A"},
+      {%{"responseStatus" => %{"Message" => "A", "errorCode" => "123"}}, "123", "A"},
+      {%{"ResponseStatus" => %{"Message" => "A", "ErrorCode" => "123"}}, "123", "A"},
+      {%{"success" => false, "message" => "A"}, nil, "A"},
+      {%{"success" => false, "errorInfo" => %{"message" => "A"}}, nil, "A"},
+      {%{"success" => "false", "message" => "A"}, nil, "A"},
+      {%{"error" => %{"message" => %{"value" => "nested"}}}, nil, "nested"},
+      {%{"error" => "string error"}, "string error", "string error"},
+      {%{"error" => %{"message" => "msg", "code" => "123"}}, "123", "msg"},
+      {%{"error" => %{"code" => "123"}}, "123", "123"},
+      {%{"error" => %{}}, nil, "HTTP 400"},
+      {%{"error" => nil}, nil, inspect(%{"error" => nil})},
+      {%{"Success" => false, "Message" => "Failed", "ErrorCode" => "ERR"}, "ERR", "Failed"},
+      {%{"Message" => "Just message"}, nil, "Just message"},
+      {%{"ExceptionMessage" => "Just exception message"}, nil, "Just exception message"},
+      {%{"message" => %{"value" => "string value"}}, nil, "string value"},
+      {%{"message" => "string value", "code" => "200"}, "200", "string value"},
+      {%{}, nil, inspect(%{})},
+      {%{"error" => %{"message" => "A", "code" => "B"}}, "B", "A"},
+      {%{"error" => %{"Message" => "A", "ErrorCode" => "B"}}, nil, "HTTP 400"},
+      {%{"message" => "A", "code" => "B"}, "B", "A"},
+      {%{"Exception" => %{"Message" => "A", "ErrorCode" => "B"}}, nil,
+       inspect(%{"Exception" => %{"Message" => "A", "ErrorCode" => "B"}})},
+      {%{"Exception" => %{"message" => "A", "errorCode" => "B"}}, nil,
+       inspect(%{"Exception" => %{"message" => "A", "errorCode" => "B"}})},
+      {%{"error_description" => "A"}, nil, inspect(%{"error_description" => "A"})}
     ]
 
-    for body <- payloads do
+    for {body, expected_code, expected_message} <- cases do
       err = Error.from_response(%Req.Response{status: 400, body: body})
-      assert is_struct(err, Error)
+      assert %Error{status: 400} = err
+      assert err.code == expected_code
+      assert err.message == expected_message
     end
 
-    assert is_struct(Error.from_response("not a response"), Error)
+    assert %Error{
+             status: nil,
+             code: nil,
+             message: "\"not a response\"",
+             response: "not a response"
+           } = Error.from_response("not a response")
 
-    assert is_struct(
-             Error.from_response(%Req.Response{status: 400, body: "just a string"}),
-             Error
-           )
+    assert %Error{status: 400, code: nil, message: "just a string"} =
+             Error.from_response(%Req.Response{status: 400, body: "just a string"})
 
     err = Error.from_response(%Req.Response{status: 400, body: %{"error" => %{"message" => 123}}})
+    assert err.status == 400
     assert err.message == "123"
+
+    json_body = Jason.encode!(%{"error" => %{"message" => "Encoded JSON error", "code" => "E1"}})
+
+    assert %Error{status: 400, code: "E1", message: "Encoded JSON error"} =
+             Error.from_response(%Req.Response{status: 400, body: json_body})
   end
 end

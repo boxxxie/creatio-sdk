@@ -114,5 +114,226 @@ defmodule Creatio.OData.QueryTest do
       assert params["$filter"] =~ "Active eq true"
       assert params["$filter"] =~ "Department eq 'Sales'"
     end
+
+    test "omits empty select, filter, orderby, and expand options from serialized params" do
+      q = %Query{entity: "Contact", select: [], filter: "", orderby: [], expand: []}
+      p = Query.to_params(q)
+
+      assert p == %{}
+      assert Query.to_query_string(q) == ""
+    end
+
+    test "supports atoms, keyword order_by, where, filter_in, and query string" do
+      q =
+        Query.new("Contact")
+        |> Query.select(:Id)
+        |> Query.select([:Name, :Email])
+        |> Query.expand(:Account)
+        |> Query.where("Age gt 20")
+        |> Query.where("City/Name eq 'Toronto'")
+        |> Query.filter_in("Status", ["Active", "Pending"])
+        |> Query.order_by(Name: :asc, CreatedOn: :desc)
+        |> Query.param("customFlag", "true")
+
+      params = Query.to_params(q)
+      assert params["$select"] == "Id,Name,Email"
+      assert params["$expand"] == "Account"
+      assert params["$orderby"] == "Name asc,CreatedOn desc"
+      assert params["customFlag"] == "true"
+      assert String.contains?(params["$filter"], "Age gt 20")
+      assert String.contains?(params["$filter"], "City/Name eq 'Toronto'")
+      assert String.contains?(params["$filter"], "Status eq 'Active' or Status eq 'Pending'")
+
+      qs = Query.to_query_string(q)
+      assert String.contains?(qs, "%24select=Id%2CName%2CEmail")
+    end
+
+    test "supports all Postman collection filtration functions and operators" do
+      q1 =
+        Query.new("Collection1")
+        |> Query.filter_eq("Field2", "Field2Value")
+        |> Query.filter_ne("Field3", "OtherVal")
+        |> Query.filter_contains("Field4", "needle")
+        |> Query.filter_startswith("Field5", "prefix")
+        |> Query.filter_endswith("Field6", "suffix")
+
+      params1 = Query.to_params(q1)
+      assert params1["$filter"] =~ "Field2 eq 'Field2Value'"
+      assert params1["$filter"] =~ "Field3 ne 'OtherVal'"
+      assert params1["$filter"] =~ "contains(Field4,'needle')"
+      assert params1["$filter"] =~ "startswith(Field5,'prefix')"
+      assert params1["$filter"] =~ "endswith(Field6,'suffix')"
+
+      q2 =
+        Query.new("Collection3")
+        |> Query.filter_eq("Collection6/Field6", "e9621f72-42bd-47c1", quoted: false)
+
+      assert Query.to_params(q2)["$filter"] == "Collection6/Field6 eq e9621f72-42bd-47c1"
+
+      q3 =
+        Query.new("Contact")
+        |> Query.filter_eq("Active", true)
+        |> Query.filter_eq("Age", 30)
+        |> Query.filter_eq("MiddleName", nil)
+
+      params3 = Query.to_params(q3)
+      assert params3["$filter"] =~ "Active eq true"
+      assert params3["$filter"] =~ "Age eq 30"
+      assert params3["$filter"] =~ "MiddleName eq null"
+
+      q4 =
+        Query.new("Product")
+        |> Query.filter_gt("Price", 100)
+        |> Query.filter_ge("Rating", 4.5)
+        |> Query.filter_lt("Stock", 10)
+        |> Query.filter_le("Discount", 0.5)
+
+      params4 = Query.to_params(q4)
+      assert params4["$filter"] =~ "Price gt 100"
+      assert params4["$filter"] =~ "Rating ge 4.5"
+      assert params4["$filter"] =~ "Stock lt 10"
+      assert params4["$filter"] =~ "Discount le 0.5"
+
+      q5 =
+        Query.new("Collection1")
+        |> Query.filter_day("Field3", "Field3Value")
+        |> Query.filter_length("Field2", "Field2Value", "gt")
+
+      params5 = Query.to_params(q5)
+      assert params5["$filter"] =~ "day(Field3) eq Field3Value"
+      assert params5["$filter"] =~ "length(Field2) gt Field2Value"
+
+      q6 =
+        Query.new("Collection1")
+        |> Query.filter_endswith("Field2", "Field2Value")
+        |> Query.filter_not()
+
+      assert Query.to_params(q6)["$filter"] == "not (endswith(Field2,'Field2Value'))"
+
+      q7 =
+        Query.new("Contact")
+        |> Query.filter_in_ids("Id", ["uuid-1", "uuid-2"])
+
+      assert Query.to_params(q7)["$filter"] == "(Id eq uuid-1 or Id eq uuid-2)"
+
+      q8 =
+        Query.new("Contact")
+        |> Query.filter_eq("City", "Toronto")
+        |> Query.or_filter_eq("City", "Montreal")
+        |> Query.or_filter_contains("Name", "Smith")
+
+      params8 = Query.to_params(q8)
+      assert params8["$filter"] =~ "or (City eq 'Montreal')"
+      assert params8["$filter"] =~ "or (contains(Name,'Smith'))"
+    end
+
+    test "supports filter_guid, or_filter_guid, or_filter_in, and additional OR functions" do
+      q1 =
+        Query.new("Contact")
+        |> Query.filter_guid("AccountId", "{4c63c8fa-467b-48a6-973f-b2069298404f}")
+        |> Query.or_filter_guid("OwnerId", "1111-2222-3333-4444")
+
+      params1 = Query.to_params(q1)
+      assert params1["$filter"] =~ "AccountId eq 4c63c8fa-467b-48a6-973f-b2069298404f"
+      assert params1["$filter"] =~ "OwnerId eq 1111-2222-3333-4444"
+
+      q2 =
+        Query.new("Contact")
+        |> Query.filter_guid("AccountId", "4c63c8fa-467b-48a6-973f-b2069298404f",
+          protocol: :odata3
+        )
+
+      assert Query.to_params(q2)["$filter"] ==
+               "AccountId eq guid'4c63c8fa-467b-48a6-973f-b2069298404f'"
+
+      q3 =
+        Query.new("Product")
+        |> Query.filter_gt("Price", 50)
+        |> Query.or_filter_gt("Price", 100)
+        |> Query.or_filter_ge("Rating", 4.0)
+        |> Query.or_filter_lt("Stock", 5)
+        |> Query.or_filter_le("Discount", 0.1)
+        |> Query.or_filter_day("CreatedOn", 15)
+        |> Query.or_filter_length("Name", 20, "lt")
+
+      params3 = Query.to_params(q3)
+      assert params3["$filter"] =~ "or (Price gt 100)"
+      assert params3["$filter"] =~ "or (Rating ge 4.0)"
+      assert params3["$filter"] =~ "or (Stock lt 5)"
+      assert params3["$filter"] =~ "or (Discount le 0.1)"
+      assert params3["$filter"] =~ "or (day(CreatedOn) eq 15)"
+      assert params3["$filter"] =~ "or (length(Name) lt 20)"
+
+      q4 =
+        Query.new("Contact")
+        |> Query.filter_eq("Active", true)
+        |> Query.or_filter_in("Department", ["Sales", "Marketing", "Sales"])
+
+      params4 = Query.to_params(q4)
+      assert params4["$filter"] =~ "or ((Department eq 'Sales' or Department eq 'Marketing'))"
+
+      q5 =
+        Query.new("Contact")
+        |> Query.filter_eq("Id", "guid'4c63c8fa-467b-48a6-973f-b2069298404f'")
+
+      assert Query.to_params(q5)["$filter"] == "Id eq guid'4c63c8fa-467b-48a6-973f-b2069298404f'"
+    end
+
+    test "formats DateTime, NaiveDateTime, Date, and Time literals for OData 4 and OData 3" do
+      dt = ~U[2024-05-01 14:30:00Z]
+      ndt = ~N[2024-05-01 14:30:00]
+      d = ~D[2024-05-01]
+      t = ~T[09:15:30]
+
+      odata4_query =
+        Query.new("Contact")
+        |> Query.filter_ge("CreatedOn", dt)
+        |> Query.filter_lt("ModifiedOn", ndt)
+        |> Query.filter_eq("BirthDate", d)
+        |> Query.filter_gt("StartTime", t)
+
+      odata4_filter = Query.to_params(odata4_query)["$filter"]
+      assert odata4_filter =~ "CreatedOn ge 2024-05-01T14:30:00Z"
+      assert odata4_filter =~ "ModifiedOn lt 2024-05-01T14:30:00Z"
+      assert odata4_filter =~ "BirthDate eq 2024-05-01"
+      assert odata4_filter =~ "StartTime gt 09:15:30"
+
+      odata3_query =
+        Query.new("Contact")
+        |> Query.filter_ge("CreatedOn", dt, protocol: :odata3)
+        |> Query.filter_lt("ModifiedOn", ndt, protocol: :odata3)
+        |> Query.filter_eq("BirthDate", d, odata3: true)
+        |> Query.filter_gt("StartTime", t, protocol: :odata3)
+
+      odata3_filter = Query.to_params(odata3_query)["$filter"]
+      assert odata3_filter =~ "CreatedOn ge datetime'2024-05-01T14:30:00Z'"
+      assert odata3_filter =~ "ModifiedOn lt datetime'2024-05-01T14:30:00'"
+      assert odata3_filter =~ "BirthDate eq datetime'2024-05-01T00:00:00'"
+      assert odata3_filter =~ "StartTime gt time'09:15:30'"
+    end
+
+    test "handles empty filter_not, nil via or_filter_eq/or_filter_in, order_by/3, and false literals" do
+      empty_not = Query.new("Contact") |> Query.filter_not()
+      assert empty_not.filter == nil
+      refute Map.has_key?(Query.to_params(empty_not), "$filter")
+
+      or_nil_only = Query.new("Contact") |> Query.or_filter_eq("MiddleName", nil)
+      assert Query.to_params(or_nil_only)["$filter"] == "MiddleName eq null"
+
+      or_chained =
+        Query.new("Contact")
+        |> Query.filter_eq("Active", false)
+        |> Query.or_filter_eq("MiddleName", nil)
+        |> Query.or_filter_in("Suffix", [nil])
+        |> Query.order_by(:Name, :asc)
+        |> Query.order_by("CreatedOn", "desc")
+
+      params = Query.to_params(or_chained)
+
+      assert params["$filter"] ==
+               "((Active eq false) or (MiddleName eq null)) or (Suffix eq null)"
+
+      assert params["$orderby"] == "Name asc,CreatedOn desc"
+    end
   end
 end

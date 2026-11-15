@@ -90,4 +90,21 @@ defmodule Creatio.ClientTest do
       assert client.req.headers["x-custom-header"] == ["custom-val"]
     end
   end
+
+  describe "read_only mode and to_req/1" do
+    test "exposes underlying Req request and preserves read_only_guard across auth updates" do
+      client = Client.new(base_url: "https://mycreatio.com", read_only: true)
+      assert client.read_only == true
+      assert Client.to_req(client) == client.req
+      assert Keyword.has_key?(client.req.request_steps, :read_only_guard)
+
+      bearer_client = Client.put_bearer_token(client, "tok_123")
+      assert bearer_client.read_only == true
+      assert Keyword.has_key?(bearer_client.req.request_steps, :read_only_guard)
+
+      forms_client = Client.put_forms_auth(client, ".ASPXAUTH=1", "csrf_1")
+      assert forms_client.read_only == true
+      assert Keyword.has_key?(forms_client.req.request_steps, :read_only_guard)
+    end
+  end
 end
