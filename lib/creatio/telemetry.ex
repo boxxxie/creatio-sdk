@@ -10,13 +10,13 @@ defmodule Creatio.Telemetry do
 
   ### HTTP Requests (`Creatio.Client`)
     * `[:creatio, :request, :start]`
-      * Measurements: `%{system_time: integer()}`
+      * Measurements: `%{system_time: integer(), monotonic_time: integer()}`
       * Metadata: `%{method: atom(), path: String.t(), base_url: String.t(), auth_mode: atom() | nil, headers: map()}`
     * `[:creatio, :request, :stop]`
-      * Measurements: `%{duration: integer()}`
+      * Measurements: `%{duration: integer(), monotonic_time: integer()}`
       * Metadata: `%{method: atom(), path: String.t(), base_url: String.t(), auth_mode: atom() | nil, headers: map(), status: integer(), result: :ok | :error, error: nil}`
     * `[:creatio, :request, :exception]`
-      * Measurements: `%{duration: integer()}`
+      * Measurements: `%{duration: integer(), monotonic_time: integer()}`
       * Metadata: `%{method: atom(), path: String.t(), base_url: String.t(), auth_mode: atom() | nil, headers: map(), status: integer() | nil, kind: :error, reason: any(), error: any(), stacktrace: list(), result: :error}`
 
   ### OData 4 Operations (`Creatio.OData`)
@@ -42,7 +42,7 @@ defmodule Creatio.Telemetry do
   ### Batch Execution (`Creatio.Batch`)
     * `[:creatio, :batch, :start | :stop | :exception]`
       * Measurements: `%{system_time: integer()}` on `:start`, `%{duration: integer()}` on `:stop | :exception`
-      * Metadata: `%{format: :json | :multipart, operation_count: non_neg_integer(), base_url: String.t(), status: :ok | :error, result: :ok | :error, error: any()}`
+      * Metadata: `%{format: :json | :multipart, operation_count: non_neg_integer(), base_url: String.t(), status: :ok | :error, result: :ok | :error, error: any(), error_count: non_neg_integer()}`
 
   ## Credential Redaction
 
@@ -118,10 +118,18 @@ defmodule Creatio.Telemetry do
     try do
       res = fun.()
       stop_monotonic = System.monotonic_time()
+      outcome = outcome_metadata(res)
+
+      outcome =
+        if event_prefix == [:creatio, :batch] and match?({:ok, _}, res) do
+          Map.put_new(outcome, :error_count, 0)
+        else
+          outcome
+        end
 
       stop_metadata =
         sanitized_start
-        |> Map.merge(outcome_metadata(res))
+        |> Map.merge(outcome)
         |> Map.put(:telemetry_span_context, span_ctx)
 
       :telemetry.execute(
@@ -177,7 +185,7 @@ defmodule Creatio.Telemetry do
 
     :telemetry.execute(
       [:creatio, :request, :start],
-      %{system_time: System.system_time()},
+      %{system_time: System.system_time(), monotonic_time: start_time},
       build_req_metadata(req)
     )
 
@@ -188,55 +196,86 @@ defmodule Creatio.Telemetry do
   @spec handle_req_stop({Req.Request.t(), Req.Response.t()}) ::
           {Req.Request.t(), Req.Response.t()}
   def handle_req_stop({%Req.Request{} = req, %Req.Response{} = resp}) do
-    duration = compute_duration(req)
+    case Req.Request.get_private(req, :creatio_telemetry_start) do
+      start_time when is_integer(start_time) ->
+        stop_time = System.monotonic_time()
+        duration = max(stop_time - start_time, 0)
 
-    meta =
-      req
-      |> build_req_metadata()
-      |> Map.merge(%{
-        status: resp.status,
-        result: if(resp.status in 200..299, do: :ok, else: :error),
-        error: nil
-      })
+        meta =
+          req
+          |> build_req_metadata()
+          |> Map.merge(%{
+            status: resp.status,
+            result: if(resp.status in 200..299, do: :ok, else: :error),
+            error: nil
+          })
 
-    :telemetry.execute([:creatio, :request, :stop], %{duration: duration}, meta)
-    {rearm_request_step(req), resp}
+        :telemetry.execute(
+          [:creatio, :request, :stop],
+          %{duration: duration, monotonic_time: stop_time},
+          meta
+        )
+
+        {rearm_request_step(req), resp}
+
+      _ ->
+        {req, resp}
+    end
   end
 
   @doc false
   @spec handle_req_error({Req.Request.t(), Exception.t()}) :: {Req.Request.t(), Exception.t()}
   def handle_req_error({%Req.Request{} = req, exception}) do
-    duration = compute_duration(req)
-    sanitized_exception = sanitize_error(exception)
+    case Req.Request.get_private(req, :creatio_telemetry_start) do
+      start_time when is_integer(start_time) ->
+        stop_time = System.monotonic_time()
+        duration = max(stop_time - start_time, 0)
+        sanitized_exception = sanitize_error(exception)
 
-    status =
-      case exception do
-        %{status: s} when is_integer(s) -> s
-        _ -> nil
-      end
+        status =
+          case exception do
+            %{status: s} when is_integer(s) -> s
+            _ -> nil
+          end
 
-    meta =
-      req
-      |> build_req_metadata()
-      |> Map.merge(%{
-        status: status,
-        kind: :error,
-        reason: sanitized_exception,
-        error: sanitized_exception,
-        stacktrace: [],
-        result: :error
-      })
+        meta =
+          req
+          |> build_req_metadata()
+          |> Map.merge(%{
+            status: status,
+            kind: :error,
+            reason: sanitized_exception,
+            error: sanitized_exception,
+            stacktrace: [],
+            result: :error
+          })
 
-    :telemetry.execute([:creatio, :request, :exception], %{duration: duration}, meta)
-    {rearm_request_step(req), exception}
+        :telemetry.execute(
+          [:creatio, :request, :exception],
+          %{duration: duration, monotonic_time: stop_time},
+          meta
+        )
+
+        {rearm_request_step(req), exception}
+
+      _ ->
+        {req, exception}
+    end
   end
 
-  defp rearm_request_step(%Req.Request{current_request_steps: current} = req) do
-    if :creatio_telemetry in current do
+  defp rearm_request_step(%Req.Request{current_request_steps: current, private: private} = req) do
+    updated_steps =
+      if :creatio_telemetry in current do
+        current
+      else
+        [:creatio_telemetry | current]
+      end
+
+    %Req.Request{
       req
-    else
-      %Req.Request{req | current_request_steps: current ++ [:creatio_telemetry]}
-    end
+      | current_request_steps: updated_steps,
+        private: Map.delete(private, :creatio_telemetry_start)
+    }
   end
 
   @doc """
@@ -401,6 +440,24 @@ defmodule Creatio.Telemetry do
   defp redact_header_value(_val), do: "[REDACTED]"
 
   defp outcome_metadata(:ok), do: %{result: :ok, status: :ok, error: nil}
+
+  defp outcome_metadata({:ok, [%Creatio.Batch.Response{} | _] = responses}) do
+    failed = Enum.filter(responses, &Creatio.Batch.Response.error?/1)
+
+    case failed do
+      [] ->
+        %{result: :ok, status: :ok, error: nil, error_count: 0}
+
+      [first_failed | _] ->
+        %{
+          result: :error,
+          status: :error,
+          error: sanitize_error(Creatio.Batch.Response.to_error(first_failed)),
+          error_count: length(failed)
+        }
+    end
+  end
+
   defp outcome_metadata({:ok, _}), do: %{result: :ok, status: :ok, error: nil}
   defp outcome_metadata({:ok, _, _}), do: %{result: :ok, status: :ok, error: nil}
 
@@ -413,18 +470,7 @@ defmodule Creatio.Telemetry do
     if Keyword.has_key?(steps, :creatio_telemetry) do
       req
     else
-      if Keyword.has_key?(steps, :read_only_guard) do
-        updated =
-          insert_before_step(
-            steps,
-            :read_only_guard,
-            {:creatio_telemetry, &__MODULE__.handle_req_start/1}
-          )
-
-        %Req.Request{req | request_steps: updated}
-      else
-        Req.Request.append_request_steps(req, creatio_telemetry: &__MODULE__.handle_req_start/1)
-      end
+      Req.Request.prepend_request_steps(req, creatio_telemetry: &__MODULE__.handle_req_start/1)
     end
   end
 
@@ -441,26 +487,6 @@ defmodule Creatio.Telemetry do
       req
     else
       Req.Request.prepend_error_steps(req, creatio_telemetry: &__MODULE__.handle_req_error/1)
-    end
-  end
-
-  defp insert_before_step([], _target_key, new_step), do: [new_step]
-
-  defp insert_before_step([{target_key, _} = head | tail], target_key, new_step) do
-    [new_step, head | tail]
-  end
-
-  defp insert_before_step([head | tail], target_key, new_step) do
-    [head | insert_before_step(tail, target_key, new_step)]
-  end
-
-  defp compute_duration(%Req.Request{} = req) do
-    case Req.Request.get_private(req, :creatio_telemetry_start) do
-      start_time when is_integer(start_time) ->
-        max(System.monotonic_time() - start_time, 0)
-
-      _ ->
-        0
     end
   end
 
@@ -511,4 +537,6 @@ defmodule Creatio.Telemetry do
 
   defp extract_path(%URI{path: path}) when is_binary(path) and path != "", do: path
   defp extract_path(%URI{}), do: "/"
+  defp extract_path(url) when is_binary(url), do: url |> URI.parse() |> extract_path()
+  defp extract_path(_), do: "/"
 end

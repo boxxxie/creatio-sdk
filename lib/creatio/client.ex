@@ -199,13 +199,16 @@ defmodule Creatio.Client do
         end
       end)
 
+    trimmed_base = String.trim_trailing(base_url, "/")
+
     configured_req =
       req
+      |> maybe_put_base_url(trimmed_base)
       |> put_header_if_absent("accept", "application/json; odata.metadata=minimal")
       |> put_header_if_absent("forceusesession", "true")
 
     client = %__MODULE__{
-      base_url: String.trim_trailing(base_url, "/"),
+      base_url: trimmed_base,
       auth_token: auth_token,
       auth_mode: auth_mode,
       cookie: cookie,
@@ -222,6 +225,16 @@ defmodule Creatio.Client do
     apply_auth_headers(client)
   end
 
+  defp maybe_put_base_url(req, ""), do: req
+
+  defp maybe_put_base_url(req, base_url) do
+    if req.options[:base_url] == base_url do
+      req
+    else
+      Req.Request.put_option(req, :base_url, base_url)
+    end
+  end
+
   @doc """
   Ensures that the input is a `%Creatio.Client{}`, converting a `%Req.Request{}` if necessary.
   """
@@ -234,8 +247,16 @@ defmodule Creatio.Client do
   """
   @spec put_bearer_token(t(), String.t()) :: t()
   def put_bearer_token(%__MODULE__{} = client, token) when is_binary(token) do
+    if String.trim(token) == "" do
+      raise ArgumentError, "expected non-empty bearer token binary"
+    end
+
     client = %{client | auth_token: token, auth_mode: :bearer, cookie: nil, bpmcsrf: nil}
     apply_auth_headers(client)
+  end
+
+  def put_bearer_token(%__MODULE__{}, token) do
+    raise ArgumentError, "expected non-empty bearer token binary, got: #{inspect(token)}"
   end
 
   @doc """
@@ -330,34 +351,44 @@ defmodule Creatio.Client do
   end
 
   defp read_only_guard(req) do
-    if req.method in [:get, :head, :options] do
-      req
-    else
-      path =
-        case req.url do
-          %URI{path: p} -> p || ""
-          other -> URI.parse(to_string(other)).path || ""
-        end
+    path =
+      case req.url do
+        %URI{path: p} -> p || ""
+        other -> URI.parse(to_string(other)).path || ""
+      end
 
-      allowed_suffixes = [
-        "/DataService/json/SyncReply/SelectQuery",
-        "/ServiceModel/AuthService.svc/Login",
-        "/AuthService.svc/Login",
-        "/connect/token",
-        "/odata/$batch"
-      ]
-
-      if not String.contains?(path, "/0/rest/") and
-           Enum.any?(allowed_suffixes, &String.ends_with?(path, &1)) do
-        req
-      else
+    cond do
+      String.contains?(path, "..") ->
         {req,
          Creatio.Error.new(
            status: 403,
            code: "ReadOnlyMode",
-           message: "Client is in read-only mode. Mutation request to #{path} blocked."
+           message: "Client is in read-only mode. Path traversal request to #{path} blocked."
          )}
-      end
+
+      req.method in [:get, :head, :options] ->
+        req
+
+      true ->
+        allowed_suffixes = [
+          "/DataService/json/SyncReply/SelectQuery",
+          "/ServiceModel/AuthService.svc/Login",
+          "/AuthService.svc/Login",
+          "/connect/token",
+          "/odata/$batch"
+        ]
+
+        if not String.contains?(path, "/0/rest/") and
+             Enum.any?(allowed_suffixes, &String.ends_with?(path, &1)) do
+          req
+        else
+          {req,
+           Creatio.Error.new(
+             status: 403,
+             code: "ReadOnlyMode",
+             message: "Client is in read-only mode. Mutation request to #{path} blocked."
+           )}
+        end
     end
   end
 

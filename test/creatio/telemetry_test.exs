@@ -814,5 +814,89 @@ defmodule Creatio.TelemetryTest do
       assert length(starts) == 2
       assert length(stops) == 2
     end
+
+    test "issue 6: emits monotonic_time, avoids unpaired stop/exception on earlier step halt, handles nil URL, and tracks batch error_count" do
+      plug = fn conn -> Req.Test.json(conn, %{"value" => []}) end
+      client = Client.new(base_url: "https://crm.test", req_options: [plug: plug])
+
+      drain_events()
+      assert {:ok, []} = OData.list(client, "Contact")
+
+      assert_receive {:telemetry_event, [:creatio, :request, :start], start_meas, _}
+      assert is_integer(start_meas.monotonic_time)
+      assert is_integer(start_meas.system_time)
+
+      assert_receive {:telemetry_event, [:creatio, :request, :stop], stop_meas, _}
+      assert is_integer(stop_meas.monotonic_time)
+      assert is_integer(stop_meas.duration)
+
+      # Pre-step halting before :creatio_telemetry runs must not emit unpaired :stop or :exception
+      halting_req =
+        Req.new(base_url: "https://crm.test", url: "/0/odata/Contact", plug: plug)
+        |> Telemetry.attach_req_steps()
+        |> Req.Request.prepend_request_steps(
+          early_cache_halt: fn r ->
+            Req.Request.halt(r, %Req.Response{status: 200, body: %{"cached" => true}})
+          end
+        )
+
+      drain_events()
+      assert {:ok, %Req.Response{status: 200}} = Req.get(halting_req)
+      assert drain_events() == []
+
+      err_halting_req =
+        Req.new(base_url: "https://crm.test", url: "/0/odata/Contact", plug: plug)
+        |> Telemetry.attach_req_steps()
+        |> Req.Request.prepend_request_steps(
+          early_fail_halt: fn r ->
+            Req.Request.halt(r, RuntimeError.exception("early failure"))
+          end
+        )
+
+      assert {:error, %RuntimeError{message: "early failure"}} = Req.get(err_halting_req)
+      assert drain_events() == []
+
+      # Direct handle_req_stop on nil URL without prior start emits no unpaired telemetry and doesn't crash
+      nil_url_req = Req.new()
+
+      assert {^nil_url_req, %Req.Response{status: 200}} =
+               Telemetry.handle_req_stop({nil_url_req, %Req.Response{status: 200}})
+
+      assert drain_events() == []
+
+      # extract_path handles nil url during handle_req_start -> handle_req_stop
+      started_nil = Telemetry.handle_req_start(nil_url_req)
+      assert {rearmed, _} = Telemetry.handle_req_stop({started_nil, %Req.Response{status: 200}})
+      refute Map.has_key?(rearmed.private, :creatio_telemetry_start)
+      assert_receive {:telemetry_event, [:creatio, :request, :start], _, %{path: "/"}}
+      assert_receive {:telemetry_event, [:creatio, :request, :stop], _, %{path: "/"}}
+
+      # Batch sub-request failures set status: :error, result: :error, error_count: N
+      batch_err_plug = fn conn ->
+        Req.Test.json(conn, %{
+          "responses" => [
+            %{"id" => "req_1", "status" => 200, "body" => %{}},
+            %{
+              "id" => "req_2",
+              "status" => 500,
+              "body" => %{"error" => %{"message" => "sub fail"}}
+            }
+          ]
+        })
+      end
+
+      batch_client = Client.new(base_url: "https://crm.test", req_options: [plug: batch_err_plug])
+      drain_events()
+
+      assert {:ok, _} = Batch.execute(batch_client, Batch.new() |> Batch.add_get("Contact"))
+
+      assert_receive {:telemetry_event, [:creatio, :batch, :stop], _,
+                      %{
+                        result: :error,
+                        status: :error,
+                        error_count: 1,
+                        error: %Error{status: 500}
+                      }}
+    end
   end
 end
