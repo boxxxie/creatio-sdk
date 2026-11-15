@@ -321,7 +321,8 @@ defmodule Creatio.TestDrivers.FacadeDriver do
 
   defp dispatch(_ctx, _client, {:query_helper, entity, fields}) do
     q = Creatio.query(entity) |> Query.select(fields)
-    {:ok, %{entity: q.entity, select: q.select}}
+    select_fields = (Query.to_params(q)["$select"] || "") |> String.split(",", trim: true)
+    {:ok, %{entity: q.entity, select: select_fields}}
   end
 
   defp dispatch(_ctx, _client, {:new_client, base_url}),

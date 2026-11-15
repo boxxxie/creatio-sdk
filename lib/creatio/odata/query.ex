@@ -22,6 +22,8 @@ defmodule Creatio.OData.Query do
       {:ok, records} = Creatio.OData.execute(client, query)
   """
 
+  alias Creatio.Util
+
   defstruct [
     :entity,
     :filter,
@@ -31,7 +33,11 @@ defmodule Creatio.OData.Query do
     :skip,
     :expand,
     count: false,
-    custom_params: %{}
+    custom_params: %{},
+    filters_rev: [],
+    select_rev: [],
+    orderby_rev: [],
+    expand_rev: []
   ]
 
   @type t :: %__MODULE__{
@@ -39,12 +45,18 @@ defmodule Creatio.OData.Query do
           filter: String.t() | nil,
           select: [String.t()] | String.t() | nil,
           orderby: [String.t()] | String.t() | nil,
-          top: integer() | nil,
-          skip: integer() | nil,
+          top: non_neg_integer() | nil,
+          skip: non_neg_integer() | nil,
           expand: [String.t()] | String.t() | nil,
           count: boolean(),
-          custom_params: map()
+          custom_params: map(),
+          filters_rev: [String.t()],
+          select_rev: [String.t()],
+          orderby_rev: [String.t()],
+          expand_rev: [String.t()]
         }
+
+  @valid_comparison_ops ~w(eq ne gt ge lt le)
 
   @doc """
   Initializes a new query for an entity collection.
@@ -60,20 +72,13 @@ defmodule Creatio.OData.Query do
   """
   @spec select(t(), [String.t() | atom()] | String.t() | atom()) :: t()
   def select(%__MODULE__{} = query, fields) when is_list(fields) do
-    new_fields = normalize_field_list(fields)
-
-    existing =
-      case query.select do
-        nil -> []
-        list when is_list(list) -> list
-        str when is_binary(str) -> normalize_field_list([str])
-      end
-
-    %{query | select: Enum.uniq(existing ++ new_fields)}
+    acc = seed_list_rev(query.select_rev, query.select, true)
+    next_rev = Enum.reduce(fields, acc, &prepend_split_tokens(&1, &2))
+    %__MODULE__{query | select: nil, select_rev: next_rev}
   end
 
   def select(%__MODULE__{} = query, field) when is_binary(field) or is_atom(field) do
-    select(query, [to_string(field)])
+    select(query, [field])
   end
 
   @doc """
@@ -81,7 +86,11 @@ defmodule Creatio.OData.Query do
   """
   @spec filter(t(), String.t()) :: t()
   def filter(%__MODULE__{} = query, filter_expr) when is_binary(filter_expr) do
-    %{query | filter: filter_expr}
+    %__MODULE__{
+      query
+      | filter: nil,
+        filters_rev: if(filter_expr == "", do: [], else: [filter_expr])
+    }
   end
 
   @doc """
@@ -96,24 +105,28 @@ defmodule Creatio.OData.Query do
   Combines an additional filter expression with `and`.
   """
   @spec and_filter(t(), String.t()) :: t()
-  def and_filter(%__MODULE__{filter: nil} = query, filter_expr) when is_binary(filter_expr) do
-    %{query | filter: filter_expr}
+  def and_filter(%__MODULE__{} = query, "") do
+    query
   end
 
-  def and_filter(%__MODULE__{filter: current} = query, filter_expr) when is_binary(filter_expr) do
-    %{query | filter: "(#{current}) and (#{filter_expr})"}
+  def and_filter(%__MODULE__{} = query, filter_expr) when is_binary(filter_expr) do
+    acc = seed_filter_rev(query)
+    %__MODULE__{query | filter: nil, filters_rev: [filter_expr | acc]}
   end
 
   @doc """
   Combines an additional filter expression with `or`.
   """
   @spec or_filter(t(), String.t()) :: t()
-  def or_filter(%__MODULE__{filter: nil} = query, filter_expr) when is_binary(filter_expr) do
-    %{query | filter: filter_expr}
+  def or_filter(%__MODULE__{} = query, "") do
+    query
   end
 
-  def or_filter(%__MODULE__{filter: current} = query, filter_expr) when is_binary(filter_expr) do
-    %{query | filter: "(#{current}) or (#{filter_expr})"}
+  def or_filter(%__MODULE__{} = query, filter_expr) when is_binary(filter_expr) do
+    case compile_filter(query) do
+      nil -> %__MODULE__{query | filter: nil, filters_rev: [filter_expr]}
+      lhs -> %__MODULE__{query | filter: nil, filters_rev: ["(#{lhs}) or (#{filter_expr})"]}
+    end
   end
 
   @doc """
@@ -209,7 +222,7 @@ defmodule Creatio.OData.Query do
   end
 
   @doc """
-  Adds a less-than-or-equal condition combined with `or` (`{field} lt {value}`).
+  Adds a less-than condition combined with `or` (`{field} lt {value}`).
   """
   @spec or_filter_lt(t(), String.t() | atom(), any(), keyword()) :: t()
   def or_filter_lt(%__MODULE__{} = query, field, value, opts \\ []) do
@@ -237,8 +250,7 @@ defmodule Creatio.OData.Query do
   """
   @spec filter_contains(t(), String.t() | atom(), any()) :: t()
   def filter_contains(%__MODULE__{} = query, field, value) do
-    escaped = String.replace(to_string(value), "'", "''")
-    and_filter(query, "contains(#{field},'#{escaped}')")
+    and_filter(query, "contains(#{field},'#{escape_single_quotes(value)}')")
   end
 
   @doc """
@@ -246,8 +258,7 @@ defmodule Creatio.OData.Query do
   """
   @spec or_filter_contains(t(), String.t() | atom(), any()) :: t()
   def or_filter_contains(%__MODULE__{} = query, field, value) do
-    escaped = String.replace(to_string(value), "'", "''")
-    or_filter(query, "contains(#{field},'#{escaped}')")
+    or_filter(query, "contains(#{field},'#{escape_single_quotes(value)}')")
   end
 
   @doc """
@@ -255,8 +266,7 @@ defmodule Creatio.OData.Query do
   """
   @spec filter_startswith(t(), String.t() | atom(), any()) :: t()
   def filter_startswith(%__MODULE__{} = query, field, value) do
-    escaped = String.replace(to_string(value), "'", "''")
-    and_filter(query, "startswith(#{field},'#{escaped}')")
+    and_filter(query, "startswith(#{field},'#{escape_single_quotes(value)}')")
   end
 
   @doc """
@@ -264,8 +274,7 @@ defmodule Creatio.OData.Query do
   """
   @spec or_filter_startswith(t(), String.t() | atom(), any()) :: t()
   def or_filter_startswith(%__MODULE__{} = query, field, value) do
-    escaped = String.replace(to_string(value), "'", "''")
-    or_filter(query, "startswith(#{field},'#{escaped}')")
+    or_filter(query, "startswith(#{field},'#{escape_single_quotes(value)}')")
   end
 
   @doc """
@@ -273,8 +282,7 @@ defmodule Creatio.OData.Query do
   """
   @spec filter_endswith(t(), String.t() | atom(), any()) :: t()
   def filter_endswith(%__MODULE__{} = query, field, value) do
-    escaped = String.replace(to_string(value), "'", "''")
-    and_filter(query, "endswith(#{field},'#{escaped}')")
+    and_filter(query, "endswith(#{field},'#{escape_single_quotes(value)}')")
   end
 
   @doc """
@@ -282,8 +290,7 @@ defmodule Creatio.OData.Query do
   """
   @spec or_filter_endswith(t(), String.t() | atom(), any()) :: t()
   def or_filter_endswith(%__MODULE__{} = query, field, value) do
-    escaped = String.replace(to_string(value), "'", "''")
-    or_filter(query, "endswith(#{field},'#{escaped}')")
+    or_filter(query, "endswith(#{field},'#{escape_single_quotes(value)}')")
   end
 
   @doc """
@@ -297,8 +304,7 @@ defmodule Creatio.OData.Query do
         ) :: t()
   def filter_day(%__MODULE__{} = query, field, day_value, op \\ "eq") do
     op_str = validate_comparison_op!(op)
-    day = extract_day(day_value)
-    and_filter(query, "day(#{field}) #{op_str} #{day}")
+    and_filter(query, "day(#{field}) #{op_str} #{extract_day_number(day_value)}")
   end
 
   @doc """
@@ -312,14 +318,13 @@ defmodule Creatio.OData.Query do
         ) :: t()
   def or_filter_day(%__MODULE__{} = query, field, day_value, op \\ "eq") do
     op_str = validate_comparison_op!(op)
-    day = extract_day(day_value)
-    or_filter(query, "day(#{field}) #{op_str} #{day}")
+    or_filter(query, "day(#{field}) #{op_str} #{extract_day_number(day_value)}")
   end
 
   @doc """
   Adds an OData `length` string function condition (`length({field}) {op} {value}`).
   """
-  @spec filter_length(t(), String.t() | atom(), any(), String.t()) :: t()
+  @spec filter_length(t(), String.t() | atom(), any(), String.t() | atom()) :: t()
   def filter_length(%__MODULE__{} = query, field, len_value, op \\ "eq") do
     and_filter(query, "length(#{field}) #{op} #{len_value}")
   end
@@ -327,7 +332,7 @@ defmodule Creatio.OData.Query do
   @doc """
   Adds an OData `length` string function condition combined with `or` (`length({field}) {op} {value}`).
   """
-  @spec or_filter_length(t(), String.t() | atom(), any(), String.t()) :: t()
+  @spec or_filter_length(t(), String.t() | atom(), any(), String.t() | atom()) :: t()
   def or_filter_length(%__MODULE__{} = query, field, len_value, op \\ "eq") do
     or_filter(query, "length(#{field}) #{op} #{len_value}")
   end
@@ -337,10 +342,12 @@ defmodule Creatio.OData.Query do
   """
   @spec filter_not(t(), String.t() | nil) :: t()
   def filter_not(query, expr \\ nil)
-  def filter_not(%__MODULE__{filter: nil} = query, nil), do: query
 
-  def filter_not(%__MODULE__{filter: current} = query, nil) do
-    %{query | filter: "not (#{current})"}
+  def filter_not(%__MODULE__{} = query, nil) do
+    case compile_filter(query) do
+      nil -> query
+      current -> %__MODULE__{query | filter: nil, filters_rev: ["not (#{current})"]}
+    end
   end
 
   def filter_not(%__MODULE__{} = query, expr) when is_binary(expr) do
@@ -359,15 +366,9 @@ defmodule Creatio.OData.Query do
   @spec filter_in(t(), String.t() | atom(), [any()], keyword()) :: t()
   def filter_in(%__MODULE__{} = query, field, values, opts \\ []) do
     case build_in_conditions(field, values, opts) do
-      [] ->
-        # No values matching
-        and_filter(query, "1 eq 0")
-
-      [single] ->
-        and_filter(query, single)
-
-      multiple ->
-        and_filter(query, "(#{Enum.join(multiple, " or ")})")
+      [] -> and_filter(query, "1 eq 0")
+      [single] -> and_filter(query, single)
+      multiple -> and_filter(query, "(#{Enum.join(multiple, " or ")})")
     end
   end
 
@@ -377,14 +378,9 @@ defmodule Creatio.OData.Query do
   @spec or_filter_in(t(), String.t() | atom(), [any()], keyword()) :: t()
   def or_filter_in(%__MODULE__{} = query, field, values, opts \\ []) do
     case build_in_conditions(field, values, opts) do
-      [] ->
-        if is_nil(query.filter), do: or_filter(query, "1 eq 0"), else: query
-
-      [single] ->
-        or_filter(query, single)
-
-      multiple ->
-        or_filter(query, "(#{Enum.join(multiple, " or ")})")
+      [] -> if(compile_filter(query) == nil, do: and_filter(query, "1 eq 0"), else: query)
+      [single] -> or_filter(query, single)
+      multiple -> or_filter(query, "(#{Enum.join(multiple, " or ")})")
     end
   end
 
@@ -394,7 +390,8 @@ defmodule Creatio.OData.Query do
   """
   @spec filter_in_ids(t(), String.t() | atom(), [any()], keyword()) :: t()
   def filter_in_ids(%__MODULE__{} = query, field, ids, opts \\ []) when is_list(ids) do
-    filter_in(query, field, ids, Keyword.merge([guid: true, quoted: false], opts))
+    cleaned = Enum.map(ids, &format_guid_literal(&1, opts))
+    filter_in(query, field, cleaned, Keyword.put(opts, :quoted, false))
   end
 
   @doc """
@@ -404,8 +401,7 @@ defmodule Creatio.OData.Query do
   """
   @spec filter_guid(t(), String.t() | atom(), any(), keyword()) :: t()
   def filter_guid(%__MODULE__{} = query, field, guid, opts \\ []) do
-    formatted = format_guid_literal(guid, opts)
-    and_filter(query, "#{field} eq #{formatted}")
+    and_filter(query, "#{field} eq #{format_guid_literal(guid, opts)}")
   end
 
   @doc """
@@ -413,8 +409,7 @@ defmodule Creatio.OData.Query do
   """
   @spec or_filter_guid(t(), String.t() | atom(), any(), keyword()) :: t()
   def or_filter_guid(%__MODULE__{} = query, field, guid, opts \\ []) do
-    formatted = format_guid_literal(guid, opts)
-    or_filter(query, "#{field} eq #{formatted}")
+    or_filter(query, "#{field} eq #{format_guid_literal(guid, opts)}")
   end
 
   # ---------------------------------------------------------------------------
@@ -428,34 +423,21 @@ defmodule Creatio.OData.Query do
   """
   @spec order_by(t(), [String.t() | atom() | tuple()] | String.t() | atom()) :: t()
   def order_by(%__MODULE__{} = query, order_expr) when is_list(order_expr) do
-    formatted =
-      Enum.map(order_expr, fn
-        {col, dir} -> "#{col} #{dir}"
-        col -> to_string(col)
+    acc = seed_list_rev(query.orderby_rev, query.orderby, false)
+
+    next_rev =
+      Enum.reduce(order_expr, acc, fn
+        {col, dir}, a -> ["#{col} #{dir}" | a]
+        col, a -> prepend_non_empty(to_string(col), a)
       end)
 
-    existing =
-      case query.orderby do
-        nil -> []
-        list when is_list(list) -> list
-        str when is_binary(str) -> [str]
-      end
-
-    %{query | orderby: existing ++ formatted}
+    %__MODULE__{query | orderby: nil, orderby_rev: next_rev}
   end
 
   def order_by(%__MODULE__{} = query, order_expr)
       when is_binary(order_expr) or is_atom(order_expr) do
-    str = to_string(order_expr)
-
-    existing =
-      case query.orderby do
-        nil -> []
-        list when is_list(list) -> list
-        prev when is_binary(prev) -> [prev]
-      end
-
-    %{query | orderby: existing ++ [str]}
+    acc = seed_list_rev(query.orderby_rev, query.orderby, false)
+    %__MODULE__{query | orderby: nil, orderby_rev: prepend_non_empty(to_string(order_expr), acc)}
   end
 
   @doc """
@@ -472,7 +454,7 @@ defmodule Creatio.OData.Query do
   """
   @spec top(t(), non_neg_integer()) :: t()
   def top(%__MODULE__{} = query, n) when is_integer(n) and n >= 0 do
-    %{query | top: n}
+    %__MODULE__{query | top: n}
   end
 
   @doc """
@@ -480,7 +462,7 @@ defmodule Creatio.OData.Query do
   """
   @spec skip(t(), non_neg_integer()) :: t()
   def skip(%__MODULE__{} = query, n) when is_integer(n) and n >= 0 do
-    %{query | skip: n}
+    %__MODULE__{query | skip: n}
   end
 
   @doc """
@@ -489,20 +471,13 @@ defmodule Creatio.OData.Query do
   """
   @spec expand(t(), [String.t() | atom()] | String.t() | atom()) :: t()
   def expand(%__MODULE__{} = query, nav_props) when is_list(nav_props) do
-    new_props = normalize_field_list(nav_props)
-
-    existing =
-      case query.expand do
-        nil -> []
-        list when is_list(list) -> list
-        str when is_binary(str) -> normalize_field_list([str])
-      end
-
-    %{query | expand: Enum.uniq(existing ++ new_props)}
+    acc = seed_list_rev(query.expand_rev, query.expand, true)
+    next_rev = Enum.reduce(nav_props, acc, &prepend_split_tokens(&1, &2))
+    %__MODULE__{query | expand: nil, expand_rev: next_rev}
   end
 
   def expand(%__MODULE__{} = query, nav_prop) when is_binary(nav_prop) or is_atom(nav_prop) do
-    expand(query, [to_string(nav_prop)])
+    expand(query, [nav_prop])
   end
 
   @doc """
@@ -510,7 +485,7 @@ defmodule Creatio.OData.Query do
   """
   @spec count(t(), boolean()) :: t()
   def count(%__MODULE__{} = query, enabled? \\ true) when is_boolean(enabled?) do
-    %{query | count: enabled?}
+    %__MODULE__{query | count: enabled?}
   end
 
   @doc """
@@ -518,7 +493,7 @@ defmodule Creatio.OData.Query do
   """
   @spec param(t(), String.t() | atom(), any()) :: t()
   def param(%__MODULE__{custom_params: params} = query, key, value) do
-    %{query | custom_params: Map.put(params, to_string(key), to_string(value))}
+    %__MODULE__{query | custom_params: Map.put(params, to_string(key), to_string(value))}
   end
 
   @doc """
@@ -534,176 +509,123 @@ defmodule Creatio.OData.Query do
   """
   @spec to_params(t()) :: map()
   def to_params(%__MODULE__{} = query) do
-    params = %{}
+    %{}
+    |> maybe_put_csv("$select", finalize_list(query.select_rev, query.select, true))
+    |> maybe_put_str("$filter", compile_filter(query))
+    |> maybe_put_csv("$orderby", finalize_list(query.orderby_rev, query.orderby, false))
+    |> maybe_put_str("$top", query.top && to_string(query.top))
+    |> maybe_put_str("$skip", query.skip && to_string(query.skip))
+    |> maybe_put_csv("$expand", finalize_list(query.expand_rev, query.expand, true))
+    |> maybe_put_str("$count", if(query.count, do: "true", else: nil))
+    |> Map.merge(query.custom_params)
+  end
 
-    params =
-      case query.select do
-        nil ->
-          params
+  defp compile_filter(%__MODULE__{filter: direct, filters_rev: []}) when is_binary(direct) do
+    if direct == "", do: nil, else: direct
+  end
 
-        [] ->
-          params
+  defp compile_filter(%__MODULE__{filters_rev: []}), do: nil
 
-        "" ->
-          params
-
-        list when is_list(list) ->
-          case Enum.reject(list, &(&1 in [nil, ""])) do
-            [] -> params
-            non_empty -> Map.put(params, "$select", Enum.join(non_empty, ","))
-          end
-
-        str when is_binary(str) ->
-          Map.put(params, "$select", str)
+  defp compile_filter(%__MODULE__{filter: direct, filters_rev: rev}) do
+    clauses =
+      case direct do
+        s when is_binary(s) and s != "" -> [s | Enum.reverse(rev)]
+        _ -> Enum.reverse(rev)
       end
 
-    params =
-      if query.filter && query.filter != "",
-        do: Map.put(params, "$filter", query.filter),
-        else: params
+    case clauses do
+      [single] -> single
+      many -> Enum.map_join(many, " and ", &wrap_if_contains_or/1)
+    end
+  end
 
-    params =
-      case query.orderby do
-        nil ->
-          params
+  defp wrap_if_contains_or(expr) do
+    if String.contains?(expr, " or ") and not wrapped_in_outer_parens?(expr) do
+      "(#{expr})"
+    else
+      expr
+    end
+  end
 
-        [] ->
-          params
+  # Verifies an opening '(' at byte 0 stays open until the final byte (not "(a) or (b)")
+  defp wrapped_in_outer_parens?(<<"(", rest::binary>>) do
+    paren_depth_closes_at_end?(rest, 1)
+  end
 
-        "" ->
-          params
+  defp wrapped_in_outer_parens?(_), do: false
 
-        list when is_list(list) ->
-          case Enum.reject(list, &(&1 in [nil, ""])) do
-            [] -> params
-            non_empty -> Map.put(params, "$orderby", Enum.join(non_empty, ","))
-          end
+  defp paren_depth_closes_at_end?(<<")">>, 1), do: true
+  defp paren_depth_closes_at_end?(<<")", _::binary>>, 1), do: false
 
-        str when is_binary(str) ->
-          Map.put(params, "$orderby", str)
+  defp paren_depth_closes_at_end?(<<"(", rest::binary>>, depth),
+    do: paren_depth_closes_at_end?(rest, depth + 1)
+
+  defp paren_depth_closes_at_end?(<<")", rest::binary>>, depth) when depth > 1,
+    do: paren_depth_closes_at_end?(rest, depth - 1)
+
+  defp paren_depth_closes_at_end?(<<_, rest::binary>>, depth),
+    do: paren_depth_closes_at_end?(rest, depth)
+
+  defp paren_depth_closes_at_end?(<<>>, _depth), do: false
+
+  defp seed_filter_rev(%__MODULE__{filter: direct, filters_rev: rev})
+       when is_binary(direct) and direct != "" do
+    rev ++ [direct]
+  end
+
+  defp seed_filter_rev(%__MODULE__{filters_rev: rev}), do: rev
+
+  defp seed_list_rev(rev, nil, _split_commas?), do: rev
+  defp seed_list_rev(rev, [], _split_commas?), do: rev
+  defp seed_list_rev(rev, "", _split_commas?), do: rev
+
+  defp seed_list_rev(rev, legacy, split_commas?) when is_list(legacy) do
+    seeded =
+      if split_commas? do
+        Enum.reduce(legacy, [], &prepend_split_tokens(&1, &2))
+      else
+        Enum.reduce(legacy, [], &prepend_non_empty(to_string(&1), &2))
       end
 
-    params =
-      if query.top, do: Map.put(params, "$top", to_string(query.top)), else: params
-
-    params =
-      if query.skip, do: Map.put(params, "$skip", to_string(query.skip)), else: params
-
-    params =
-      case query.expand do
-        nil ->
-          params
-
-        [] ->
-          params
-
-        "" ->
-          params
-
-        list when is_list(list) ->
-          case Enum.reject(list, &(&1 in [nil, ""])) do
-            [] -> params
-            non_empty -> Map.put(params, "$expand", Enum.join(non_empty, ","))
-          end
-
-        str when is_binary(str) ->
-          Map.put(params, "$expand", str)
-      end
-
-    params =
-      if query.count, do: Map.put(params, "$count", "true"), else: params
-
-    Map.merge(params, query.custom_params)
+    rev ++ seeded
   end
 
-  defp format_literal(nil, _opts), do: "null"
-  defp format_literal(true, _opts), do: "true"
-  defp format_literal(false, _opts), do: "false"
-
-  defp format_literal(%DateTime{} = val, opts) do
-    if Keyword.get(opts, :protocol) == :odata3 or Keyword.get(opts, :odata3, false) do
-      "datetime'#{DateTime.to_iso8601(val)}'"
-    else
-      DateTime.to_iso8601(val)
-    end
+  defp seed_list_rev(rev, legacy, split_commas?) when is_binary(legacy) do
+    seed_list_rev(rev, [legacy], split_commas?)
   end
 
-  defp format_literal(%NaiveDateTime{} = val, opts) do
-    if Keyword.get(opts, :protocol) == :odata3 or Keyword.get(opts, :odata3, false) do
-      "datetime'#{NaiveDateTime.to_iso8601(val)}'"
-    else
-      NaiveDateTime.to_iso8601(val) <> "Z"
-    end
+  defp prepend_split_tokens(item, acc) do
+    item
+    |> to_string()
+    |> String.split(",", trim: true)
+    |> Enum.reduce(acc, fn tok, a -> prepend_non_empty(String.trim(tok), a) end)
   end
 
-  defp format_literal(%Date{} = val, opts) do
-    if Keyword.get(opts, :protocol) == :odata3 or Keyword.get(opts, :odata3, false) do
-      "datetime'#{Date.to_iso8601(val)}T00:00:00'"
-    else
-      Date.to_iso8601(val)
-    end
+  defp prepend_non_empty("", acc), do: acc
+  defp prepend_non_empty(str, acc), do: [str | acc]
+
+  defp finalize_list(rev, legacy, split_commas?) do
+    rev
+    |> seed_list_rev(legacy, split_commas?)
+    |> Enum.reverse()
+    |> Enum.uniq()
   end
 
-  defp format_literal(%Time{} = val, opts) do
-    if Keyword.get(opts, :protocol) == :odata3 or Keyword.get(opts, :odata3, false) do
-      "time'#{Time.to_iso8601(val)}'"
-    else
-      Time.to_iso8601(val)
-    end
-  end
+  defp maybe_put_csv(map, _key, []), do: map
+  defp maybe_put_csv(map, key, list), do: Map.put(map, key, Enum.join(list, ","))
 
-  defp format_literal(val, opts) when is_integer(val) or is_float(val) do
-    if Keyword.get(opts, :quoted, false) do
-      "'#{val}'"
-    else
-      to_string(val)
-    end
-  end
-
-  defp format_literal(val, opts) do
-    str = to_string(val)
-
-    cond do
-      Keyword.get(opts, :guid, false) or Keyword.get(opts, :type) == :guid ->
-        format_guid_literal(val, opts)
-
-      String.starts_with?(str, "guid'") and String.ends_with?(str, "'") ->
-        str
-
-      Keyword.get(opts, :quoted, true) ->
-        escaped = String.replace(str, "'", "''")
-        "'#{escaped}'"
-
-      true ->
-        str
-    end
-  end
-
-  @valid_comparison_ops ~w(eq ne gt ge lt le)
-
-  defp normalize_field_list(fields) do
-    fields
-    |> Enum.flat_map(fn f ->
-      f
-      |> to_string()
-      |> String.split(",", trim: true)
-      |> Enum.map(&String.trim/1)
-      |> Enum.reject(&(&1 == ""))
-    end)
-  end
+  defp maybe_put_str(map, _key, nil), do: map
+  defp maybe_put_str(map, _key, ""), do: map
+  defp maybe_put_str(map, key, val), do: Map.put(map, key, val)
 
   defp build_in_conditions(field, values, opts) do
     values
     |> Enum.uniq()
-    |> Enum.map(fn val ->
-      "#{field} eq #{format_literal(val, opts)}"
-    end)
+    |> Enum.map(fn val -> "#{field} eq #{format_literal(val, opts)}" end)
   end
 
-  defp extract_day(%Date{day: day}), do: day
-  defp extract_day(%DateTime{day: day}), do: day
-  defp extract_day(%NaiveDateTime{day: day}), do: day
-  defp extract_day(day) when is_integer(day) or is_binary(day), do: day
+  defp extract_day_number(%{day: day}) when is_integer(day), do: day
+  defp extract_day_number(val), do: val
 
   defp validate_comparison_op!(op) do
     op_str = to_string(op)
@@ -716,13 +638,60 @@ defmodule Creatio.OData.Query do
     end
   end
 
-  defp format_guid_literal(guid, opts) do
-    clean = Creatio.Util.clean_guid(guid)
+  defp escape_single_quotes(val), do: val |> to_string() |> String.replace("'", "''")
 
-    if Keyword.get(opts, :protocol) == :odata3 or Keyword.get(opts, :odata3, false) do
-      "guid'#{clean}'"
-    else
-      clean
+  defp format_literal(nil, _opts), do: "null"
+  defp format_literal(true, _opts), do: "true"
+  defp format_literal(false, _opts), do: "false"
+
+  defp format_literal(%DateTime{} = val, opts) do
+    if odata3?(opts), do: "datetime'#{DateTime.to_iso8601(val)}'", else: DateTime.to_iso8601(val)
+  end
+
+  defp format_literal(%NaiveDateTime{} = val, opts) do
+    if odata3?(opts),
+      do: "datetime'#{NaiveDateTime.to_iso8601(val)}'",
+      else: NaiveDateTime.to_iso8601(val) <> "Z"
+  end
+
+  defp format_literal(%Date{} = val, opts) do
+    if odata3?(opts),
+      do: "datetime'#{Date.to_iso8601(val)}T00:00:00'",
+      else: Date.to_iso8601(val)
+  end
+
+  defp format_literal(%Time{} = val, opts) do
+    if odata3?(opts), do: "time'#{Time.to_iso8601(val)}'", else: Time.to_iso8601(val)
+  end
+
+  defp format_literal(val, opts) when is_integer(val) or is_float(val) do
+    if Keyword.get(opts, :quoted, false), do: "'#{val}'", else: to_string(val)
+  end
+
+  defp format_literal(val, opts) do
+    str = to_string(val)
+
+    cond do
+      Keyword.get(opts, :guid, false) or Keyword.get(opts, :type) == :guid ->
+        format_guid_literal(val, opts)
+
+      byte_size(str) >= 6 and String.downcase(binary_part(str, 0, 5)) == "guid'" and
+          String.ends_with?(str, "'") ->
+        "guid'#{Util.clean_guid(str)}'"
+
+      Keyword.get(opts, :quoted, true) ->
+        "'#{escape_single_quotes(str)}'"
+
+      true ->
+        str
     end
   end
+
+  defp format_guid_literal(guid, opts) do
+    clean = Util.clean_guid(guid)
+    if odata3?(opts), do: "guid'#{clean}'", else: clean
+  end
+
+  defp odata3?(opts),
+    do: Keyword.get(opts, :protocol) == :odata3 or Keyword.get(opts, :odata3, false)
 end
