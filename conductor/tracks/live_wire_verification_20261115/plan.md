@@ -2,7 +2,7 @@
 
 ## Phase 1: Live Test Harness & Configuration Safety
 - [x] Task: Document and configure live-test environment variables
-    - [x] Update `.env.example` and `README.md` with optional `CREATIO_IDENTITY_URL`, `CREATIO_CLIENT_ID`, `CREATIO_CLIENT_SECRET`, `CREATIO_LIVE_ENTITY`, `CREATIO_LIVE_ALLOW_MUTATIONS`, and `CREATIO_LIVE_STRICT` flags (and configure local `.env` from `../connect/.env.staging` with `CREATIO_READ_ONLY=true`).
+    - [x] Update `.env.example` and `README.md` with optional `CREATIO_IDENTITY_URL`, `CREATIO_CLIENT_ID`, `CREATIO_CLIENT_SECRET`, `CREATIO_LIVE_ENTITY`, `CREATIO_LIVE_ALLOW_MUTATIONS`, and `CREATIO_LIVE_STRICT` flags (and configure local `.env` with `CREATIO_READ_ONLY=true`).
     - [x] Add a live-suite setup helper (`test/support/live_helper.ex`) that skips cleanly with an explicit diagnostic reason when `CREATIO_BASE_URL` / credentials are unset or blocked by a WAF/network challenge (such as Imperva Incapsula), and enforces `read_only: true` unless `CREATIO_LIVE_ALLOW_MUTATIONS=true`.
 - [x] Task: Write live smoke-test suite under `@moduletag :live`
     - [x] Create `test/live/creatio_live_test.exs` with `@moduletag :live` verifying client construction, Forms authentication, and OAuth2 client-credentials (`login_oauth/1`, `openid_configuration/1`, `oauth_health_check/1`).
@@ -23,7 +23,7 @@
     - [x] Write `:live` tests covering `OData.create/4` and `OData.update/5` with `return: :minimal` (`204` header handling) vs `return: :representation`, `OData.update_field/6`, and `OData.delete/4`.
     - [x] Write `:live` tests for `$batch` changeset execution (`atomicityGroup`) and register deterministic `on_exit/1` record cleanup via `Creatio.LiveHelper.register_cleanup/3`.
 - [x] Task: Capture live Creatio wire findings in mock drivers and regressions
-    - [x] Probe live sandbox (`https://763309-caasa.creatio.com`) and cross-check official Postman collection / `connect` `SyncCreatio` usage. Observed Imperva Incapsula WAF HTML challenge (`/_Incapsula_Resource` HTTP `200 OK`) from this host IP and captured 4 wire discrepancies:
+    - [x] Probe live sandbox (`https://your-instance.creatio.com`) and cross-check official Postman collection / `SyncCreatio` usage. Observed Imperva Incapsula WAF HTML challenge (`/_Incapsula_Resource` HTTP `200 OK`) from this host IP and captured 4 wire discrepancies:
         1. IIS `Content-Type: text/html; charset=utf-8` (plus UTF-8 BOM) on JSON responses vs. HTTP `200` HTML WAF/login interstitials (`Creatio.Util.normalize_json_response/1`, `Creatio.Util.html_or_xml_response?/1`, and guards across `OData`, `OData3`, `Auth`, `DataService`, and `Batch`).
         2. Nested `$expand` comma corruption across parentheses in `Creatio.OData.Query.expand/2` (`split_top_level_commas/1`).
         3. `OData.create/4` `return: :minimal` (`204 No Content`) case-insensitive `OData-EntityId` / `Location` header lookup and `"Id"` extraction alongside `"@odata.id"`.

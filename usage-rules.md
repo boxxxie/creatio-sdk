@@ -28,6 +28,15 @@ Guidance for humans and coding agents using the `:creatio` Elixir SDK (`~> 1.0`)
   - Query: `Creatio.query("Contact")`, `Query.select/2`, `Query.filter_eq/4`, `Query.and_filter/2`, `Query.or_filter_eq/4`, `Query.order_by/2`, `Query.top/2`, `Query.skip/2`, `Query.expand/2`, `Query.entity/1`, `Query.get_top/1`, `Query.get_skip/1`, `Query.to_params/1`, `Query.to_query_string/1`.
   - Batch: `Creatio.batch_new(opts)`, `Batch.add_get/2..4`, `Batch.add_create/4`, `Batch.add_update/5`, `Batch.add_delete/4`, `Batch.size/1`, `Batch.requests/1`, `Batch.to_payload/1`, `Batch.to_multipart_iodata/2`, `Batch.to_multipart/2`.
 
+```elixir
+# DO: construct and inspect via public builders and accessors
+q = Creatio.query("Contact") |> Creatio.OData.Query.select(["Id", "Name"]) |> Creatio.OData.Query.top(25)
+entity = Creatio.OData.Query.entity(q)
+
+# DON'T: pattern-match or read internal @opaque fields
+%Creatio.OData.Query{entity: entity} = q
+```
+
 ## Calling Styles & Bang Variants
 
 - All public facade functions live in `Creatio`. Use `{:ok, result}` / `:ok` variants in application pipelines and `!` variants (`list!/3`, `get!/4`, `stream!/3`, `create!/4`, `update!/5`, `delete!/4`, `custom_service!/5`, etc.) only when raising `%Creatio.Error{}` directly is intended.
@@ -39,10 +48,24 @@ Guidance for humans and coding agents using the `:creatio` Elixir SDK (`~> 1.0`)
 - **Use `stream!/3` or `odata3_stream!/3`** when you want plain `record` maps in the stream and want a mid-stream failure to raise `%Creatio.Error{}`.
 - Prefer keyset pagination (`cursor_field: "Id"`, optional `after_cursor: last_id`) over large `:skip` offsets on big tables, and use `:max_records` when capping total streamed items.
 
+```elixir
+# DO: handle tuple results from stream/3
+client
+|> Creatio.stream(query, page_size: 200, max_records: 500)
+|> Enum.reduce_while([], fn
+  {:ok, row}, acc -> {:cont, [row | acc]}
+  {:error, err}, _acc -> {:halt, {:error, err}}
+end)
+
+# DON'T: assume stream/3 yields bare maps
+client |> Creatio.stream(query) |> Enum.map(& &1["Id"])
+```
+
 ## Binary `$value` Downloads, Uploads & `Prefer` Headers
 
 - Use `Creatio.get_field_value(client, entity, id, field, opts)` (or `odata3_get_field_value/5`) to fetch raw scalars or binary streams without automatic JSON decoding (`decode_body: false` is always enforced, even if `:req_options` passes `decode_body: true`).
 - Forward `:into` (e.g. `into: File.stream!("/path/to/file")`), `:headers`, `:req_options`, and OData query options cleanly through `get_field_value/5`.
+- When `:into` is a `Collectable` (such as `File.stream!/1`), chunk forwarding is gated to `2xx` responses (`204` returns `{:ok, nil}` without opening/writing the sink): non-`2xx` error bodies stay buffered so `4xx`/`5xx` server payloads never corrupt the target file and are preserved in `%Creatio.Error{}`. For custom 2-arity `into:` funs (`fn {:data, chunk}, {req, resp} -> ... end`), the callback itself controls status gating.
 - Upload binaries, `File.Stream`, or arbitrary `Stream` chunks via `Creatio.update_field(client, entity, id, field, data, opts)` (uses `application/octet-stream` for binary/stream bodies or `Jason.encode_to_iodata!/1` for scalar/map values).
 - Pass `return: :minimal` on `create/4`, `update/5`, or `Batch.new/1` / `Batch.add/4` to send `Prefer: return=minimal` and extract `Id` / `@odata.id` from `204` `odata-entityid` / `location` headers.
 

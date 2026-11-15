@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Field Value Transport Option Forwarding**:
   - Extended `Creatio.get_field_value/5`, `Creatio.OData.get_field_value/5`, `Creatio.odata3_get_field_value/5`, and `Creatio.OData3.get_field_value/5` to forward `:headers`, `:req_options`, and query options alongside `:into` while preserving `decode_body: false`.
 - **Opaque Builder Public Accessors & Full Facade `@spec` Coverage**:
-  - Added public accessors `Creatio.Batch.size/1`, `Creatio.Batch.requests/1`, `Creatio.OData.Query.entity/1`, `Creatio.OData.Query.get_top/1`, `Creatio.OData.Query.get_skip/1`, `Creatio.OData.Query.reset_stream_target/1`, and `Creatio.OData.Query.strip_filter_and_order/1`.
+  - Added public accessors `Creatio.Batch.size/1`, `Creatio.Batch.requests/1`, `Creatio.OData.Query.entity/1`, `Creatio.OData.Query.get_top/1`, and `Creatio.OData.Query.get_skip/1`.
   - Added explicit `@spec` annotations across every `defdelegate` in `Creatio`.
 - **`usage-rules.md` & Opt-In Live Wire Verification**:
   - Added `usage-rules.md` in the repository root and bundled it in the Hex package manifest and ExDoc extras.
