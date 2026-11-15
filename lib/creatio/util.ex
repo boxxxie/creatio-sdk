@@ -1,36 +1,40 @@
 defmodule Creatio.Util do
   @moduledoc false
 
+  alias Creatio.{Client, Error}
   alias Creatio.OData.Query
 
   @max_creatio_page_size 20_000
 
   @doc """
-  Sanitizes a GUID string by removing braces, quotes, `guid'...'` wrappers, and whitespace.
+  Sanitizes a GUID string case-insensitively by removing `guid'...'`, braces, quotes, and whitespace.
   """
-  @spec clean_guid(String.t() | atom()) :: String.t()
+  @spec clean_guid(any()) :: String.t()
   def clean_guid(guid) do
-    str =
-      guid
-      |> to_string()
-      |> String.trim()
+    trimmed = guid |> to_string() |> String.trim()
 
-    str =
-      if Regex.match?(~r/^guid'/i, str) do
-        str
-        |> then(&Regex.replace(~r/^guid'/i, &1, ""))
+    unprefixed =
+      if byte_size(trimmed) >= 5 and String.downcase(binary_part(trimmed, 0, 5)) == "guid'" do
+        trimmed
+        |> binary_part(5, byte_size(trimmed) - 5)
         |> String.replace_suffix("'", "")
       else
-        str
+        trimmed
       end
 
-    str
+    unprefixed
     |> String.replace_prefix("{", "")
     |> String.replace_suffix("}", "")
     |> String.replace_prefix("'", "")
     |> String.replace_suffix("'", "")
     |> String.trim()
   end
+
+  @doc """
+  Wraps an exception or preserves an existing `%Creatio.Error{}` into `{:error, %Creatio.Error{}}`.
+  """
+  @spec wrap_error(any()) :: {:error, Error.t()}
+  def wrap_error(error_or_exception), do: Error.wrap_error(error_or_exception)
 
   @doc """
   Retrieves an option from a keyword list or map by atom or string key.
@@ -137,23 +141,37 @@ defmodule Creatio.Util do
   end
 
   @doc """
-  Shared lazy pagination stream for OData 4 and OData 3 collections.
+  Shared lazy pagination stream supporting both `$skip` offset pagination and `$skip`-free
+  keyset pagination (`cursor_field: "Id"`, `after_cursor: "..."`).
   """
   @spec paginate_stream(
-          Creatio.Client.t(),
+          Client.t() | Req.Request.t(),
           String.t() | Query.t(),
-          keyword(),
-          (Creatio.Client.t(), String.t() | Query.t(), keyword() ->
-             {:ok, list() | map()} | {:error, Creatio.Error.t()})
+          keyword() | map(),
+          atom(),
+          (Client.t(), String.t() | Query.t(), keyword() ->
+             {:ok, list() | map()} | {:error, Error.t()})
         ) :: Enumerable.t()
-  def paginate_stream(client, entity_or_query, opts, list_fun) do
-    page_size = opts |> Keyword.get(:page_size, 100) |> parse_non_neg_int(100) |> max(1)
-    base_opts = Keyword.drop(opts, [:page_size, :top, :skip, :count])
+  def paginate_stream(client_or_req, entity_or_query, opts, protocol \\ :odata4, list_fun) do
+    # Resolve %Req.Request{} -> %Client{} once up front instead of once per page
+    client = Client.ensure_client(client_or_req)
+    opts_kw = if is_map(opts), do: Map.to_list(opts), else: opts
+
+    page_size = opts_kw |> Keyword.get(:page_size, 100) |> parse_non_neg_int(100) |> max(1)
+    cursor_field = opts_kw |> Keyword.get(:cursor_field) |> then(&(&1 && to_string(&1)))
+    after_cursor = Keyword.get(opts_kw, :after_cursor)
+
+    max_records =
+      case {Keyword.get(opts_kw, :max_records), entity_or_query} do
+        {n, _} when is_integer(n) and n >= 0 -> n
+        {nil, %Query{top: n}} when is_integer(n) and n >= 0 -> n
+        _ -> nil
+      end
 
     initial_skip =
       cond do
-        Keyword.has_key?(opts, :skip) ->
-          opts |> Keyword.get(:skip, 0) |> parse_non_neg_int(0)
+        Keyword.has_key?(opts_kw, :skip) ->
+          opts_kw |> Keyword.get(:skip, 0) |> parse_non_neg_int(0)
 
         match?(%Query{skip: s} when is_integer(s) and s >= 0, entity_or_query) ->
           entity_or_query.skip
@@ -162,36 +180,61 @@ defmodule Creatio.Util do
           0
       end
 
-    initial_remaining =
-      case entity_or_query do
-        %Query{top: t} when is_integer(t) and t >= 0 -> t
-        _ -> nil
-      end
+    base_opts =
+      Keyword.drop(opts_kw, [
+        :page_size,
+        :top,
+        :skip,
+        :count,
+        :cursor_field,
+        :after_cursor,
+        :max_records
+      ])
 
-    cleaned_entity_or_query =
+    base_target =
       case entity_or_query do
-        %Query{} = q -> %{q | count: false, top: nil, skip: nil}
-        other -> other
+        %Query{} = q -> %Query{q | count: false, top: nil, skip: nil}
+        entity -> entity
       end
 
     Stream.resource(
-      fn -> {initial_skip, initial_remaining, initial_remaining == 0} end,
+      fn ->
+        %{
+          offset: initial_skip,
+          cursor: after_cursor,
+          remaining: max_records,
+          halt?: max_records == 0
+        }
+      end,
       fn
-        {_offset, _remaining, true} ->
+        %{halt?: true} ->
           {:halt, nil}
 
-        {offset, remaining, false} ->
-          req_top =
-            if is_integer(remaining), do: min(page_size, remaining), else: page_size
+        %{remaining: 0} ->
+          {:halt, nil}
+
+        state ->
+          fetch_size =
+            case state.remaining do
+              nil -> page_size
+              rem -> min(page_size, rem)
+            end
 
           page_opts =
-            base_opts
-            |> Keyword.put(:top, req_top)
-            |> Keyword.put(:skip, offset)
+            build_stream_page_opts(
+              base_opts,
+              base_target,
+              fetch_size,
+              cursor_field,
+              state,
+              protocol
+            )
 
-          case list_fun.(client, cleaned_entity_or_query, page_opts) do
+          target = strip_query_filter_if_overridden(base_target, cursor_field)
+
+          case list_fun.(client, target, page_opts) do
             {:ok, records} when is_list(records) ->
-              emit_stream_page(records, false, offset, req_top, remaining)
+              emit_stream_page(records, false, fetch_size, cursor_field, state)
 
             {:ok, %{records: records} = meta} when is_list(records) ->
               has_next? =
@@ -199,12 +242,10 @@ defmodule Creatio.Util do
                   (Map.has_key?(meta[:raw], "@odata.nextLink") or
                      Map.has_key?(meta[:raw], "__next"))
 
-              emit_stream_page(records, has_next?, offset, req_top, remaining)
+              emit_stream_page(records, has_next?, fetch_size, cursor_field, state)
 
             {:ok, other} ->
-              raise Creatio.Error.new(
-                      message: "Unexpected stream page response: #{inspect(other)}"
-                    )
+              raise Error.new(message: "Unexpected stream page response: #{inspect(other)}")
 
             {:error, error} ->
               raise error
@@ -214,13 +255,54 @@ defmodule Creatio.Util do
     )
   end
 
-  defp emit_stream_page([], _has_next?, _offset, _req_top, _remaining), do: {:halt, nil}
+  defp build_stream_page_opts(base_opts, _base_target, fetch_size, nil, state, _protocol) do
+    base_opts
+    |> Keyword.put(:top, fetch_size)
+    |> Keyword.put(:skip, state.offset)
+  end
 
-  defp emit_stream_page(records, has_next?, offset, req_top, remaining) do
+  defp build_stream_page_opts(base_opts, base_target, fetch_size, cursor_field, state, protocol) do
+    base_filter =
+      case base_target do
+        %Query{} = q -> Query.to_params(q)["$filter"] || Keyword.get(base_opts, :filter)
+        _ -> Keyword.get(base_opts, :filter)
+      end
+
+    combined_filter =
+      case {base_filter, state.cursor} do
+        {f, nil} ->
+          f
+
+        {nil, cur} ->
+          "#{cursor_field} gt #{format_cursor(cur, protocol)}"
+
+        {"", cur} ->
+          "#{cursor_field} gt #{format_cursor(cur, protocol)}"
+
+        {f, cur} ->
+          "(#{f}) and (#{cursor_field} gt #{format_cursor(cur, protocol)})"
+      end
+
+    base_opts
+    |> Keyword.put(:top, fetch_size)
+    |> Keyword.put(:orderby, "#{cursor_field} asc")
+    |> maybe_put_kw(:filter, combined_filter)
+  end
+
+  defp strip_query_filter_if_overridden(%Query{} = q, cursor_field)
+       when is_binary(cursor_field) do
+    %Query{q | filter: nil, filters_rev: [], orderby: nil, orderby_rev: []}
+  end
+
+  defp strip_query_filter_if_overridden(other, _cursor_field), do: other
+
+  defp emit_stream_page([], _has_next?, _fetch_size, _cursor_field, _state), do: {:halt, nil}
+
+  defp emit_stream_page(records, has_next?, fetch_size, cursor_field, state) do
     {emitted, next_remaining, cap_reached?} =
-      if is_integer(remaining) do
-        sliced = Enum.take(records, remaining)
-        new_rem = remaining - length(sliced)
+      if is_integer(state.remaining) do
+        sliced = Enum.take(records, state.remaining)
+        new_rem = state.remaining - length(sliced)
         {sliced, new_rem, new_rem <= 0}
       else
         {records, nil, false}
@@ -228,12 +310,44 @@ defmodule Creatio.Util do
 
     len = length(emitted)
 
-    done? =
-      cap_reached? or
-        (not has_next? and len < req_top and req_top <= @max_creatio_page_size)
+    if len == 0 do
+      {:halt, nil}
+    else
+      next_cursor = cursor_field && Map.get(List.last(emitted), cursor_field)
 
-    {emitted, {offset + len, next_remaining, done?}}
+      done? =
+        cap_reached? or
+          (cursor_field != nil and is_nil(next_cursor)) or
+          (not has_next? and len < fetch_size and fetch_size <= @max_creatio_page_size)
+
+      {emitted,
+       %{
+         offset: state.offset + len,
+         cursor: next_cursor,
+         remaining: next_remaining,
+         halt?: done?
+       }}
+    end
   end
+
+  defp format_cursor(val, protocol) when is_binary(val) do
+    cleaned = clean_guid(val)
+
+    if uuid_like?(cleaned) do
+      if protocol == :odata3, do: "guid'#{cleaned}'", else: cleaned
+    else
+      "'#{String.replace(val, "'", "''")}'"
+    end
+  end
+
+  defp format_cursor(val, _protocol), do: to_string(val)
+
+  defp uuid_like?(bin) when byte_size(bin) == 36 do
+    binary_part(bin, 8, 1) == "-" and binary_part(bin, 13, 1) == "-" and
+      binary_part(bin, 18, 1) == "-" and binary_part(bin, 23, 1) == "-"
+  end
+
+  defp uuid_like?(_), do: false
 
   defp parse_non_neg_int(val, _default) when is_integer(val) and val >= 0, do: val
 
@@ -245,4 +359,8 @@ defmodule Creatio.Util do
   end
 
   defp parse_non_neg_int(_, default), do: default
+
+  defp maybe_put_kw(kw, _k, nil), do: Keyword.delete(kw, :filter)
+  defp maybe_put_kw(kw, _k, ""), do: Keyword.delete(kw, :filter)
+  defp maybe_put_kw(kw, k, v), do: Keyword.put(kw, k, v)
 end

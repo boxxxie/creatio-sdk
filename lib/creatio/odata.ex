@@ -8,7 +8,7 @@ defmodule Creatio.OData do
   alias Creatio.{Batch, Client, Error, Util}
   alias Creatio.OData.Query
 
-  @default_content_type "application/json; odata=verbose; IEEE754Compatible=true"
+  @default_content_type "application/json; odata.metadata=minimal; IEEE754Compatible=true"
 
   @doc """
   Queries an entity collection (`GET /0/odata/{Entity}`).
@@ -305,16 +305,29 @@ defmodule Creatio.OData do
   end
 
   @doc """
-  Retrieves the raw scalar or stream value of a field (`GET /0/odata/{Entity}({id})/{Field}/$value`).
+  Retrieves the raw scalar or binary stream value of a field (`GET /0/odata/{Entity}({id})/{Field}/$value`).
+
+  Pass `into: File.stream!("/path/to/file")` to stream large attachments directly to disk
+  without buffering in memory.
   """
-  @spec get_field_value(Client.t() | Req.Request.t(), String.t(), String.t(), String.t()) ::
-          {:ok, binary() | nil} | {:error, Error.t()}
-  def get_field_value(client_or_req, entity, id, field_name) do
+  @spec get_field_value(
+          Client.t() | Req.Request.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          keyword()
+        ) ::
+          {:ok, any()} | {:error, Error.t()}
+  def get_field_value(client_or_req, entity, id, field_name, opts \\ []) do
     client = Client.ensure_client(client_or_req)
     clean = clean_id(id)
     url = "/0/odata/#{entity}(#{clean})/#{field_name}/$value"
 
-    case Req.get(client.req, url: url) do
+    req_opts =
+      [url: url, decode_body: false]
+      |> maybe_put_into(Keyword.get(opts, :into))
+
+    case Req.get(client.req, req_opts) do
       {:ok, %{status: 204}} ->
         {:ok, nil}
 
@@ -329,13 +342,22 @@ defmodule Creatio.OData do
     end
   end
 
+  defp maybe_put_into(req_opts, nil), do: req_opts
+  defp maybe_put_into(req_opts, into_sink), do: Keyword.put(req_opts, :into, into_sink)
+
   @doc """
-  Same as `get_field_value/4`, but raises `Creatio.Error` on failure.
+  Same as `get_field_value/5`, but raises `Creatio.Error` on failure.
   """
-  @spec get_field_value!(Client.t() | Req.Request.t(), String.t(), String.t(), String.t()) ::
-          binary() | nil
-  def get_field_value!(client, entity, id, field_name) do
-    case get_field_value(client, entity, id, field_name) do
+  @spec get_field_value!(
+          Client.t() | Req.Request.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          keyword()
+        ) ::
+          any()
+  def get_field_value!(client, entity, id, field_name, opts \\ []) do
+    case get_field_value(client, entity, id, field_name, opts) do
       {:ok, result} -> result
       {:error, error} -> raise error
     end
@@ -438,6 +460,11 @@ defmodule Creatio.OData do
 
   @doc """
   Creates a new entity record (`POST /0/odata/{Entity}`).
+
+  ## Options
+
+    * `:return` - `:minimal` or `:representation`. Pass `return: :minimal` to send
+      `Prefer: return=minimal` and avoid echoing all columns back from Creatio.
   """
   @spec create(Client.t() | Req.Request.t(), String.t(), map(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
@@ -453,18 +480,20 @@ defmodule Creatio.OData do
        )}
     else
       url = "/0/odata/#{entity}"
+      {return_pref, query_opts} = pop_opt(opts, :return)
 
       req =
         client.req
         |> Req.Request.put_header("content-type", @default_content_type)
-        |> Req.Request.put_header("forceusesession", "true")
+        |> maybe_put_return_prefer(return_pref)
 
-      case Req.post(req, url: url, json: attrs, params: normalize_params(opts)) do
-        {:ok, %{status: 201, body: body}} ->
+      case Req.post(req, url: url, json: attrs, params: normalize_params(query_opts)) do
+        {:ok, %{status: status, body: body}} when status in [200, 201] ->
           {:ok, body}
 
-        {:ok, %{status: 200, body: body}} ->
-          {:ok, body}
+        {:ok, %{status: 204, headers: headers}} ->
+          entity_id = List.first(headers["odata-entityid"] || headers["location"] || [])
+          {:ok, if(entity_id, do: %{"@odata.id" => entity_id}, else: %{})}
 
         {:ok, %Req.Response{} = resp} ->
           {:error, Error.from_response(resp)}
@@ -488,6 +517,10 @@ defmodule Creatio.OData do
 
   @doc """
   Updates an existing entity record (`PATCH /0/odata/{Entity}({id})`).
+
+  ## Options
+
+    * `:return` - `:minimal` or `:representation` (`Prefer: return=minimal` / `return=representation`).
   """
   @spec update(Client.t() | Req.Request.t(), String.t(), String.t(), map(), keyword()) ::
           :ok | {:ok, map()} | {:error, Error.t()}
@@ -504,13 +537,14 @@ defmodule Creatio.OData do
     else
       clean = clean_id(id)
       url = "/0/odata/#{entity}(#{clean})"
+      {return_pref, query_opts} = pop_opt(opts, :return)
 
       req =
         client.req
         |> Req.Request.put_header("content-type", @default_content_type)
-        |> Req.Request.put_header("forceusesession", "true")
+        |> maybe_put_return_prefer(return_pref)
 
-      case Req.patch(req, url: url, json: attrs, params: normalize_params(opts)) do
+      case Req.patch(req, url: url, json: attrs, params: normalize_params(query_opts)) do
         {:ok, %{status: 204}} ->
           :ok
 
@@ -558,11 +592,7 @@ defmodule Creatio.OData do
       clean = clean_id(id)
       url = "/0/odata/#{entity}(#{clean})"
 
-      req =
-        client.req
-        |> Req.Request.put_header("forceusesession", "true")
-
-      case Req.delete(req, url: url, params: normalize_params(opts)) do
+      case Req.delete(client.req, url: url, params: normalize_params(opts)) do
         {:ok, %{status: 204}} ->
           :ok
 
@@ -623,7 +653,6 @@ defmodule Creatio.OData do
         client.req
         |> Req.Request.put_header("accept", "application/json; text/plain; */*")
         |> Req.Request.put_header("content-type", content_type)
-        |> Req.Request.put_header("forceusesession", "true")
 
       case Req.put(req, url: url, body: body_payload) do
         {:ok, %{status: status}} when status in [200, 201, 204] ->
@@ -639,13 +668,18 @@ defmodule Creatio.OData do
   end
 
   defp encode_field_payload(value, _opts)
+       when is_struct(value, File.Stream) or is_struct(value, Stream) or is_function(value, 2) do
+    {value, "application/octet-stream; IEEE754Compatible=true"}
+  end
+
+  defp encode_field_payload(value, _opts)
        when is_map(value) or (is_list(value) and not is_nil(value)) do
-    {Jason.encode!(value), "application/json; IEEE754Compatible=true"}
+    {Jason.encode_to_iodata!(value), "application/json; IEEE754Compatible=true"}
   end
 
   defp encode_field_payload(value, _opts)
        when is_boolean(value) or is_number(value) or is_atom(value) do
-    {Jason.encode!(%{"value" => value}), "application/json; IEEE754Compatible=true"}
+    {Jason.encode_to_iodata!(%{"value" => value}), "application/json; IEEE754Compatible=true"}
   end
 
   defp encode_field_payload(value, opts) when is_binary(value) do
@@ -656,7 +690,7 @@ defmodule Creatio.OData do
         {value, explicit_ct}
 
       String.valid?(value) ->
-        {Jason.encode!(%{"value" => value}), "application/json; IEEE754Compatible=true"}
+        {Jason.encode_to_iodata!(%{"value" => value}), "application/json; IEEE754Compatible=true"}
 
       true ->
         {value, "application/octet-stream; IEEE754Compatible=true"}
@@ -711,7 +745,6 @@ defmodule Creatio.OData do
           "content-type",
           "application/octet-stream; IEEE754Compatible=true"
         )
-        |> Req.Request.put_header("forceusesession", "true")
 
       case Req.delete(req, url: url, params: normalize_params(opts)) do
         {:ok, %{status: 204}} ->
@@ -765,11 +798,17 @@ defmodule Creatio.OData do
   @doc """
   Returns a lazy `Stream` that paginates through records of the given entity or query.
 
+  Supports both offset (`$top`/`$skip`) and keyset/cursor pagination (`cursor_field: "Id"`).
+
   ## Options
 
     * `:page_size` - Number of records per page (default: 100).
     * `:skip` - Initial offset to begin streaming from (default: 0).
-    * `:top` - Maximum total number of records to stream when passed explicitly (or via `Query.top/2`).
+    * `:cursor_field` - Field name (e.g. `"Id"`) to switch from `$skip` offset pagination to
+      `$orderby={field} asc` + `$filter={field} gt {cursor}` keyset pagination.
+    * `:after_cursor` - Initial cursor value to resume keyset pagination from.
+    * `:max_records` - Maximum total number of records to stream.
+    * `:top` - Maximum total number of records to stream when set via `Query.top/2`.
     * `:select` - Fields to select.
     * `:filter` - Filter expression.
     * `:orderby` - Ordering expression.
@@ -794,9 +833,19 @@ defmodule Creatio.OData do
   end
 
   def stream(client_or_req, entity_or_query, opts) do
-    client = Client.ensure_client(client_or_req)
-    Util.paginate_stream(client, entity_or_query, opts, &list/3)
+    Util.paginate_stream(client_or_req, entity_or_query, opts, :odata4, &list/3)
   end
+
+  defp pop_opt(opts, key) when is_list(opts), do: Keyword.pop(opts, key)
+  defp pop_opt(opts, key) when is_map(opts), do: Map.pop(opts, key)
+
+  defp maybe_put_return_prefer(req, :minimal),
+    do: Req.Request.put_header(req, "prefer", "return=minimal")
+
+  defp maybe_put_return_prefer(req, :representation),
+    do: Req.Request.put_header(req, "prefer", "return=representation")
+
+  defp maybe_put_return_prefer(req, _), do: req
 
   defp normalize_params(opts) do
     Util.normalize_odata_params(opts, %{}, {"$count", "true"})

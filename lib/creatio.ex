@@ -123,6 +123,11 @@ defmodule Creatio do
   def batch_new(opts \\ []), do: Batch.new(opts)
 
   @doc """
+  Serializes a batch to `{boundary, iodata}` without intermediate binary copying.
+  """
+  defdelegate batch_to_multipart_iodata(batch, opts \\ []), to: Batch, as: :to_multipart_iodata
+
+  @doc """
   Serializes a batch to a multipart/mixed MIME body string. Returns `{boundary, body}`.
   """
   defdelegate batch_to_multipart(batch, opts \\ []), to: Batch, as: :to_multipart
@@ -261,12 +266,12 @@ defmodule Creatio do
   @doc """
   Retrieves raw scalar/stream value (`GET /0/odata/{Entity}({id})/{Field}/$value`).
   """
-  defdelegate get_field_value(client, entity, id, field_name), to: OData
+  defdelegate get_field_value(client, entity, id, field_name, opts \\ []), to: OData
 
   @doc """
-  Same as `get_field_value/4`, raising `Creatio.Error` on failure.
+  Same as `get_field_value/5`, raising `Creatio.Error` on failure.
   """
-  defdelegate get_field_value!(client, entity, id, field_name), to: OData
+  defdelegate get_field_value!(client, entity, id, field_name, opts \\ []), to: OData
 
   @doc """
   Gets total count of an entity collection (`GET /0/odata/{Entity}/$count`).
@@ -539,14 +544,14 @@ defmodule Creatio do
   @doc """
   Retrieves raw scalar/stream value in OData 3.
   """
-  defdelegate odata3_get_field_value(client, entity, id, field_name),
+  defdelegate odata3_get_field_value(client, entity, id, field_name, opts \\ []),
     to: OData3,
     as: :get_field_value
 
   @doc """
-  Same as `odata3_get_field_value/4`, raising `Creatio.Error` on failure.
+  Same as `odata3_get_field_value/5`, raising `Creatio.Error` on failure.
   """
-  defdelegate odata3_get_field_value!(client, entity, id, field_name),
+  defdelegate odata3_get_field_value!(client, entity, id, field_name, opts \\ []),
     to: OData3,
     as: :get_field_value!
 

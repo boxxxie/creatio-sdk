@@ -68,10 +68,7 @@ defmodule Creatio.OData3 do
     collection_name = collection_name(entity)
     url = "#{@base_path}/#{collection_name}"
 
-    req =
-      client.req
-      |> Req.Request.put_header("accept", "application/json; odata=verbose")
-      |> Req.Request.put_header("forceusesession", "true")
+    req = Req.Request.put_header(client.req, "accept", "application/json; odata=verbose")
 
     case Req.get(req, url: url, params: params) do
       {:ok, %{status: 200, body: %{"d" => %{"results" => records} = d_map}}} ->
@@ -135,10 +132,7 @@ defmodule Creatio.OData3 do
     url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')"
     params = normalize_params(opts)
 
-    req =
-      client.req
-      |> Req.Request.put_header("accept", "application/json; odata=verbose")
-      |> Req.Request.put_header("forceusesession", "true")
+    req = Req.Request.put_header(client.req, "accept", "application/json; odata=verbose")
 
     case Req.get(req, url: url, params: params) do
       {:ok, %{status: 200, body: %{"d" => record}}} ->
@@ -184,10 +178,7 @@ defmodule Creatio.OData3 do
     url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')/#{nav_property}"
     params = normalize_params(opts)
 
-    req =
-      client.req
-      |> Req.Request.put_header("accept", "application/json; odata=verbose")
-      |> Req.Request.put_header("forceusesession", "true")
+    req = Req.Request.put_header(client.req, "accept", "application/json; odata=verbose")
 
     case Req.get(req, url: url, params: params) do
       {:ok, %{status: 204}} ->
@@ -239,10 +230,7 @@ defmodule Creatio.OData3 do
     url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')/#{field_name}"
     params = normalize_params(opts)
 
-    req =
-      client.req
-      |> Req.Request.put_header("accept", "application/json; odata=verbose")
-      |> Req.Request.put_header("forceusesession", "true")
+    req = Req.Request.put_header(client.req, "accept", "application/json; odata=verbose")
 
     case Req.get(req, url: url, params: params) do
       {:ok, %{status: 204}} ->
@@ -280,20 +268,29 @@ defmodule Creatio.OData3 do
 
   @doc """
   Retrieves raw scalar/stream value in OData 3 (`GET .../{Entity}Collection(guid'{id}')/{field_name}/$value`).
+
+  Pass `into: File.stream!("/path/to/file")` to stream large attachments directly to disk
+  without buffering in memory.
   """
-  @spec get_field_value(Client.t() | Req.Request.t(), String.t(), String.t(), String.t()) ::
-          {:ok, binary() | nil} | {:error, Error.t()}
-  def get_field_value(client_or_req, entity, id, field_name) do
+  @spec get_field_value(
+          Client.t() | Req.Request.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          keyword()
+        ) ::
+          {:ok, any()} | {:error, Error.t()}
+  def get_field_value(client_or_req, entity, id, field_name, opts \\ []) do
     client = Client.ensure_client(client_or_req)
     collection_name = collection_name(entity)
     clean_id = Util.clean_guid(id)
     url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')/#{field_name}/$value"
 
-    req =
-      client.req
-      |> Req.Request.put_header("forceusesession", "true")
+    req_opts =
+      [url: url, decode_body: false]
+      |> maybe_put_into(Keyword.get(opts, :into))
 
-    case Req.get(req, url: url) do
+    case Req.get(client.req, req_opts) do
       {:ok, %{status: 204}} ->
         {:ok, nil}
 
@@ -308,13 +305,22 @@ defmodule Creatio.OData3 do
     end
   end
 
+  defp maybe_put_into(req_opts, nil), do: req_opts
+  defp maybe_put_into(req_opts, into_sink), do: Keyword.put(req_opts, :into, into_sink)
+
   @doc """
-  Same as `get_field_value/4`, but raises `Creatio.Error` on failure.
+  Same as `get_field_value/5`, but raises `Creatio.Error` on failure.
   """
-  @spec get_field_value!(Client.t() | Req.Request.t(), String.t(), String.t(), String.t()) ::
-          binary() | nil
-  def get_field_value!(client, entity, id, field_name) do
-    case get_field_value(client, entity, id, field_name) do
+  @spec get_field_value!(
+          Client.t() | Req.Request.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          keyword()
+        ) ::
+          any()
+  def get_field_value!(client, entity, id, field_name, opts \\ []) do
+    case get_field_value(client, entity, id, field_name, opts) do
       {:ok, result} -> result
       {:error, error} -> raise error
     end
@@ -356,11 +362,7 @@ defmodule Creatio.OData3 do
         if map_size(params) > 0, do: [url: url, params: params], else: [url: url]
       end
 
-    req =
-      client.req
-      |> Req.Request.put_header("forceusesession", "true")
-
-    case Req.get(req, req_opts) do
+    case Req.get(client.req, req_opts) do
       {:ok, %{status: 200, body: body}} when is_integer(body) ->
         {:ok, body}
 
@@ -398,12 +400,18 @@ defmodule Creatio.OData3 do
   end
 
   @doc """
-  Returns a lazy `Stream` that paginates through records of an OData 3 entity collection using `$top` and `$skip`.
+  Returns a lazy `Stream` that paginates through records of an OData 3 entity collection.
+
+  Supports both offset (`$top`/`$skip`) and keyset/cursor pagination (`cursor_field: "Id"`).
 
   ## Options
 
     * `:page_size` - Records per request (default `100`).
     * `:skip` - Initial offset to begin streaming from (default: `0`).
+    * `:cursor_field` - Field name (e.g. `"Id"`) to switch from `$skip` offset pagination to
+      `$orderby={field} asc` + `$filter={field} gt guid'...'` keyset pagination.
+    * `:after_cursor` - Initial cursor value to resume keyset pagination from.
+    * `:max_records` - Maximum total number of records to stream.
     * `:select` - List or string of fields to retrieve.
     * `:filter` - Filter expression.
     * `:orderby` - Ordering expression.
@@ -427,8 +435,7 @@ defmodule Creatio.OData3 do
   end
 
   def stream(client_or_req, entity_or_query, opts) do
-    client = Client.ensure_client(client_or_req)
-    Util.paginate_stream(client, entity_or_query, opts, &list/3)
+    Util.paginate_stream(client_or_req, entity_or_query, opts, :odata3, &list/3)
   end
 
   @doc """
@@ -478,7 +485,6 @@ defmodule Creatio.OData3 do
         client.req
         |> Req.Request.put_header("content-type", "application/json; odata=verbose")
         |> Req.Request.put_header("accept", "application/json; odata=verbose")
-        |> Req.Request.put_header("forceusesession", "true")
 
       case Req.post(req, url: url, json: attrs, params: normalize_params(opts)) do
         {:ok, %{status: 201, body: %{"d" => record}}} ->
@@ -537,7 +543,6 @@ defmodule Creatio.OData3 do
         client.req
         |> Req.Request.put_header("content-type", "application/json; odata=verbose")
         |> Req.Request.put_header("accept", "application/json; odata=verbose")
-        |> Req.Request.put_header("forceusesession", "true")
 
       case Req.patch(req, url: url, json: attrs, params: normalize_params(opts)) do
         {:ok, %{status: 204}} ->
@@ -591,11 +596,7 @@ defmodule Creatio.OData3 do
       clean_id = Util.clean_guid(id)
       url = "#{@base_path}/#{collection_name}(guid'#{clean_id}')"
 
-      req =
-        client.req
-        |> Req.Request.put_header("forceusesession", "true")
-
-      case Req.delete(req, url: url, params: normalize_params(opts)) do
+      case Req.delete(client.req, url: url, params: normalize_params(opts)) do
         {:ok, %{status: 204}} ->
           :ok
 
