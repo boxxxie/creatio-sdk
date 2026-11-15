@@ -9,8 +9,16 @@ defmodule Creatio.MixProject do
       app: :creatio,
       version: @version,
       elixir: "~> 1.15",
+      elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
-      test_coverage: [summary: [threshold: 84]],
+      test_coverage: [
+        summary: [threshold: 84],
+        ignore_modules: [
+          Creatio.FeatureScenario,
+          ~r/^Creatio\.TestDSL\./,
+          ~r/^Creatio\.TestDrivers\./
+        ]
+      ],
       deps: deps(),
       description: description(),
       package: package(),
@@ -23,6 +31,9 @@ defmodule Creatio.MixProject do
       extra_applications: [:logger]
     ]
   end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
 
   defp deps do
     [
@@ -42,9 +53,10 @@ defmodule Creatio.MixProject do
   defp package do
     [
       name: "creatio",
-      maintainers: ["CAASA"],
-      files: ~w(lib .formatter.exs mix.exs README.md LICENSE),
-      licenses: ["Apache-2.0"],
+      maintainers: ["Paul Iannazzo"],
+      files:
+        ~w(lib docs/CREATIO_API_INTEGRATION.md docs/USE_CASES_SYNCING_USERS.md .formatter.exs mix.exs README.md LICENSE),
+      licenses: ["MIT"],
       links: %{"GitLab" => @source_url}
     ]
   end

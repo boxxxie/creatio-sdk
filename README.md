@@ -1,7 +1,7 @@
 # Creatio
 
 [![Hex.pm](https://img.shields.io/hexpm/v/creatio.svg)](https://hex.pm/packages/creatio)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 An idiomatic, full-featured Elixir SDK for the **Creatio CRM** (formerly bpm'online) API.
 
@@ -347,4 +347,4 @@ Comprehensive API documentation and resources are available in the `docs/` direc
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+Licensed under the MIT License. See [LICENSE](LICENSE) for details.
