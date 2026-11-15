@@ -19,19 +19,20 @@ Built on top of [Req](https://github.com/wojtekmach/req), `Creatio` provides a c
   - Enforce read-only safety at the client level (`read_only: true` or `CREATIO_READ_ONLY=true`).
   - Locally blocks mutation operations (`create`, `update`, `delete`, field mutations, mutating batches, and DataService writes) with structured 403 `ReadOnlyMode` errors.
 - **OData 4 Support** (`/0/odata/`):
-  - Collection listing with `$select`, `$filter`, `$orderby`, `$top`, `$skip`, `$expand`, and inline `$count`.
-  - CRUD operations (`create`, `get`, `update`, `delete`).
-  - Field-level operations and scalar `$value` access.
-  - Binary stream / file uploads via `PUT` with `application/octet-stream`.
-  - Composable **Query Builder** (`Creatio.OData.Query`).
-  - Lazy auto-paginated streaming (`Creatio.stream/3`) with configurable page sizes and initial `:skip` offsets.
+  - Collection listing with `$select`, `$filter`, `$orderby`, `$top`, `$skip`, `$expand`, and inline `$count` using `odata.metadata=minimal`.
+  - CRUD operations (`create`, `get`, `update`, `delete`) with `Prefer: return=minimal` / `:representation` support.
+  - Field-level operations and raw scalar/binary `$value` access with `into:` stream downloads (`decode_body: false`).
+  - Binary stream / file uploads (`File.Stream`, `Stream`, or binary) via `PUT` with `application/octet-stream`.
+  - Composable **O(1) Query Builder** (`Creatio.OData.Query`) with `OR`-precedence preservation.
+  - Lazy auto-paginated streaming (`Creatio.stream/3`) supporting both offset (`:skip`) and `$skip`-free keyset/cursor pagination (`:cursor_field`, `:after_cursor`, `:max_records`).
 - **OData 4 Batch Operations** (`/0/odata/$batch`):
-  - Full support for JSON batch requests, atomicity groups (changesets), and `Prefer: continue-on-error`.
+  - O(1) batch assembly with JSON batch and zero-copy iodata multipart/mixed MIME serialization (`batch_to_multipart_iodata/2`).
+  - Atomicity groups (changesets), `Prefer: continue-on-error`, `Prefer: return=minimal` / `:representation`, and byte-level multipart response parsing.
 - **DataService API**:
   - Direct execution of Creatio `SelectQuery` payloads.
   - Calling custom REST services (`/0/rest/...`).
 - **OData 3 Support**:
-  - Legacy `EntityDataService.svc` endpoint compatibility with streaming support.
+  - Legacy `EntityDataService.svc` endpoint compatibility with offset and keyset streaming plus `into:` field download streaming.
 - **Test-Ready**:
   - Easily mockable using standard `Req` plug options (`req_options: [plug: ...]`).
 
@@ -44,7 +45,7 @@ Add `creatio` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:creatio, "~> 0.3.1"}
+    {:creatio, "~> 0.4.0"}
   ]
 end
 ```
@@ -212,14 +213,24 @@ Creatio.stream(client, "Contact", page_size: 100, select: ["Id", "Name"])
 |> Enum.take(500)
 ```
 
-#### Resuming Streams with Initial Skip Offset
+#### Resuming Streams with Offset or Keyset Cursor Pagination
 
-`Creatio.stream/3` and `Creatio.odata3_stream/3` accept an initial `:skip` offset, making it easy to resume interrupted background syncs or stream data in partition windows:
+`Creatio.stream/3` and `Creatio.odata3_stream/3` accept an initial `:skip` offset or `:cursor_field` for `$skip`-free keyset pagination on large tables:
 
 ```elixir
-# Resume streaming from offset 1,000
+# Resume offset streaming from offset 1,000
 Creatio.stream(client, "Contact", page_size: 100, skip: 1000, select: ["Id", "Name"])
 |> Enum.take(200)
+
+# Keyset / cursor pagination (avoids deep $skip overhead)
+Creatio.stream(client, "Contact",
+  page_size: 200,
+  cursor_field: "Id",
+  after_cursor: last_synced_id,
+  max_records: 1_000,
+  select: ["Id", "Name"]
+)
+|> Enum.to_list()
 
 # Or combine directly with the Query builder
 query =
@@ -233,7 +244,7 @@ Creatio.stream(client, query, page_size: 100)
 ### CRUD Operations
 
 ```elixir
-# Create
+# Create (pass `return: :minimal` to avoid echoing all columns back)
 {:ok, new_contact} = Creatio.create(client, "Contact", %{
   "Name" => "John Doe",
   "Email" => "john.doe@example.com"
@@ -245,21 +256,26 @@ Creatio.stream(client, query, page_size: 100)
 # Update
 :ok = Creatio.update(client, "Contact", contact["Id"], %{
   "JobTitle" => "Managing Director"
-})
+}, return: :minimal)
 
 # Delete
 :ok = Creatio.delete(client, "Contact", contact["Id"])
 ```
 
-### Field & Binary Stream Uploads
+### Field & Binary Stream Uploads / Downloads
 
 ```elixir
-# Get raw scalar value
+# Get raw scalar value (returns un-decoded binary via `decode_body: false`)
 {:ok, name} = Creatio.get_field_value(client, "Contact", contact_id, "Name")
 
-# Upload binary / octet-stream (e.g. photo or document)
-binary_content = File.read!("avatar.png")
-:ok = Creatio.update_field(client, "Contact", contact_id, "Photo", binary_content)
+# Stream large attachments directly to disk without buffering in memory
+{:ok, _stream} =
+  Creatio.get_field_value(client, "SysFile", file_id, "Data",
+    into: File.stream!("/tmp/attachment.bin")
+  )
+
+# Upload binary / octet-stream (supports raw binary or File.Stream / Stream)
+:ok = Creatio.update_field(client, "Contact", contact_id, "Photo", File.stream!("avatar.png"))
 
 # Delete a field value
 :ok = Creatio.delete_field(client, "Contact", contact_id, "Photo")
@@ -273,7 +289,7 @@ Execute multiple operations in a single HTTP request using either the OData 4 JS
 
 ```elixir
 batch =
-  Creatio.batch_new(continue_on_error: true)
+  Creatio.batch_new(continue_on_error: true, return: :minimal)
   |> Creatio.Batch.add_create("Contact", %{"Name" => "Alice"}, atomicity_group: "group1")
   |> Creatio.Batch.add_update("Contact", contact_id, %{"JobTitle" => "VP"}, atomicity_group: "group1")
   |> Creatio.Batch.add_delete("Contact", old_contact_id)
@@ -337,6 +353,7 @@ Creatio.odata3_stream(client, "Contact", page_size: 100)
 
 Comprehensive API documentation and resources are available in the `docs/` directory:
 
+- [Changelog](CHANGELOG.md) — Release history and upgrade notes.
 - [Creatio API & Integration Guide](docs/CREATIO_API_INTEGRATION.md) — Authentication flows, OData 4 protocol endpoints, and entity mapping reference.
 - [Syncing Creatio Users Guide](docs/USE_CASES_SYNCING_USERS.md) — A step-by-step tutorial on building a resilient sync engine between Creatio and a local database.
 - [Postman Collection v2.0](docs/creatio_api_collection.json) — Full 1.8 MB offline Postman collection covering all Creatio endpoints (OAuth 2.0, OData 4 CRUD, streaming, batching, and OData 3).

@@ -1,7 +1,7 @@
 defmodule Creatio.MixProject do
   use Mix.Project
 
-  @version "0.3.1"
+  @version "0.4.0"
   @source_url "https://gitlab.nvestiv.com/caasa/creatio-sdk"
 
   def project do
@@ -55,7 +55,7 @@ defmodule Creatio.MixProject do
       name: "creatio",
       maintainers: ["Paul Iannazzo"],
       files:
-        ~w(lib docs/CREATIO_API_INTEGRATION.md docs/USE_CASES_SYNCING_USERS.md .formatter.exs mix.exs README.md LICENSE),
+        ~w(lib docs/CREATIO_API_INTEGRATION.md docs/USE_CASES_SYNCING_USERS.md .formatter.exs mix.exs README.md CHANGELOG.md LICENSE),
       licenses: ["MIT"],
       links: %{"GitLab" => @source_url}
     ]
@@ -64,8 +64,11 @@ defmodule Creatio.MixProject do
   defp docs do
     [
       main: "readme",
+      source_ref: "v#{@version}",
+      source_url: @source_url,
       extras: [
         "README.md",
+        "CHANGELOG.md",
         "docs/CREATIO_API_INTEGRATION.md",
         "docs/USE_CASES_SYNCING_USERS.md",
         "LICENSE"

@@ -265,6 +265,9 @@ defmodule Creatio do
 
   @doc """
   Retrieves raw scalar/stream value (`GET /0/odata/{Entity}({id})/{Field}/$value`).
+
+  Pass `into: File.stream!("/path/to/file")` to stream large attachments directly to disk
+  without buffering in memory.
   """
   defdelegate get_field_value(client, entity, id, field_name, opts \\ []), to: OData
 
@@ -285,6 +288,8 @@ defmodule Creatio do
 
   @doc """
   Creates an entity record (`POST /0/odata/{Entity}`).
+
+  Pass `return: :minimal` to send `Prefer: return=minimal` and avoid echoing all columns back.
   """
   defdelegate create(client, entity, attrs, opts \\ []), to: OData
 
@@ -295,6 +300,8 @@ defmodule Creatio do
 
   @doc """
   Updates an entity record (`PATCH /0/odata/{Entity}({id})`).
+
+  Pass `return: :minimal` or `return: :representation` to control the `Prefer` header.
   """
   defdelegate update(client, entity, id, attrs, opts \\ []), to: OData
 
@@ -346,10 +353,17 @@ defmodule Creatio do
   @doc """
   Returns a lazy `Stream` that paginates through records of an entity or query.
 
+  Supports both offset (`$top`/`$skip`) and keyset/cursor pagination (`cursor_field: "Id"`).
+
   ## Options
 
     * `:page_size` - Number of records per request (default: 100).
     * `:skip` - Initial offset to begin streaming from (default: 0).
+    * `:cursor_field` - Field name (e.g. `"Id"`) to use `$orderby={field} asc` +
+      `$filter={field} gt {cursor}` keyset pagination instead of `$skip`.
+    * `:after_cursor` - Initial cursor value to resume keyset pagination from.
+    * `:max_records` - Maximum total number of records to stream.
+    * `:top` - Maximum total number of records to stream when set via `Query.top/2`.
     * `:select` - List of fields or comma-separated string to retrieve.
     * `:filter` - OData filter expression string.
     * `:orderby` - Ordering expression string.
@@ -543,6 +557,9 @@ defmodule Creatio do
 
   @doc """
   Retrieves raw scalar/stream value in OData 3.
+
+  Pass `into: File.stream!("/path/to/file")` to stream large attachments directly to disk
+  without buffering in memory.
   """
   defdelegate odata3_get_field_value(client, entity, id, field_name, opts \\ []),
     to: OData3,
@@ -598,12 +615,17 @@ defmodule Creatio do
   @doc """
   Returns a lazy `Stream` that paginates through records of a legacy OData 3 entity collection.
 
-  Supports both client-first and pipe/query-first argument order.
+  Supports both client-first and pipe/query-first argument order, as well as offset
+  (`$top`/`$skip`) and keyset/cursor pagination (`cursor_field: "Id"`).
 
   ## Options
 
     * `:page_size` - Records per request (default: 100).
     * `:skip` - Initial offset to begin streaming from (default: 0).
+    * `:cursor_field` - Field name (e.g. `"Id"`) to switch from `$skip` offset pagination to
+      `$orderby={field} asc` + `$filter={field} gt guid'...'` keyset pagination.
+    * `:after_cursor` - Initial cursor value to resume keyset pagination from.
+    * `:max_records` - Maximum total number of records to stream.
     * `:select` - List or string of fields to retrieve.
     * `:filter` - Filter expression.
     * `:orderby` - Ordering expression.
