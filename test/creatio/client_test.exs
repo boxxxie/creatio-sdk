@@ -174,6 +174,67 @@ defmodule Creatio.ClientTest do
       assert {:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}} =
                Req.post(client.req, url: "/0/odata/Contact", json: %{})
     end
+
+    test "inspect/1 redacts secrets and client.options strips sensitive credentials" do
+      client =
+        Client.new(
+          base_url: "https://crm.test",
+          identity_service_url: "https://ids.test",
+          client_id: "public-cid",
+          client_secret: "super-secret-client-secret",
+          auth_token: "super-secret-jwt",
+          cookie: ".ASPXAUTH=secret-cookie",
+          bpmcsrf: "secret-csrf",
+          read_only: true,
+          req_options: [
+            headers: [{"authorization", "Bearer header-secret"}, {"x-safe", "visible"}],
+            auth: {:bearer, "basic-secret"},
+            receive_timeout: 5_000
+          ]
+        )
+
+      inspected = inspect(client)
+      assert inspected =~ "https://crm.test"
+      assert inspected =~ "public-cid"
+      assert inspected =~ "read_only: true"
+      refute inspected =~ "super-secret-client-secret"
+      refute inspected =~ "super-secret-jwt"
+      refute inspected =~ "secret-cookie"
+      refute inspected =~ "secret-csrf"
+      refute inspected =~ "header-secret"
+      refute inspected =~ "basic-secret"
+      refute inspected =~ "options:"
+      refute inspected =~ "req:"
+
+      refute Keyword.has_key?(client.options, :client_secret)
+      refute Keyword.has_key?(client.options, :auth_token)
+      refute Keyword.has_key?(client.options, :cookie)
+      refute Keyword.has_key?(client.options, :bpmcsrf)
+      assert client.options[:req_options] == [receive_timeout: 5_000]
+    end
+
+    test "normalizes string-keyed maps safely in new/1 and from_req/2" do
+      client =
+        Client.new(%{
+          "base_url" => "https://crm.test/",
+          "auth_token" => "tok-1",
+          "read_only" => "true",
+          "unknown_runtime_key_xyz" => "ignored"
+        })
+
+      assert client.base_url == "https://crm.test"
+      assert client.auth_token == "tok-1"
+      assert client.read_only == true
+
+      from_req_client =
+        Client.from_req(client.req, %{
+          "read_only" => false,
+          "unknown_from_req_key_xyz" => "ignored"
+        })
+
+      assert from_req_client.read_only == false
+      refute Keyword.has_key?(from_req_client.req.request_steps, :read_only_guard)
+    end
   end
 end
 
@@ -214,5 +275,30 @@ defmodule Creatio.ClientEnvTest do
 
     client_from_new = Client.new()
     assert client_from_new.base_url == "https://env.creatio.com"
+  end
+
+  test "from_req/2 ignores CREATIO_READ_ONLY env and application config" do
+    prev_env = System.get_env("CREATIO_READ_ONLY")
+    prev_app = Application.get_env(:creatio, :read_only)
+
+    on_exit(fn ->
+      if prev_env,
+        do: System.put_env("CREATIO_READ_ONLY", prev_env),
+        else: System.delete_env("CREATIO_READ_ONLY")
+
+      if prev_app != nil,
+        do: Application.put_env(:creatio, :read_only, prev_app),
+        else: Application.delete_env(:creatio, :read_only)
+    end)
+
+    System.put_env("CREATIO_READ_ONLY", "true")
+    Application.put_env(:creatio, :read_only, true)
+
+    assert Client.new(base_url: "https://crm.test").read_only == true
+
+    req = Req.new(base_url: "https://crm.test")
+    client = Client.from_req(req)
+    assert client.read_only == false
+    refute Keyword.has_key?(client.req.request_steps, :read_only_guard)
   end
 end

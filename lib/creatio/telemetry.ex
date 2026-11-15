@@ -93,8 +93,10 @@ defmodule Creatio.Telemetry do
   end
 
   @doc """
-  Executes `fun` inside a `:telemetry.span/3` for the given domain atom or prefix list,
-  sanitizing start metadata and enriching stop metadata with `:result`, `:status`, and `:error`.
+  Executes `fun` inside a telemetry span for the given domain atom or prefix list,
+  sanitizing start metadata, enriching stop and exception metadata with `:result`,
+  `:status`, and `:error`, and redacting sensitive data from raised exceptions
+  and stacktraces.
   """
   @spec span(atom() | [atom()], map(), (-> result)) :: result when result: var
   def span(domain, start_metadata, fun) when is_atom(domain) do
@@ -104,12 +106,56 @@ defmodule Creatio.Telemetry do
   def span(event_prefix, start_metadata, fun)
       when is_list(event_prefix) and is_map(start_metadata) and is_function(fun, 0) do
     sanitized_start = sanitize_metadata(start_metadata)
+    span_ctx = make_ref()
+    start_monotonic = System.monotonic_time()
 
-    :telemetry.span(event_prefix, sanitized_start, fn ->
+    :telemetry.execute(
+      event_prefix ++ [:start],
+      %{monotonic_time: start_monotonic, system_time: System.system_time()},
+      Map.put(sanitized_start, :telemetry_span_context, span_ctx)
+    )
+
+    try do
       res = fun.()
-      stop_metadata = Map.merge(sanitized_start, outcome_metadata(res))
-      {res, stop_metadata}
-    end)
+      stop_monotonic = System.monotonic_time()
+
+      stop_metadata =
+        sanitized_start
+        |> Map.merge(outcome_metadata(res))
+        |> Map.put(:telemetry_span_context, span_ctx)
+
+      :telemetry.execute(
+        event_prefix ++ [:stop],
+        %{duration: stop_monotonic - start_monotonic, monotonic_time: stop_monotonic},
+        stop_metadata
+      )
+
+      res
+    catch
+      kind, reason ->
+        stop_monotonic = System.monotonic_time()
+        sanitized_reason = sanitize_error(reason)
+
+        exception_metadata =
+          sanitized_start
+          |> Map.merge(%{
+            result: :error,
+            status: :error,
+            error: sanitized_reason,
+            kind: kind,
+            reason: sanitized_reason,
+            stacktrace: sanitize_stacktrace(__STACKTRACE__),
+            telemetry_span_context: span_ctx
+          })
+
+        :telemetry.execute(
+          event_prefix ++ [:exception],
+          %{duration: stop_monotonic - start_monotonic, monotonic_time: stop_monotonic},
+          exception_metadata
+        )
+
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
   end
 
   @doc """
@@ -154,7 +200,7 @@ defmodule Creatio.Telemetry do
       })
 
     :telemetry.execute([:creatio, :request, :stop], %{duration: duration}, meta)
-    {req, resp}
+    {rearm_request_step(req), resp}
   end
 
   @doc false
@@ -182,7 +228,15 @@ defmodule Creatio.Telemetry do
       })
 
     :telemetry.execute([:creatio, :request, :exception], %{duration: duration}, meta)
-    {req, exception}
+    {rearm_request_step(req), exception}
+  end
+
+  defp rearm_request_step(%Req.Request{current_request_steps: current} = req) do
+    if :creatio_telemetry in current do
+      req
+    else
+      %Req.Request{req | current_request_steps: current ++ [:creatio_telemetry]}
+    end
   end
 
   @doc """
@@ -240,27 +294,101 @@ defmodule Creatio.Telemetry do
   defp sanitize_meta_value(%Error{} = err), do: sanitize_error(err)
   defp sanitize_meta_value(%Req.Response{} = resp), do: sanitize_response(resp)
 
+  defp sanitize_meta_value(%Req.Request{headers: headers, options: options, body: body} = req) do
+    %Req.Request{
+      req
+      | headers: sanitize_headers(headers),
+        options: sanitize_metadata(options),
+        body: if(is_nil(body), do: nil, else: "[REDACTED]")
+    }
+  end
+
+  defp sanitize_meta_value(%URI{userinfo: userinfo} = uri) when is_binary(userinfo) do
+    %URI{uri | userinfo: "[REDACTED]"}
+  end
+
+  defp sanitize_meta_value(%{__struct__: mod} = struct)
+       when mod not in [Date, DateTime, NaiveDateTime, Time, URI, Regex, MapSet] do
+    if is_exception(struct) or mod == Creatio.Client do
+      sanitize_struct(struct)
+    else
+      struct
+    end
+  end
+
   defp sanitize_meta_value(val) when is_map(val) and not is_struct(val),
     do: sanitize_metadata(val)
 
+  defp sanitize_meta_value(val) when is_list(val) do
+    if Keyword.keyword?(val) do
+      Enum.map(val, fn {k, v} -> {k, sanitize_meta_entry(k, v)} end)
+    else
+      Enum.map(val, &sanitize_meta_value/1)
+    end
+  end
+
+  defp sanitize_meta_value(val) when is_tuple(val) do
+    val
+    |> Tuple.to_list()
+    |> Enum.map(&sanitize_meta_value/1)
+    |> List.to_tuple()
+  end
+
+  defp sanitize_meta_value(val) when is_binary(val), do: redact_text_secrets(val)
   defp sanitize_meta_value(val), do: val
 
-  defp sanitize_error(%Error{response: %Req.Response{} = resp} = err) do
-    %Error{err | response: sanitize_response(resp)}
+  defp sanitize_struct(%{__struct__: _mod} = struct) do
+    sanitized_fields =
+      struct
+      |> Map.from_struct()
+      |> Map.new(fn
+        {:__exception__, _} = pair -> pair
+        {:message, msg} when is_binary(msg) -> {:message, redact_text_secrets(msg)}
+        {k, v} -> {k, sanitize_meta_entry(k, v)}
+      end)
+
+    Map.merge(struct, sanitized_fields)
   end
 
-  defp sanitize_error(%Error{details: details} = err)
-       when is_map(details) and not is_struct(details) do
-    %Error{err | details: sanitize_metadata(details)}
+  defp sanitize_error(%Error{message: message, response: resp, details: details} = err) do
+    %Error{
+      err
+      | message: redact_text_secrets(message),
+        response: sanitize_meta_value(resp),
+        details: sanitize_meta_value(details)
+    }
   end
 
-  defp sanitize_error(other), do: other
+  defp sanitize_error(other), do: sanitize_meta_value(other)
+
+  defp sanitize_stacktrace(stack) when is_list(stack) do
+    Enum.map(stack, fn
+      {mod, fun, args, loc} when is_list(args) -> {mod, fun, length(args), loc}
+      other -> other
+    end)
+  end
+
+  defp redact_text_secrets(str) when is_binary(str) do
+    str
+    |> String.replace(~r/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+=*/i, "\\1 [REDACTED]")
+    |> String.replace(
+      ~r/\b(BPMCSRF|BPMLOADER|\.ASPXAUTH|ASP\.NET_SessionId)=[^;\s,&"']+/i,
+      "\\1=[REDACTED]"
+    )
+    |> String.replace(
+      ~r/("?(?:auth_token|bearer_token|access_token|refresh_token|client_secret|bpmcsrf|password|user_password|userpassword)"?\s*:\s*)"[^"]*"/i,
+      "\\1\"[REDACTED]\""
+    )
+    |> String.replace(
+      ~r/\b(auth_token|bearer_token|access_token|refresh_token|client_secret|password|user_password|userpassword)=[^\s,&;]+/i,
+      "\\1=[REDACTED]"
+    )
+  end
+
+  defp redact_text_secrets(other), do: other
 
   defp sanitize_response(%Req.Response{headers: headers, body: body} = resp) do
-    sanitized_body =
-      if is_map(body) and not is_struct(body), do: sanitize_metadata(body), else: body
-
-    %Req.Response{resp | headers: sanitize_headers(headers), body: sanitized_body}
+    %Req.Response{resp | headers: sanitize_headers(headers), body: sanitize_meta_value(body)}
   end
 
   defp sensitive_header?(key) do
@@ -304,7 +432,7 @@ defmodule Creatio.Telemetry do
     if Keyword.has_key?(steps, :creatio_telemetry) do
       req
     else
-      Req.Request.append_response_steps(req, creatio_telemetry: &__MODULE__.handle_req_stop/1)
+      Req.Request.prepend_response_steps(req, creatio_telemetry: &__MODULE__.handle_req_stop/1)
     end
   end
 
@@ -312,7 +440,7 @@ defmodule Creatio.Telemetry do
     if Keyword.has_key?(steps, :creatio_telemetry) do
       req
     else
-      Req.Request.append_error_steps(req, creatio_telemetry: &__MODULE__.handle_req_error/1)
+      Req.Request.prepend_error_steps(req, creatio_telemetry: &__MODULE__.handle_req_error/1)
     end
   end
 
@@ -338,7 +466,13 @@ defmodule Creatio.Telemetry do
 
   defp build_req_metadata(%Req.Request{} = req) do
     client_meta = Req.Request.get_private(req, :creatio_client_meta, %{})
-    base_url = Map.get(client_meta, :base_url) || resolve_base_url(req)
+
+    base_url =
+      case Map.get(client_meta, :base_url) do
+        url when is_binary(url) and url != "" -> url
+        _ -> resolve_base_url(req)
+      end
+
     auth_mode = Map.get(client_meta, :auth_mode)
 
     %{
@@ -355,15 +489,25 @@ defmodule Creatio.Telemetry do
          url: %URI{scheme: scheme, host: host, port: port}
        })
        when is_binary(scheme) and is_binary(host) do
-    opts[:base_url] || format_origin(scheme, host, port)
+    case opts[:base_url] do
+      url when is_binary(url) and url != "" -> url
+      _ -> format_origin(scheme, host, port)
+    end
   end
 
-  defp resolve_base_url(%Req.Request{options: opts}), do: opts[:base_url] || ""
+  defp resolve_base_url(%Req.Request{options: opts}) do
+    case opts[:base_url] do
+      url when is_binary(url) and url != "" -> url
+      _ -> ""
+    end
+  end
 
-  defp format_origin("http", host, 80), do: "http://#{host}"
-  defp format_origin("https", host, 443), do: "https://#{host}"
-  defp format_origin(scheme, host, nil), do: "#{scheme}://#{host}"
-  defp format_origin(scheme, host, port), do: "#{scheme}://#{host}:#{port}"
+  @doc false
+  @spec format_origin(String.t(), String.t(), :inet.port_number() | nil) :: String.t()
+  def format_origin("http", host, 80), do: "http://#{host}"
+  def format_origin("https", host, 443), do: "https://#{host}"
+  def format_origin(scheme, host, nil), do: "#{scheme}://#{host}"
+  def format_origin(scheme, host, port), do: "#{scheme}://#{host}:#{port}"
 
   defp extract_path(%URI{path: path}) when is_binary(path) and path != "", do: path
   defp extract_path(%URI{}), do: "/"

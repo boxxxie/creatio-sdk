@@ -8,6 +8,34 @@ defmodule Creatio.Client do
 
   alias Creatio.Telemetry
 
+  @sensitive_option_keys [
+    :auth_token,
+    :bearer_token,
+    :cookie,
+    :bpmcsrf,
+    :client_secret,
+    :password,
+    :user_password
+  ]
+
+  @known_string_option_keys %{
+    "base_url" => :base_url,
+    "auth_token" => :auth_token,
+    "bearer_token" => :bearer_token,
+    "auth_mode" => :auth_mode,
+    "cookie" => :cookie,
+    "bpmcsrf" => :bpmcsrf,
+    "identity_service_url" => :identity_service_url,
+    "client_id" => :client_id,
+    "client_secret" => :client_secret,
+    "password" => :password,
+    "user_password" => :user_password,
+    "read_only" => :read_only,
+    "req_options" => :req_options,
+    "token_url" => :token_url
+  }
+
+  @derive {Inspect, only: [:base_url, :auth_mode, :identity_service_url, :client_id, :read_only]}
   @enforce_keys [:base_url]
   defstruct [
     :base_url,
@@ -57,44 +85,53 @@ defmodule Creatio.Client do
   @spec new(keyword() | map() | Req.Request.t()) :: t()
   def new(opts \\ [])
   def new(%Req.Request{} = req), do: from_req(req)
-  def new(opts) when is_map(opts), do: opts |> Map.to_list() |> new()
+  def new(opts) when is_map(opts), do: opts |> normalize_opts_list() |> new()
 
   def new(opts) when is_list(opts) do
+    opts_list = normalize_opts_list(opts)
+
     base_url =
-      (Keyword.get(opts, :base_url) ||
+      (Keyword.get(opts_list, :base_url) ||
          Application.get_env(:creatio, :base_url) ||
          System.get_env("CREATIO_BASE_URL") ||
          "")
       |> String.trim_trailing("/")
 
     auth_token =
-      Keyword.get(opts, :auth_token) ||
+      Keyword.get(opts_list, :auth_token) ||
+        Keyword.get(opts_list, :bearer_token) ||
         Application.get_env(:creatio, :auth_token) ||
         System.get_env("CREATIO_AUTH_TOKEN") ||
         System.get_env("CREATIO_BEARER_TOKEN")
 
-    cookie = Keyword.get(opts, :cookie)
-    bpmcsrf = Keyword.get(opts, :bpmcsrf)
+    cookie = Keyword.get(opts_list, :cookie)
+    bpmcsrf = Keyword.get(opts_list, :bpmcsrf)
 
     identity_service_url =
-      (Keyword.get(opts, :identity_service_url) ||
+      (Keyword.get(opts_list, :identity_service_url) ||
          Application.get_env(:creatio, :identity_service_url) ||
          System.get_env("CREATIO_IDENTITY_URL") ||
          System.get_env("CREATIO_IDENTITY_SERVICE_URL"))
       |> normalize_optional_url()
 
     client_id =
-      Keyword.get(opts, :client_id) ||
+      Keyword.get(opts_list, :client_id) ||
         Application.get_env(:creatio, :client_id) ||
         System.get_env("CREATIO_CLIENT_ID")
 
     client_secret =
-      Keyword.get(opts, :client_secret) ||
+      Keyword.get(opts_list, :client_secret) ||
         Application.get_env(:creatio, :client_secret) ||
         System.get_env("CREATIO_CLIENT_SECRET")
 
-    req_options = Keyword.get(opts, :req_options, [])
-    read_only = resolve_read_only(opts)
+    req_options =
+      case Keyword.get(opts_list, :req_options, []) do
+        map when is_map(map) -> Map.to_list(map)
+        list when is_list(list) -> list
+        _ -> []
+      end
+
+    read_only = resolve_read_only(opts_list)
 
     auth_mode =
       cond do
@@ -122,7 +159,7 @@ defmodule Creatio.Client do
       client_id: client_id,
       client_secret: client_secret,
       read_only: read_only,
-      options: opts,
+      options: sanitize_stored_options(opts_list),
       req: req
     }
 
@@ -133,19 +170,25 @@ defmodule Creatio.Client do
   Builds a `Creatio.Client` from an existing `Req.Request`.
 
   Uses `:base_url` from `opts` if provided, falling back to `req.options[:base_url]`
-  or `""`. Unlike `new/1`, does not read `CREATIO_BASE_URL` from the environment.
+  or `""`. Unlike `new/1`, does not read `CREATIO_BASE_URL` or `CREATIO_READ_ONLY`
+  from the environment or application config.
   """
   @spec from_req(Req.Request.t(), keyword() | map()) :: t()
   def from_req(%Req.Request{} = req, opts \\ []) do
-    opts_list = if is_map(opts), do: Map.to_list(opts), else: opts
+    opts_list = normalize_opts_list(opts)
 
     base_url =
       Keyword.get(opts_list, :base_url) || req.options[:base_url] || ""
 
-    auth_token = Keyword.get(opts_list, :auth_token)
+    auth_token = Keyword.get(opts_list, :auth_token) || Keyword.get(opts_list, :bearer_token)
     cookie = Keyword.get(opts_list, :cookie)
     bpmcsrf = Keyword.get(opts_list, :bpmcsrf)
-    read_only = resolve_read_only(opts_list)
+
+    read_only =
+      case Keyword.fetch(opts_list, :read_only) do
+        {:ok, val} when not is_nil(val) -> normalize_read_only(val)
+        _ -> Keyword.has_key?(req.request_steps, :read_only_guard)
+      end
 
     auth_mode =
       Keyword.get_lazy(opts_list, :auth_mode, fn ->
@@ -173,7 +216,7 @@ defmodule Creatio.Client do
       client_secret: Keyword.get(opts_list, :client_secret),
       read_only: read_only,
       req: configured_req,
-      options: opts_list
+      options: sanitize_stored_options(opts_list)
     }
 
     apply_auth_headers(client)
@@ -262,7 +305,8 @@ defmodule Creatio.Client do
           |> maybe_put_header("bpmcsrf", client.bpmcsrf)
       end
 
-    req =
+    %Req.Request{} =
+      req =
       req
       |> Req.Request.put_private(:creatio_client_meta, %{
         base_url: client.base_url,
@@ -271,10 +315,15 @@ defmodule Creatio.Client do
       |> Telemetry.attach_req_steps()
 
     req =
-      if client.read_only and not Keyword.has_key?(req.request_steps, :read_only_guard) do
-        Req.Request.append_request_steps(req, read_only_guard: &read_only_guard/1)
-      else
-        req
+      cond do
+        client.read_only and not Keyword.has_key?(req.request_steps, :read_only_guard) ->
+          Req.Request.append_request_steps(req, read_only_guard: &read_only_guard/1)
+
+        not client.read_only and Keyword.has_key?(req.request_steps, :read_only_guard) ->
+          %{req | request_steps: Keyword.delete(req.request_steps, :read_only_guard)}
+
+        true ->
+          req
       end
 
     %{client | req: req}
@@ -324,6 +373,47 @@ defmodule Creatio.Client do
 
   defp put_or_delete_header(req, name, nil), do: Req.Request.delete_header(req, name)
   defp put_or_delete_header(req, name, value), do: Req.Request.put_header(req, name, value)
+
+  defp normalize_opts_list(opts) when is_map(opts) do
+    opts
+    |> Map.to_list()
+    |> normalize_opts_list()
+  end
+
+  defp normalize_opts_list(opts) when is_list(opts) do
+    Enum.flat_map(opts, fn
+      {k, v} when is_atom(k) ->
+        [{k, v}]
+
+      {k, v} when is_binary(k) ->
+        case Map.fetch(@known_string_option_keys, k) do
+          {:ok, atom_key} -> [{atom_key, v}]
+          :error -> []
+        end
+
+      _ ->
+        []
+    end)
+  end
+
+  defp sanitize_stored_options(opts_list) when is_list(opts_list) do
+    opts_list
+    |> Keyword.drop(@sensitive_option_keys)
+    |> Enum.map(fn
+      {:req_options, req_opts} when is_list(req_opts) ->
+        cleaned_req_opts =
+          req_opts
+          |> Keyword.drop([:auth, :headers])
+
+        {:req_options, cleaned_req_opts}
+
+      {:req_options, req_opts} when is_map(req_opts) ->
+        {:req_options, Map.drop(req_opts, [:auth, :headers, "auth", "headers"])}
+
+      other ->
+        other
+    end)
+  end
 
   defp normalize_optional_url(url) when is_binary(url) do
     case url |> String.trim() |> String.trim_trailing("/") do
