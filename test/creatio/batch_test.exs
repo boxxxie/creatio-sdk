@@ -28,7 +28,7 @@ defmodule Creatio.BatchTest do
       assert req1["body"] == %{"Name" => "Alice"}
 
       assert req2["method"] == "PATCH"
-      assert req2["url"] == "Contact({id-1})"
+      assert req2["url"] == "Contact(id-1)"
       assert req2["id"] == "u1"
       assert req2["atomicityGroup"] == "group1"
 
@@ -148,6 +148,103 @@ defmodule Creatio.BatchTest do
 
       assert %Error{status: 404, code: "NotFound", message: "Missing"} =
                Response.to_error(err_resp)
+    end
+
+    test "gives ungrouped writes separate changesets, keeps GETs outside changesets, and preserves request order" do
+      batch =
+        Batch.new()
+        |> Batch.add_create("Contact", %{"Name" => "Write1"}, id: "w1")
+        |> Batch.add_get("Contact", "1", id: "g1", atomicity_group: "g_ignored")
+        |> Batch.add_update("Contact", "2", %{"Name" => "Write2"}, id: "w2")
+
+      {boundary, body} = Batch.to_multipart(batch, boundary: "batch_order_test")
+      parts = String.split(body, "--#{boundary}") |> Enum.slice(1, 3)
+
+      assert Enum.at(parts, 0) =~ "Content-ID: w1"
+      assert Enum.at(parts, 0) =~ "multipart/mixed; boundary=changeset_"
+      assert Enum.at(parts, 1) =~ "GET Contact(1) HTTP/1.1"
+      refute Enum.at(parts, 1) =~ "changeset_"
+      assert Enum.at(parts, 2) =~ "Content-ID: w2"
+      assert Enum.at(parts, 2) =~ "multipart/mixed; boundary=changeset_"
+    end
+
+    test "case-insensitive header override in Batch.add/4" do
+      batch =
+        Batch.new()
+        |> Batch.add("PATCH", "Contact(1)",
+          body: %{"Name" => "X"},
+          headers: %{"Content-Type" => "application/json"}
+        )
+
+      [req] = Batch.to_payload(batch)["requests"]
+      assert req["headers"]["Content-Type"] == "application/json"
+      refute Map.has_key?(req["headers"], "content-type")
+    end
+
+    test "parses HTTP/2 parts, preserves body whitespace, and ignores nested MIME strings inside JSON body" do
+      raw =
+        """
+        --batchresponse_outer
+        Content-Type: application/http
+        Content-Transfer-Encoding: binary
+        Content-ID: req_1
+
+        HTTP/2 200 OK
+        Content-Type: application/json
+
+        {"Body":"  --fake_boundary\\r\\nContent-Type: text/plain  "}
+        --batchresponse_outer--
+        """
+        |> String.replace("\n", "\r\n")
+
+      assert {:ok, [resp]} = Batch.parse_multipart_response(raw)
+      assert resp.status == 200
+      assert resp.body == %{"Body" => "  --fake_boundary\r\nContent-Type: text/plain  "}
+    end
+
+    test "blocks atom-keyed and atom-method mutations in read-only mode" do
+      client = Creatio.Client.new(base_url: "https://test.creatio.com", read_only: true)
+
+      assert {:error, %Error{status: 403, code: "ReadOnlyMode"}} =
+               Batch.execute(client, [%{method: :post, url: "Contact", body: %{"Name" => "X"}}])
+
+      assert {:error, %Error{status: 403, code: "ReadOnlyMode"}} =
+               Batch.execute(client, [%{method: "DELETE", url: "Contact(1)"}])
+    end
+
+    test "handles multipart response returned in JSON batch mode and HTML 200 error response" do
+      multipart_resp_body =
+        "--batch_srv\r\nContent-Type: application/http\r\nContent-ID: r1\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n--batch_srv--\r\n"
+
+      multipart_client =
+        Creatio.Client.new(
+          base_url: "https://test.creatio.com",
+          req_options: [
+            plug: fn conn ->
+              conn
+              |> Plug.Conn.put_resp_content_type("multipart/mixed; boundary=batch_srv")
+              |> Plug.Conn.send_resp(200, multipart_resp_body)
+            end
+          ]
+        )
+
+      assert {:ok, [%Response{id: "r1", status: 204}]} =
+               Batch.execute(multipart_client, Batch.new() |> Batch.add_get("Contact", "1"))
+
+      html_client =
+        Creatio.Client.new(
+          base_url: "https://test.creatio.com",
+          req_options: [
+            plug: fn conn ->
+              conn
+              |> Plug.Conn.put_resp_content_type("text/html")
+              |> Plug.Conn.send_resp(200, "<html>Login Required</html>")
+            end
+          ]
+        )
+
+      assert {:error, %Error{status: 200}} =
+               Batch.execute(html_client, Batch.new() |> Batch.add_get("Contact", "1"))
     end
   end
 end

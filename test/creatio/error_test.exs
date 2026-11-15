@@ -168,13 +168,13 @@ defmodule Creatio.ErrorTest do
       {%{"message" => "string value", "code" => "200"}, "200", "string value"},
       {%{}, nil, inspect(%{})},
       {%{"error" => %{"message" => "A", "code" => "B"}}, "B", "A"},
-      {%{"error" => %{"Message" => "A", "ErrorCode" => "B"}}, nil, "HTTP 400"},
+      {%{"error" => %{"Message" => "A", "ErrorCode" => "B"}}, "B", "A"},
       {%{"message" => "A", "code" => "B"}, "B", "A"},
-      {%{"Exception" => %{"Message" => "A", "ErrorCode" => "B"}}, nil,
-       inspect(%{"Exception" => %{"Message" => "A", "ErrorCode" => "B"}})},
-      {%{"Exception" => %{"message" => "A", "errorCode" => "B"}}, nil,
-       inspect(%{"Exception" => %{"message" => "A", "errorCode" => "B"}})},
-      {%{"error_description" => "A"}, nil, inspect(%{"error_description" => "A"})}
+      {%{"Exception" => %{"Message" => "A", "ErrorCode" => "B"}}, "B", "A"},
+      {%{"Exception" => %{"message" => "A", "errorCode" => "B"}}, "B", "A"},
+      {%{"error_description" => "A"}, nil, "A"},
+      {%{"Code" => 1, "Message" => "", "ExceptionMessage" => "NullReferenceException"}, 1,
+       "NullReferenceException"}
     ]
 
     for {body, expected_code, expected_message} <- cases do
@@ -183,6 +183,11 @@ defmodule Creatio.ErrorTest do
       assert err.code == expected_code
       assert err.message == expected_message
     end
+
+    assert Exception.message(Error.new(status: 500, code: "Err")) ==
+             "Creatio error Err (HTTP 500)"
+
+    assert Exception.message(Error.new([])) == "Creatio error"
 
     assert %Error{
              status: nil,

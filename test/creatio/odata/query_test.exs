@@ -57,13 +57,26 @@ defmodule Creatio.OData.QueryTest do
         |> Query.filter_startswith("Email", "john")
         |> Query.filter_endswith("Email", ".com")
         |> Query.filter_day("CreatedOn", ~D[2024-01-01])
-        |> Query.filter_day("CreatedOn", ~D[2024-01-01], :odata3)
+        |> Query.filter_day("CreatedOn", 15, "ge")
 
       params = Query.to_params(q)
       assert is_binary(params["$filter"])
       assert params["$filter"] =~ "Active eq true"
       assert params["$filter"] =~ "Age gt 18"
-      assert params["$filter"] =~ "day(CreatedOn)"
+      assert params["$filter"] =~ "day(CreatedOn) eq 1"
+      assert params["$filter"] =~ "day(CreatedOn) ge 15"
+    end
+
+    test "filter_day validates comparison operators" do
+      assert_raise ArgumentError, fn ->
+        Query.new("Contact")
+        |> Query.filter_day("CreatedOn", ~D[2024-01-01], :odata3)
+      end
+
+      assert_raise ArgumentError, fn ->
+        Query.new("Contact")
+        |> Query.or_filter_day("CreatedOn", 5, :bad_op)
+      end
     end
 
     test "or_filter conditions" do
@@ -85,6 +98,34 @@ defmodule Creatio.OData.QueryTest do
 
       params = Query.to_params(q)
       assert params["$filter"] =~ " or "
+      assert params["$filter"] =~ "(Category eq 1 or Category eq 2 or Category eq 3)"
+      assert params["$filter"] =~ "day(UpdatedOn) eq 1"
+    end
+
+    test "empty or_filter_in produces 1 eq 0 when filter is nil" do
+      q = Query.new("Contact") |> Query.or_filter_in("Department", [])
+      assert Query.to_params(q)["$filter"] == "1 eq 0"
+    end
+
+    test "filter_in_ids cleans braced and guid'-prefixed UUIDs" do
+      q =
+        Query.new("Contact")
+        |> Query.filter_in_ids("Id", ["{aaa-111}", "guid'bbb-222'"])
+
+      assert Query.to_params(q)["$filter"] == "(Id eq aaa-111 or Id eq bbb-222)"
+    end
+
+    test "select and expand trim comma-separated values and deduplicate" do
+      q =
+        Query.new("Contact")
+        |> Query.select("Id, Name")
+        |> Query.select(["Name", "Email"])
+        |> Query.expand("Owner, Account")
+        |> Query.expand(["Account", "City"])
+
+      params = Query.to_params(q)
+      assert params["$select"] == "Id,Name,Email"
+      assert params["$expand"] == "Owner,Account,City"
     end
 
     test "GUID and identifier helpers" do

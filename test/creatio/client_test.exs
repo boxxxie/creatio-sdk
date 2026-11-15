@@ -105,6 +105,60 @@ defmodule Creatio.ClientTest do
       forms_client = Client.put_forms_auth(client, ".ASPXAUTH=1", "csrf_1")
       assert forms_client.read_only == true
       assert Keyword.has_key?(forms_client.req.request_steps, :read_only_guard)
+      assert is_nil(forms_client.auth_token)
+      assert is_nil(forms_client.req.headers["authorization"])
+
+      back_to_bearer = Client.put_bearer_token(forms_client, "tok_2")
+      assert is_nil(back_to_bearer.cookie)
+      assert is_nil(back_to_bearer.bpmcsrf)
+      assert is_nil(back_to_bearer.req.headers["cookie"])
+      assert is_nil(back_to_bearer.req.headers["bpmcsrf"])
+    end
+
+    test "normalizes read_only option to boolean and preserves from_req auth detection" do
+      assert Client.new(base_url: "https://mycreatio.com", read_only: "false").read_only == false
+      assert Client.new(base_url: "https://mycreatio.com", read_only: "true").read_only == true
+
+      req_bearer =
+        Req.new(base_url: "https://mycreatio.com", headers: [{"authorization", "Bearer abc"}])
+
+      assert Client.from_req(req_bearer).auth_mode == :bearer
+
+      req_forms =
+        Req.new(
+          base_url: "https://mycreatio.com",
+          headers: [{"cookie", ".ASPXAUTH=abc"}, {"bpmcsrf", "csrf"}]
+        )
+
+      assert Client.from_req(req_forms).auth_mode == :forms
+    end
+
+    test "read_only_guard rejects non-read REST paths, false suffix matches, and duplicate steps" do
+      client =
+        Client.new(
+          base_url: "https://mycreatio.com",
+          read_only: true,
+          req_options: [plug: fn conn -> Req.Test.json(conn, %{"ok" => true}) end]
+        )
+
+      read_only_steps =
+        client.req.request_steps
+        |> Keyword.keys()
+        |> Enum.count(&(&1 == :read_only_guard))
+
+      assert read_only_steps == 1
+
+      assert {:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}} =
+               Req.post(client.req, url: "/0/rest/SomeService/GetOrMutate", json: %{})
+
+      assert {:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}} =
+               Req.post(client.req,
+                 url: "/0/DataService/json/SyncReply/FakeSelectQuery",
+                 json: %{}
+               )
+
+      assert {:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}} =
+               Req.post(client.req, url: "/0/odata/Contact", json: %{})
     end
   end
 end
