@@ -37,13 +37,14 @@ defmodule Creatio.OData3 do
 
   def list(client_or_req, entity, opts)
       when is_client_or_req(client_or_req) and is_binary(entity) do
+    entity = require_entity_name!(entity, "list/3")
     client = Client.ensure_client(client_or_req)
     params = normalize_params(opts)
     do_list(client, entity, params)
   end
 
   def list(client_or_req, query, opts) when is_client_or_req(client_or_req) do
-    entity = require_query_entity!(query)
+    entity = Query.require_entity!(query, "list/3")
     client = Client.ensure_client(client_or_req)
     query_params = Query.to_params(query)
 
@@ -129,6 +130,7 @@ defmodule Creatio.OData3 do
   @spec get(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def get(client_or_req, entity, id, opts \\ []) do
+    entity = require_entity_name!(entity, "get/4")
     client = Client.ensure_client(client_or_req)
 
     Telemetry.span(
@@ -180,6 +182,7 @@ defmodule Creatio.OData3 do
         ) ::
           {:ok, any()} | {:error, Error.t()}
   def get_navigation(client_or_req, entity, id, nav_property, opts \\ []) do
+    entity = require_entity_name!(entity, "get_navigation/5")
     client = Client.ensure_client(client_or_req)
 
     Telemetry.span(
@@ -241,6 +244,7 @@ defmodule Creatio.OData3 do
   @spec get_field(Client.t() | Req.Request.t(), String.t(), String.t(), String.t(), keyword()) ::
           {:ok, any()} | {:error, Error.t()}
   def get_field(client_or_req, entity, id, field_name, opts \\ []) do
+    entity = require_entity_name!(entity, "get_field/5")
     client = Client.ensure_client(client_or_req)
 
     Telemetry.span(
@@ -269,9 +273,12 @@ defmodule Creatio.OData3 do
 
             if resp.status == 200 and not Util.html_or_xml_response?(resp) do
               case resp.body do
+                %{"error" => _} -> {:error, Error.from_response(resp)}
                 %{"d" => %{} = d_map} -> {:ok, Map.get(d_map, field_name, d_map)}
                 %{"d" => val} -> {:ok, val}
-                other -> {:ok, other}
+                %{} = map -> {:ok, map}
+                list when is_list(list) -> {:ok, list}
+                _other -> {:error, Error.from_response(resp)}
               end
             else
               {:error, Error.from_response(resp)}
@@ -317,6 +324,7 @@ defmodule Creatio.OData3 do
         ) ::
           {:ok, any()} | {:error, Error.t()}
   def get_field_value(client_or_req, entity, id, field_name, opts \\ []) do
+    entity = require_entity_name!(entity, "get_field_value/5")
     client = Client.ensure_client(client_or_req)
 
     Telemetry.span(
@@ -369,6 +377,7 @@ defmodule Creatio.OData3 do
   @spec count(Client.t() | Req.Request.t(), String.t(), keyword()) ::
           {:ok, integer()} | {:error, Error.t()}
   def count(client_or_req, entity, opts \\ []) do
+    entity = require_entity_name!(entity, "count/3")
     client = Client.ensure_client(client_or_req)
 
     Telemetry.span(
@@ -377,7 +386,8 @@ defmodule Creatio.OData3 do
       fn ->
         collection_name = collection_name(entity)
         strategy = Keyword.get(opts, :strategy, :path)
-        params = normalize_params(Keyword.drop(opts, [:strategy]))
+        extra_req_opts = opts |> Keyword.get(:req_options, []) |> Keyword.drop([:url, :method])
+        params = opts |> Keyword.drop([:strategy, :req_options]) |> normalize_params()
 
         req_opts =
           if strategy == :query do
@@ -390,32 +400,18 @@ defmodule Creatio.OData3 do
                 base
               end
 
-            [url: url]
+            Keyword.put(extra_req_opts, :url, url)
           else
             url = "#{@base_path}/#{collection_name}/$count"
-            if map_size(params) > 0, do: [url: url, params: params], else: [url: url]
+            req_base = Keyword.put(extra_req_opts, :url, url)
+            if map_size(params) > 0, do: Keyword.put(req_base, :params, params), else: req_base
           end
 
         case Req.get(client.req, req_opts) do
-          {:ok, %{status: 200, body: body}} when is_integer(body) ->
-            {:ok, body}
-
-          {:ok, %{status: 200, body: %{"d" => count}}} when is_integer(count) ->
-            {:ok, count}
-
-          {:ok, %{status: 200, body: %{"d" => %{"count" => count}}}} when is_integer(count) ->
-            {:ok, count}
-
-          {:ok, %{status: 200, body: body}} when is_binary(body) ->
-            cleaned = body |> String.trim() |> String.trim_leading("\uFEFF") |> String.trim()
-
-            case Integer.parse(cleaned) do
-              {int, _} -> {:ok, int}
-              :error -> {:error, Error.new(message: "Failed to parse count response: #{body}")}
-            end
-
-          {:ok, %Req.Response{} = resp} ->
-            {:error, Error.from_response(resp)}
+          {:ok, %Req.Response{} = raw_resp} ->
+            raw_resp
+            |> Util.normalize_json_response()
+            |> extract_odata3_count()
 
           {:error, exception} ->
             Error.wrap_error(exception)
@@ -463,8 +459,15 @@ defmodule Creatio.OData3 do
         ) :: Enumerable.t()
   def stream(client_or_req, entity_or_query, opts \\ [])
 
-  def stream(client_or_req, entity_or_query, opts) when is_client_or_req(client_or_req) do
-    Util.paginate_stream(client_or_req, entity_or_query, opts, :odata3, &list/3)
+  def stream(client_or_req, entity, opts)
+      when is_client_or_req(client_or_req) and is_binary(entity) do
+    entity = require_entity_name!(entity, "stream/3")
+    Util.paginate_stream(client_or_req, entity, opts, :odata3, &list/3)
+  end
+
+  def stream(client_or_req, query, opts) when is_client_or_req(client_or_req) do
+    _entity = Query.require_entity!(query, "stream/3")
+    Util.paginate_stream(client_or_req, query, opts, :odata3, &list/3)
   end
 
   def stream(entity_or_query, client_or_req, opts) when is_client_or_req(client_or_req) do
@@ -483,8 +486,15 @@ defmodule Creatio.OData3 do
         ) :: Enumerable.t()
   def stream!(client_or_req, entity_or_query, opts \\ [])
 
-  def stream!(client_or_req, entity_or_query, opts) when is_client_or_req(client_or_req) do
-    Util.paginate_stream!(client_or_req, entity_or_query, opts, :odata3, &list/3)
+  def stream!(client_or_req, entity, opts)
+      when is_client_or_req(client_or_req) and is_binary(entity) do
+    entity = require_entity_name!(entity, "stream!/3")
+    Util.paginate_stream!(client_or_req, entity, opts, :odata3, &list/3)
+  end
+
+  def stream!(client_or_req, query, opts) when is_client_or_req(client_or_req) do
+    _entity = Query.require_entity!(query, "stream!/3")
+    Util.paginate_stream!(client_or_req, query, opts, :odata3, &list/3)
   end
 
   def stream!(entity_or_query, client_or_req, opts) when is_client_or_req(client_or_req) do
@@ -497,6 +507,7 @@ defmodule Creatio.OData3 do
   @spec create(Client.t() | Req.Request.t(), String.t(), map(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def create(client_or_req, entity, attrs, opts \\ []) do
+    entity = require_entity_name!(entity, "create/4")
     client = Client.ensure_client(client_or_req)
 
     Telemetry.span(
@@ -555,8 +566,9 @@ defmodule Creatio.OData3 do
   Updates an entity via OData 3 (`PATCH .../{Entity}Collection(guid'{id}')`).
   """
   @spec update(Client.t() | Req.Request.t(), String.t(), String.t(), map(), keyword()) ::
-          :ok | {:ok, map()} | {:error, Error.t()}
+          :ok | {:ok, map() | binary()} | {:error, Error.t()}
   def update(client_or_req, entity, id, attrs, opts \\ []) do
+    entity = require_entity_name!(entity, "update/5")
     client = Client.ensure_client(client_or_req)
 
     Telemetry.span(
@@ -588,10 +600,7 @@ defmodule Creatio.OData3 do
               resp = Util.normalize_json_response(raw_resp)
 
               if resp.status == 200 and not Util.html_or_xml_response?(resp) do
-                case resp.body do
-                  %{"d" => record} -> {:ok, record}
-                  body -> {:ok, body}
-                end
+                handle_ok_update_body(resp)
               else
                 {:error, Error.from_response(resp)}
               end
@@ -608,7 +617,7 @@ defmodule Creatio.OData3 do
   Same as `update/5`, but raises `Creatio.Error` on failure.
   """
   @spec update!(Client.t() | Req.Request.t(), String.t(), String.t(), map(), keyword()) ::
-          :ok | map()
+          :ok | map() | binary()
   def update!(client, entity, id, attrs, opts \\ []) do
     case update(client, entity, id, attrs, opts) do
       :ok -> :ok
@@ -623,6 +632,7 @@ defmodule Creatio.OData3 do
   @spec delete(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) ::
           :ok | {:error, Error.t()}
   def delete(client_or_req, entity, id, opts \\ []) do
+    entity = require_entity_name!(entity, "delete/4")
     client = Client.ensure_client(client_or_req)
 
     Telemetry.span(
@@ -645,8 +655,8 @@ defmodule Creatio.OData3 do
             {:ok, %{status: 204}} ->
               :ok
 
-            {:ok, %{status: 200}} ->
-              :ok
+            {:ok, %Req.Response{status: 200} = raw_resp} ->
+              handle_ok_void_response(raw_resp)
 
             {:ok, %Req.Response{} = resp} ->
               {:error, Error.from_response(resp)}
@@ -670,6 +680,64 @@ defmodule Creatio.OData3 do
     end
   end
 
+  defp extract_odata3_count(%{status: 200, body: count}) when is_integer(count), do: {:ok, count}
+
+  defp extract_odata3_count(%{status: 200, body: %{"d" => %{"__count" => count}}} = resp),
+    do: Util.parse_integer_count(count, resp)
+
+  defp extract_odata3_count(%{status: 200, body: %{"d" => %{"count" => count}}} = resp),
+    do: Util.parse_integer_count(count, resp)
+
+  defp extract_odata3_count(%{status: 200, body: %{"d" => count}} = resp)
+       when is_integer(count) or is_binary(count),
+       do: Util.parse_integer_count(count, resp)
+
+  defp extract_odata3_count(%{status: 200, body: %{"__count" => count}} = resp),
+    do: Util.parse_integer_count(count, resp)
+
+  defp extract_odata3_count(%{status: 200, body: %{"count" => count}} = resp),
+    do: Util.parse_integer_count(count, resp)
+
+  defp extract_odata3_count(%{status: 200, body: body} = resp) when is_binary(body) do
+    case Util.parse_integer_count(body, resp) do
+      {:ok, _} = ok ->
+        ok
+
+      {:error, _} = err ->
+        if Util.html_or_xml_response?(resp) do
+          {:error, Error.from_response(resp)}
+        else
+          err
+        end
+    end
+  end
+
+  defp extract_odata3_count(%Req.Response{} = resp), do: {:error, Error.from_response(resp)}
+
+  defp handle_ok_update_body(resp) do
+    case resp.body do
+      %{"error" => _} ->
+        {:error, Error.from_response(resp)}
+
+      %{"d" => record} ->
+        {:ok, record}
+
+      %{} = body ->
+        {:ok, body}
+
+      nil ->
+        :ok
+
+      bin when is_binary(bin) ->
+        if(String.trim(bin) == "", do: :ok, else: {:error, Error.from_response(resp)})
+
+      _other ->
+        {:error, Error.from_response(resp)}
+    end
+  end
+
+  defp handle_ok_void_response(raw_resp), do: Util.ok_void_response(raw_resp)
+
   defp parse_count_value(val) when is_integer(val), do: val
 
   defp parse_count_value(val) when is_binary(val) do
@@ -691,13 +759,5 @@ defmodule Creatio.OData3 do
     Util.normalize_odata_params(opts, %{}, {"$inlinecount", "allpages"})
   end
 
-  defp require_query_entity!(query) do
-    case Query.entity(query) do
-      "" ->
-        raise ArgumentError, "Creatio.OData.Query must specify a non-empty entity name"
-
-      entity ->
-        entity
-    end
-  end
+  defp require_entity_name!(entity, fun_name), do: Util.require_entity_name!(entity, fun_name)
 end

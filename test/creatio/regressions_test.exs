@@ -739,6 +739,124 @@ defmodule Creatio.RegressionsTest do
                Batch.execute(client, Batch.new() |> Batch.add_get("Contact"))
     end
 
+    test "rejects HTTP 200 and 201 HTML/WAF interstitials across delete, update_field, delete_field, and OData3.delete" do
+      waf_html =
+        "<html><body><iframe src=\"/_Incapsula_Resource?SWKMTFSR=1\"></iframe></body></html>"
+
+      id = "00000000-0000-0000-0000-000000000001"
+
+      client_200 =
+        Client.new(
+          base_url: "https://test.creatio.com",
+          req_options: [
+            plug: fn conn ->
+              conn
+              |> Plug.Conn.put_resp_content_type("text/html")
+              |> Plug.Conn.send_resp(200, waf_html)
+            end
+          ]
+        )
+
+      assert {:error, %Error{status: 200}} = OData.delete(client_200, "Contact", id)
+
+      assert {:error, %Error{status: 200}} =
+               OData.update_field(client_200, "Contact", id, "Name", "X")
+
+      assert {:error, %Error{status: 200}} = OData.delete_field(client_200, "Contact", id, "Name")
+      assert {:error, %Error{status: 200}} = OData3.delete(client_200, "Contact", id)
+
+      client_201 =
+        Client.new(
+          base_url: "https://test.creatio.com",
+          req_options: [
+            plug: fn conn ->
+              conn
+              |> Plug.Conn.put_resp_content_type("text/html")
+              |> Plug.Conn.send_resp(201, waf_html)
+            end
+          ]
+        )
+
+      assert {:error, %Error{status: 201}} =
+               OData.update_field(client_201, "Contact", id, "Name", "X")
+    end
+
+    test "rejects corrupt JSON and plain-text 200 responses while allowing IIS text/html Healthy on OAuthHealthCheck" do
+      id = "00000000-0000-0000-0000-000000000002"
+
+      for {ct, body} <- [
+            {"application/json", "{broken"},
+            {"text/plain", "{broken"},
+            {"text/plain", "Gateway Timeout"}
+          ] do
+        client =
+          Client.new(
+            base_url: "https://test.creatio.com",
+            req_options: [
+              plug: fn conn ->
+                conn
+                |> Plug.Conn.put_resp_content_type(ct)
+                |> Plug.Conn.send_resp(200, body)
+              end
+            ]
+          )
+
+        expected_status = if ct == "application/json", do: nil, else: 200
+
+        assert {:error, %Error{status: ^expected_status}} =
+                 DataService.execute_query(client, :select, %{})
+
+        assert {:error, %Error{status: ^expected_status}} =
+                 OData.update(client, "Contact", id, %{"Name" => "X"}, return: :representation)
+
+        assert {:error, %Error{status: ^expected_status}} =
+                 OData3.update(client, "Contact", id, %{"Name" => "X"}, return: :representation)
+
+        assert {:error, %Error{status: ^expected_status}} =
+                 OData.get_field(client, "Contact", id, "Name")
+
+        assert {:error, %Error{status: ^expected_status}} =
+                 OData3.get_field(client, "Contact", id, "Name")
+      end
+
+      health_ok_client =
+        Client.new(
+          base_url: "https://test.creatio.com",
+          req_options: [
+            plug: fn conn ->
+              conn
+              |> Plug.Conn.put_resp_content_type("text/html")
+              |> Plug.Conn.send_resp(200, "Healthy")
+            end
+          ]
+        )
+
+      assert {:ok, "Healthy"} = Auth.oauth_health_check(health_ok_client)
+
+      for {ct, bad_body} <- [
+            {"text/html", "<html><body>WAF</body></html>"},
+            {"text/html", "{broken"},
+            {"application/json", "{broken"}
+          ] do
+        bad_health_client =
+          Client.new(
+            base_url: "https://test.creatio.com",
+            req_options: [
+              plug: fn conn ->
+                conn
+                |> Plug.Conn.put_resp_content_type(ct)
+                |> Plug.Conn.send_resp(200, bad_body)
+              end
+            ]
+          )
+
+        expected_status = if ct == "application/json", do: nil, else: 200
+
+        assert {:error, %Error{status: ^expected_status}} =
+                 Auth.oauth_health_check(bad_health_client)
+      end
+    end
+
     test "CreatioServerDriver simulates IIS text/html JSON and 204 OData-EntityId headers" do
       alias Creatio.TestDrivers.CreatioServerDriver, as: Server
 
@@ -759,6 +877,377 @@ defmodule Creatio.RegressionsTest do
 
       assert {:ok, %{"@odata.id" => "https://mycreatio.com/0/odata/Contact(d-2)", "Id" => "d-2"}} =
                OData.create(client, "Contact", %{"Name" => "Driver"})
+    end
+
+    test "get_field_value into: Collectable gates disk writes to 2xx and preserves non-2xx errors" do
+      tmp_dir = System.tmp_dir!()
+
+      error_path =
+        Path.join(tmp_dir, "creatio-err-#{System.unique_integer([:positive])}.bin")
+
+      empty_path =
+        Path.join(tmp_dir, "creatio-empty-#{System.unique_integer([:positive])}.bin")
+
+      ok_path =
+        Path.join(tmp_dir, "creatio-ok-#{System.unique_integer([:positive])}.bin")
+
+      on_exit(fn ->
+        File.rm(error_path)
+        File.rm(empty_path)
+        File.rm(ok_path)
+      end)
+
+      plug = fn conn ->
+        case conn.request_path do
+          "/0/odata/SysFile(err-404)/Data/$value" ->
+            conn
+            |> Plug.Conn.put_resp_content_type("application/json")
+            |> Plug.Conn.send_resp(
+              404,
+              Jason.encode!(%{"error" => %{"message" => "File missing"}})
+            )
+
+          "/0/ServiceModel/EntityDataService.svc/AccountFileCollection(guid'err-500')/Data/$value" ->
+            conn
+            |> Plug.Conn.put_resp_content_type("application/json")
+            |> Plug.Conn.send_resp(
+              500,
+              Jason.encode!(%{"error" => %{"message" => "Server boom"}})
+            )
+
+          "/0/odata/SysFile(empty-204)/Data/$value" ->
+            Plug.Conn.send_resp(conn, 204, "")
+
+          "/0/odata/SysFile(ok-200)/Data/$value" ->
+            conn
+            |> Plug.Conn.put_resp_content_type("application/octet-stream")
+            |> Plug.Conn.send_resp(200, "binary-payload-bytes")
+        end
+      end
+
+      client = Client.new(base_url: "https://crm.test", req_options: [plug: plug])
+
+      assert {:error, %Error{status: 404, message: "File missing"}} =
+               OData.get_field_value(client, "SysFile", "err-404", "Data",
+                 into: File.stream!(error_path)
+               )
+
+      refute File.exists?(error_path)
+
+      assert {:error, %Error{status: 500, message: "Server boom"}} =
+               OData3.get_field_value(client, "AccountFile", "err-500", "Data",
+                 into: File.stream!(error_path)
+               )
+
+      refute File.exists?(error_path)
+
+      assert {:ok, nil} =
+               OData.get_field_value(client, "SysFile", "empty-204", "Data",
+                 into: File.stream!(empty_path)
+               )
+
+      refute File.exists?(empty_path)
+
+      assert {:ok, %File.Stream{}} =
+               OData.get_field_value(client, "SysFile", "ok-200", "Data",
+                 into: File.stream!(ok_path)
+               )
+
+      assert File.read!(ok_path) == "binary-payload-bytes"
+    end
+
+    test "OData.count, OData3.count, and DataService.custom_service normalize IIS text/html JSON and reject WAF HTML" do
+      iis_plug = fn conn ->
+        cond do
+          conn.request_path == "/0/odata/Contact" ->
+            conn
+            |> Plug.Conn.put_resp_content_type("text/html")
+            |> Plug.Conn.send_resp(
+              200,
+              "\uFEFF" <> Jason.encode!(%{"@odata.count" => 42, "value" => []})
+            )
+
+          conn.request_path == "/0/odata/Contact/$count" ->
+            conn
+            |> Plug.Conn.put_resp_content_type("text/html")
+            |> Plug.Conn.send_resp(200, "\uFEFF42")
+
+          conn.request_path == "/0/ServiceModel/EntityDataService.svc/ContactCollection/$count" ->
+            conn
+            |> Plug.Conn.put_resp_content_type("text/html")
+            |> Plug.Conn.send_resp(200, "\uFEFF19")
+
+          conn.request_path == "/0/rest/MySvc/Info" ->
+            conn
+            |> Plug.Conn.put_resp_content_type("text/html")
+            |> Plug.Conn.send_resp(200, "\uFEFF" <> Jason.encode!(%{"ok" => true}))
+        end
+      end
+
+      iis_client = Client.new(base_url: "https://crm.test", req_options: [plug: iis_plug])
+
+      assert {:ok, 42} = OData.count(iis_client, "Contact", strategy: :top_zero)
+      assert {:ok, 42} = OData.count(iis_client, "Contact", strategy: :path)
+      assert {:ok, 19} = OData3.count(iis_client, "Contact")
+
+      assert {:ok, %{"ok" => true}} =
+               DataService.custom_service(iis_client, "MySvc", "Info", method: :get)
+
+      waf_html = "<html><body><iframe src=\"/_Incapsula_Resource\"></iframe></body></html>"
+
+      waf_plug = fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/html")
+        |> Plug.Conn.send_resp(200, waf_html)
+      end
+
+      waf_client = Client.new(base_url: "https://crm.test", req_options: [plug: waf_plug])
+
+      assert {:error, %Error{status: 200}} =
+               OData.count(waf_client, "Contact", strategy: :top_zero)
+
+      assert {:error, %Error{status: 200}} = OData.count(waf_client, "Contact", strategy: :path)
+      assert {:error, %Error{status: 200}} = OData3.count(waf_client, "Contact")
+
+      assert {:error, %Error{status: 200}} =
+               DataService.custom_service(waf_client, "MySvc", "Info", method: :get)
+    end
+
+    test "OData.create return: :minimal avoids mis-extracting Id from composite keys and stream/list validate entities eagerly" do
+      plug = fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header(
+          "odata-entityid",
+          "https://crm.test/0/odata/OrderItem(OrderId=1,ItemId=2)"
+        )
+        |> Plug.Conn.send_resp(204, "")
+      end
+
+      client = Client.new(base_url: "https://crm.test", req_options: [plug: plug])
+
+      assert {:ok, created} =
+               OData.create(client, "OrderItem", %{"Name" => "X"}, return: :minimal)
+
+      assert created["@odata.id"] == "https://crm.test/0/odata/OrderItem(OrderId=1,ItemId=2)"
+      refute Map.has_key?(created, "Id")
+
+      for empty_target <- ["", Query.new("")] do
+        assert_raise ArgumentError, ~r/empty/, fn -> OData.list(client, empty_target) end
+        assert_raise ArgumentError, ~r/empty/, fn -> OData.stream(client, empty_target) end
+        assert_raise ArgumentError, ~r/empty/, fn -> OData.stream!(client, empty_target) end
+
+        assert_raise ArgumentError, ~r/empty/, fn ->
+          OData.stream(client, empty_target, max_records: 0)
+        end
+
+        assert_raise ArgumentError, ~r/empty/, fn -> OData3.list(client, empty_target) end
+        assert_raise ArgumentError, ~r/empty/, fn -> OData3.stream(client, empty_target) end
+        assert_raise ArgumentError, ~r/empty/, fn -> OData3.stream!(client, empty_target) end
+
+        assert_raise ArgumentError, ~r/empty/, fn ->
+          OData3.stream(client, empty_target, max_records: 0)
+        end
+      end
+    end
+
+    test "rejects nil, whitespace, and invalid non-string/Query targets without network requests" do
+      id = "00000000-0000-0000-0000-000000000003"
+
+      client =
+        Client.new(
+          base_url: "https://test.creatio.com",
+          req_options: [
+            plug: fn conn ->
+              flunk("should not issue HTTP request for invalid entity: #{conn.request_path}")
+            end
+          ]
+        )
+
+      for bad_target <- [nil, "   ", Query.new(nil), Query.new("   "), :Contact] do
+        assert_raise ArgumentError, fn -> OData.list(client, bad_target) end
+        assert_raise ArgumentError, fn -> OData.count(client, bad_target) end
+        assert_raise ArgumentError, fn -> OData.stream(client, bad_target) end
+        assert_raise ArgumentError, fn -> OData3.list(client, bad_target) end
+        assert_raise ArgumentError, fn -> OData3.count(client, bad_target) end
+        assert_raise ArgumentError, fn -> OData3.stream(client, bad_target) end
+      end
+
+      for bad_name <- [nil, "", "   ", :Contact] do
+        assert_raise ArgumentError, fn -> OData.get(client, bad_name, id) end
+        assert_raise ArgumentError, fn -> OData.create(client, bad_name, %{"Name" => "X"}) end
+        assert_raise ArgumentError, fn -> OData.update(client, bad_name, id, %{"Name" => "X"}) end
+        assert_raise ArgumentError, fn -> OData.delete(client, bad_name, id) end
+        assert_raise ArgumentError, fn -> OData.get_field(client, bad_name, id, "Name") end
+        assert_raise ArgumentError, fn -> OData.get_field_value(client, bad_name, id, "Photo") end
+
+        assert_raise ArgumentError, fn ->
+          OData.update_field(client, bad_name, id, "Name", "X")
+        end
+
+        assert_raise ArgumentError, fn -> OData.delete_field(client, bad_name, id, "Name") end
+
+        assert_raise ArgumentError, fn ->
+          OData.get_navigation(client, bad_name, id, "Account")
+        end
+
+        assert_raise ArgumentError, fn -> OData3.get(client, bad_name, id) end
+        assert_raise ArgumentError, fn -> OData3.create(client, bad_name, %{"Name" => "X"}) end
+
+        assert_raise ArgumentError, fn ->
+          OData3.update(client, bad_name, id, %{"Name" => "X"})
+        end
+
+        assert_raise ArgumentError, fn -> OData3.delete(client, bad_name, id) end
+        assert_raise ArgumentError, fn -> OData3.get_field(client, bad_name, id, "Name") end
+
+        assert_raise ArgumentError, fn ->
+          OData3.get_field_value(client, bad_name, id, "Photo")
+        end
+      end
+    end
+
+    test "OData3.count/3 supports string, __count, count, IIS text/html, forwards req_options, and preserves parse error metadata" do
+      cases = [
+        {"application/json", %{"d" => "42"}, 42},
+        {"application/json", %{"d" => %{"__count" => "15"}}, 15},
+        {"application/json", %{"d" => %{"count" => 7}}, 7},
+        {"text/plain", "42", 42},
+        {"text/html", "123", 123}
+      ]
+
+      for {ct, payload, expected} <- cases do
+        client =
+          Client.new(
+            base_url: "https://test.creatio.com",
+            req_options: [
+              plug: fn conn ->
+                assert Plug.Conn.get_req_header(conn, "x-count-check") == ["1"]
+
+                if ct == "application/json" do
+                  Req.Test.json(conn, payload)
+                else
+                  conn
+                  |> Plug.Conn.put_resp_content_type(ct)
+                  |> Plug.Conn.send_resp(200, payload)
+                end
+              end
+            ]
+          )
+
+        assert {:ok, ^expected} =
+                 OData3.count(client, "Contact", req_options: [headers: [{"x-count-check", "1"}]])
+      end
+
+      bad_client =
+        Client.new(
+          base_url: "https://test.creatio.com",
+          req_options: [
+            plug: fn conn -> Req.Test.json(conn, %{"d" => "not-a-number"}) end
+          ]
+        )
+
+      assert {:error, %Error{status: 200, response: %Req.Response{status: 200}}} =
+               OData3.count(bad_client, "Contact")
+    end
+
+    test "Auth validates URLs for OAuth/OIDC discovery and strips stale headers in login_forms/4" do
+      unconfigured =
+        Client.new(
+          base_url: "",
+          identity_service_url: nil,
+          client_id: "cid",
+          client_secret: "sec"
+        )
+
+      assert {:error, %Error{message: msg1}} = Auth.openid_configuration(unconfigured)
+      assert msg1 =~ "URL"
+
+      assert {:error, %Error{message: msg2}} =
+               Auth.login_oauth(unconfigured, identity_service_url: "/relative-only")
+
+      assert msg2 =~ "URL"
+
+      stale_client =
+        Client.new(
+          base_url: "https://test.creatio.com",
+          auth_token: "stale-bearer",
+          cookie: "stale-cookie",
+          bpmcsrf: "stale-csrf",
+          req_options: [
+            plug: fn conn ->
+              assert Plug.Conn.get_req_header(conn, "authorization") == []
+              assert Plug.Conn.get_req_header(conn, "cookie") == []
+              assert Plug.Conn.get_req_header(conn, "bpmcsrf") == []
+
+              conn
+              |> Plug.Conn.put_resp_cookie("BPMCSRF", "fresh-csrf", path: "/")
+              |> Plug.Conn.put_resp_cookie(".ASPXAUTH", "fresh-auth", path: "/")
+              |> Req.Test.json(%{"Code" => 0})
+            end
+          ]
+        )
+
+      assert {:ok, authed} = Auth.login_forms(stale_client, "user", "pass")
+      assert authed.bpmcsrf == "fresh-csrf"
+    end
+
+    test "keyset stream auto-selects cursor_field, detects missing cursor, prioritizes opts[:filter], and tie-breaks duplicates" do
+      ts = "2026-01-01T00:00:00Z"
+
+      plug = fn conn ->
+        conn = Plug.Conn.fetch_query_params(conn)
+        params = conn.query_params
+        select_fields = String.split(params["$select"] || "", ",")
+
+        assert "ModifiedOn" in select_fields
+        assert "Id" in select_fields
+        assert params["$orderby"] == "ModifiedOn asc, Id asc"
+        assert params["$filter"] =~ "Active eq true"
+        refute params["$filter"] =~ "Active eq false"
+
+        records =
+          if String.contains?(params["$filter"], "Id gt") do
+            [%{"Id" => "id-3", "Name" => "C", "ModifiedOn" => ts}]
+          else
+            [
+              %{"Id" => "id-1", "Name" => "A", "ModifiedOn" => ts},
+              %{"Id" => "id-2", "Name" => "B", "ModifiedOn" => ts}
+            ]
+          end
+
+        Req.Test.json(conn, %{"value" => records})
+      end
+
+      client = Client.new(base_url: "https://test.creatio.com", req_options: [plug: plug])
+
+      query =
+        Query.new("Contact")
+        |> Query.select(["Name"])
+        |> Query.filter_eq("Active", false)
+
+      items =
+        client
+        |> OData.stream(query, cursor_field: "ModifiedOn", page_size: 2, filter: "Active eq true")
+        |> Enum.to_list()
+
+      assert Enum.map(items, fn {:ok, record} -> record["Id"] end) == ["id-1", "id-2", "id-3"]
+
+      missing_cursor_client =
+        Client.new(
+          base_url: "https://test.creatio.com",
+          req_options: [
+            plug: fn conn ->
+              Req.Test.json(conn, %{"value" => [%{"Id" => "id-1", "Name" => "NoCursor"}]})
+            end
+          ]
+        )
+
+      assert [{:ok, %{"Id" => "id-1"}}, {:error, %Error{message: msg}}] =
+               missing_cursor_client
+               |> OData.stream("Contact", cursor_field: "ModifiedOn", page_size: 1)
+               |> Enum.to_list()
+
+      assert msg =~ "ModifiedOn"
     end
   end
 end

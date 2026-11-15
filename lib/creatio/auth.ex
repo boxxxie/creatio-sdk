@@ -29,7 +29,12 @@ defmodule Creatio.Auth do
       url = Keyword.get(opts, :url, "/ServiceModel/AuthService.svc/Login")
       body = %{"UserName" => username, "UserPassword" => password}
 
-      req = Req.Request.put_header(client.req, "content-type", "application/json; charset=utf-8")
+      req =
+        client.req
+        |> Req.Request.delete_header("authorization")
+        |> Req.Request.delete_header("cookie")
+        |> Req.Request.delete_header("bpmcsrf")
+        |> Req.Request.put_header("content-type", "application/json; charset=utf-8")
 
       case Req.post(req, url: url, json: body) do
         {:ok, %Req.Response{} = resp} ->
@@ -148,44 +153,46 @@ defmodule Creatio.Auth do
               "#{identity_url}#{normalized_path}"
             end
 
-          form_data = [
-            grant_type: "client_credentials",
-            client_id: client_id,
-            client_secret: client_secret
-          ]
+          with :ok <- validate_absolute_url(full_token_url, "OAuth 2.0 token endpoint") do
+            form_data = [
+              grant_type: "client_credentials",
+              client_id: client_id,
+              client_secret: client_secret
+            ]
 
-          extra_req_opts = Keyword.get(opts, :req_options, [])
+            extra_req_opts = Keyword.get(opts, :req_options, [])
 
-          token_req =
-            client
-            |> identity_base_req()
-            |> Req.merge([url: full_token_url, form: form_data] ++ extra_req_opts)
+            token_req =
+              client
+              |> identity_base_req(:oauth)
+              |> Req.merge([url: full_token_url, form: form_data] ++ extra_req_opts)
 
-          case Req.post(token_req) do
-            {:ok, %Req.Response{} = raw_resp} ->
-              case Util.normalize_json_response(raw_resp) do
-                %{status: 200, body: %{"access_token" => token} = token_body} ->
-                  updated_client =
-                    %Client{
-                      client
-                      | client_id: client_id,
-                        client_secret: client_secret,
-                        identity_service_url:
-                          if(identity_url != "",
-                            do: identity_url,
-                            else: client.identity_service_url
-                          )
-                    }
-                    |> Client.put_bearer_token(token)
+            case Req.post(token_req) do
+              {:ok, %Req.Response{} = raw_resp} ->
+                case Util.normalize_json_response(raw_resp) do
+                  %{status: 200, body: %{"access_token" => token} = token_body} ->
+                    updated_client =
+                      %Client{
+                        client
+                        | client_id: client_id,
+                          client_secret: client_secret,
+                          identity_service_url:
+                            if(identity_url != "",
+                              do: identity_url,
+                              else: client.identity_service_url
+                            )
+                      }
+                      |> Client.put_bearer_token(token)
 
-                  {:ok, updated_client, token_body}
+                    {:ok, updated_client, token_body}
 
-                %Req.Response{} = resp ->
-                  {:error, Error.from_response(resp)}
-              end
+                  %Req.Response{} = resp ->
+                    {:error, Error.from_response(resp)}
+                end
 
-            {:error, exception} ->
-              Error.wrap_error(exception)
+              {:error, exception} ->
+                Error.wrap_error(exception)
+            end
           end
       end
     end)
@@ -206,7 +213,7 @@ defmodule Creatio.Auth do
         {:ok, %Req.Response{} = raw_resp} ->
           resp = Util.normalize_json_response(raw_resp)
 
-          if resp.status == 200 and not Util.html_or_xml_response?(resp) do
+          if resp.status == 200 and valid_health_response?(resp) do
             {:ok, resp.body}
           else
             {:error, Error.from_response(resp)}
@@ -217,6 +224,20 @@ defmodule Creatio.Auth do
       end
     end)
   end
+
+  defp valid_health_response?(%Req.Response{body: %{} = body}) do
+    not Map.has_key?(body, "error")
+  end
+
+  defp valid_health_response?(%Req.Response{body: body} = resp) when is_binary(body) do
+    trimmed = body |> String.trim_leading("\uFEFF") |> String.trim()
+
+    trimmed != "" and
+      not String.starts_with?(trimmed, ["{", "["]) and
+      not Util.html_or_xml_markup?(resp)
+  end
+
+  defp valid_health_response?(_), do: false
 
   @doc """
   Retrieves the OpenID configuration from the Identity Service (`/.well-known/openid-configuration`).
@@ -235,12 +256,17 @@ defmodule Creatio.Auth do
 
       extra_req_opts = Keyword.get(opts, :req_options, [])
 
-      req =
-        client
-        |> identity_base_req()
-        |> Req.merge([url: url] ++ extra_req_opts)
+      effective_url =
+        resolve_request_url(url, Keyword.get(extra_req_opts, :base_url))
 
-      handle_openid_response(Req.get(req))
+      with :ok <- validate_absolute_url(effective_url, "OpenID configuration") do
+        req =
+          client
+          |> identity_base_req(:openid_configuration)
+          |> Req.merge([url: url] ++ extra_req_opts)
+
+        handle_openid_response(Req.get(req))
+      end
     end)
   end
 
@@ -250,22 +276,51 @@ defmodule Creatio.Auth do
       %{auth_mode: :openid_configuration, base_url: origin_from_url(url)},
       fn ->
         req_opts = Keyword.get(opts, :req_options, [])
+        effective_url = resolve_request_url(url, Keyword.get(req_opts, :base_url))
 
-        req =
-          [url: url]
-          |> Keyword.merge(req_opts)
-          |> Req.new()
-          |> Telemetry.attach_req_steps()
+        with :ok <- validate_absolute_url(effective_url, "OpenID configuration") do
+          req =
+            [url: url]
+            |> Keyword.merge(req_opts)
+            |> Req.new()
+            |> Telemetry.attach_req_steps()
 
-        handle_openid_response(Req.get(req))
+          handle_openid_response(Req.get(req))
+        end
       end
     )
   end
 
+  defp resolve_request_url(url, base_url)
+       when is_binary(base_url) and base_url != "" and is_binary(url) do
+    if String.starts_with?(url, ["http://", "https://"]) do
+      url
+    else
+      "#{String.trim_trailing(base_url, "/")}#{if String.starts_with?(url, "/"), do: url, else: "/#{url}"}"
+    end
+  end
+
+  defp resolve_request_url(url, _base_url), do: url
+
+  defp validate_absolute_url(url, label) when is_binary(url) do
+    case URI.parse(url) do
+      %URI{scheme: scheme, host: host}
+      when scheme in ["http", "https"] and is_binary(host) and host != "" ->
+        :ok
+
+      _ ->
+        {:error, Error.new(message: "Invalid or missing URL for #{label}: #{inspect(url)}")}
+    end
+  end
+
+  defp validate_absolute_url(other, label) do
+    {:error, Error.new(message: "Invalid or missing URL for #{label}: #{inspect(other)}")}
+  end
+
   defp origin_from_url(url) do
     case URI.parse(url) do
-      %URI{scheme: scheme, host: host} when is_binary(scheme) and is_binary(host) ->
-        "#{scheme}://#{host}"
+      %URI{scheme: scheme, host: host, port: port} when is_binary(scheme) and is_binary(host) ->
+        Telemetry.format_origin(scheme, host, port)
 
       _ ->
         ""
@@ -282,9 +337,10 @@ defmodule Creatio.Auth do
   defp handle_openid_response({:error, exception}), do: Error.wrap_error(exception)
 
   # Reuses client.req (Finch pool, TLS, retry, :plug) without leaking CRM session headers
-  defp identity_base_req(%Client{req: %Req.Request{} = req}) do
+  defp identity_base_req(%Client{req: %Req.Request{} = req}, auth_mode) do
     req
     |> Req.Request.put_option(:base_url, nil)
+    |> Req.Request.put_private(:creatio_client_meta, %{base_url: nil, auth_mode: auth_mode})
     |> Req.Request.delete_header("authorization")
     |> Req.Request.delete_header("cookie")
     |> Req.Request.delete_header("bpmcsrf")

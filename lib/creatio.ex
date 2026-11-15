@@ -316,14 +316,14 @@ defmodule Creatio do
   Pass `return: :minimal` or `return: :representation` to control the `Prefer` header.
   """
   @spec update(Client.t() | Req.Request.t(), String.t(), String.t(), map(), keyword()) ::
-          :ok | {:ok, map()} | {:error, Error.t()}
+          :ok | {:ok, map() | binary()} | {:error, Error.t()}
   defdelegate update(client, entity, id, attrs, opts \\ []), to: OData
 
   @doc """
   Same as `update/5`, raising `Creatio.Error` on failure.
   """
   @spec update!(Client.t() | Req.Request.t(), String.t(), String.t(), map(), keyword()) ::
-          :ok | map()
+          :ok | map() | binary()
   defdelegate update!(client, entity, id, attrs, opts \\ []), to: OData
 
   @doc """
@@ -382,14 +382,15 @@ defmodule Creatio do
   @doc """
   Executes an OData batch request (`POST /0/odata/$batch`).
   """
-  @spec batch(Client.t() | Req.Request.t(), Batch.t() | [map()], keyword()) ::
+  @spec batch(Client.t() | Req.Request.t(), Batch.t() | map() | [map()] | binary(), keyword()) ::
           {:ok, list() | any()} | {:error, Error.t()}
   defdelegate batch(client, batch_or_requests, opts \\ []), to: OData
 
   @doc """
   Same as `batch/3`, raising `Creatio.Error` on failure.
   """
-  @spec batch!(Client.t() | Req.Request.t(), Batch.t() | [map()], keyword()) :: list() | any()
+  @spec batch!(Client.t() | Req.Request.t(), Batch.t() | map() | [map()] | binary(), keyword()) ::
+          list() | any()
   defdelegate batch!(client, batch_or_requests, opts \\ []), to: OData
 
   @doc """
@@ -703,14 +704,14 @@ defmodule Creatio do
   Updates an entity via legacy OData 3.
   """
   @spec odata3_update(Client.t() | Req.Request.t(), String.t(), String.t(), map(), keyword()) ::
-          :ok | {:ok, map()} | {:error, Error.t()}
+          :ok | {:ok, map() | binary()} | {:error, Error.t()}
   defdelegate odata3_update(client, entity, id, attrs, opts \\ []), to: OData3, as: :update
 
   @doc """
   Same as `odata3_update/5`, raising `Creatio.Error` on failure.
   """
   @spec odata3_update!(Client.t() | Req.Request.t(), String.t(), String.t(), map(), keyword()) ::
-          :ok | map()
+          :ok | map() | binary()
   defdelegate odata3_update!(client, entity, id, attrs, opts \\ []), to: OData3, as: :update!
 
   @doc """

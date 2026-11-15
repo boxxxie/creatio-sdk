@@ -266,5 +266,17 @@ defmodule Creatio.BatchTest do
 
       assert String.contains?(url1, "Contact(00000000-0000-0000-0000-000000000001)")
     end
+
+    test "raises ArgumentError on invalid :format option" do
+      client = Creatio.Client.new(base_url: "https://test.creatio.com")
+
+      assert_raise ArgumentError, ~r/invalid batch :format option/, fn ->
+        Batch.execute(client, Batch.new() |> Batch.add_get("Contact"), format: :multiprat)
+      end
+
+      assert_raise ArgumentError, ~r/invalid batch :format option/, fn ->
+        Batch.execute(client, "raw body", boundary: "b1", format: :multiprat)
+      end
+    end
   end
 end

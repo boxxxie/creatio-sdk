@@ -56,9 +56,16 @@ defmodule Creatio.OData.Query do
   @doc """
   Initializes a new query for an entity collection.
   """
-  @spec new(String.t()) :: t()
+  @spec new(String.t() | nil) :: t()
+  def new(nil), do: %__MODULE__{entity: ""}
+
   def new(entity) when is_binary(entity) do
-    %__MODULE__{entity: entity}
+    %__MODULE__{entity: String.trim(entity)}
+  end
+
+  def new(other) do
+    raise ArgumentError,
+          "expected a string or nil entity name in Creatio.OData.Query.new/1, got: #{inspect(other)}"
   end
 
   @doc """
@@ -521,18 +528,35 @@ defmodule Creatio.OData.Query do
   @spec get_skip(t()) :: non_neg_integer() | nil
   def get_skip(%__MODULE__{skip: skip_val}), do: skip_val
 
-  @doc """
-  Clears pagination and inline count state (`top`, `skip`, and `count`) so a query
-  can serve as a reusable per-page template during streaming.
-  """
+  @doc false
+  @spec require_entity!(t(), String.t()) :: String.t()
+  def require_entity!(%__MODULE__{entity: entity}, fun_name) when is_binary(entity) do
+    trimmed = String.trim(entity)
+
+    if trimmed == "" do
+      raise ArgumentError,
+            "Creatio.OData.Query must specify a non-empty entity name before calling #{fun_name}"
+    else
+      trimmed
+    end
+  end
+
+  def require_entity!(other, fun_name) do
+    raise ArgumentError,
+          "expected a non-empty entity name binary or %Creatio.OData.Query{} in #{fun_name}, got: #{inspect(other)}"
+  end
+
+  @doc false
+  @spec has_select?(t()) :: boolean()
+  def has_select?(%__MODULE__{select_rev: rev}), do: rev != []
+
+  @doc false
   @spec reset_stream_target(t()) :: t()
   def reset_stream_target(%__MODULE__{} = query) do
     %__MODULE__{query | count: false, top: nil, skip: nil}
   end
 
-  @doc """
-  Clears accumulated `$filter` and `$orderby` clauses from the query.
-  """
+  @doc false
   @spec strip_filter_and_order(t()) :: t()
   def strip_filter_and_order(%__MODULE__{} = query) do
     %__MODULE__{query | filters_rev: [], orderby_rev: []}
@@ -572,33 +596,63 @@ defmodule Creatio.OData.Query do
   end
 
   defp wrap_if_contains_or(expr) do
-    if String.contains?(expr, " or ") and not wrapped_in_outer_parens?(expr) do
+    trimmed = String.trim(expr)
+
+    if contains_or_outside_quotes?(trimmed) and not wrapped_in_outer_parens?(trimmed) do
       "(#{expr})"
     else
       expr
     end
   end
 
-  # Verifies an opening '(' at byte 0 stays open until the final byte (not "(a) or (b)")
+  defp contains_or_outside_quotes?(expr) do
+    expr
+    |> replace_quoted_literals(<<>>)
+    |> then(&Regex.match?(~r/(?:^|[\s()])or(?:$|[\s()])/i, &1))
+  end
+
+  defp replace_quoted_literals(<<"'", rest::binary>>, acc) do
+    skip_quoted_literal(rest, <<acc::binary, " ">>)
+  end
+
+  defp replace_quoted_literals(<<char, rest::binary>>, acc) do
+    replace_quoted_literals(rest, <<acc::binary, char>>)
+  end
+
+  defp replace_quoted_literals(<<>>, acc), do: acc
+
+  defp skip_quoted_literal(<<"''", rest::binary>>, acc), do: skip_quoted_literal(rest, acc)
+  defp skip_quoted_literal(<<"'", rest::binary>>, acc), do: replace_quoted_literals(rest, acc)
+  defp skip_quoted_literal(<<_, rest::binary>>, acc), do: skip_quoted_literal(rest, acc)
+  defp skip_quoted_literal(<<>>, acc), do: acc
+
+  # Verifies an opening '(' at byte 0 stays open until the final byte (not "(a) or (b)"),
+  # ignoring parentheses inside single-quoted OData string literals (including escaped '').
   defp wrapped_in_outer_parens?(<<"(", rest::binary>>) do
-    paren_depth_closes_at_end?(rest, 1)
+    paren_depth_closes_at_end?(rest, 1, false)
   end
 
   defp wrapped_in_outer_parens?(_), do: false
 
-  defp paren_depth_closes_at_end?(<<")">>, 1), do: true
-  defp paren_depth_closes_at_end?(<<")", _::binary>>, 1), do: false
+  defp paren_depth_closes_at_end?(<<"''", rest::binary>>, depth, true),
+    do: paren_depth_closes_at_end?(rest, depth, true)
 
-  defp paren_depth_closes_at_end?(<<"(", rest::binary>>, depth),
-    do: paren_depth_closes_at_end?(rest, depth + 1)
+  defp paren_depth_closes_at_end?(<<"'", rest::binary>>, depth, in_quotes?),
+    do: paren_depth_closes_at_end?(rest, depth, not in_quotes?)
 
-  defp paren_depth_closes_at_end?(<<")", rest::binary>>, depth) when depth > 1,
-    do: paren_depth_closes_at_end?(rest, depth - 1)
+  defp paren_depth_closes_at_end?(<<")">>, 1, false), do: true
+  defp paren_depth_closes_at_end?(<<")", _::binary>>, 1, false), do: false
 
-  defp paren_depth_closes_at_end?(<<_, rest::binary>>, depth),
-    do: paren_depth_closes_at_end?(rest, depth)
+  defp paren_depth_closes_at_end?(<<"(", rest::binary>>, depth, false),
+    do: paren_depth_closes_at_end?(rest, depth + 1, false)
 
-  defp paren_depth_closes_at_end?(<<>>, _depth), do: false
+  defp paren_depth_closes_at_end?(<<")", rest::binary>>, depth, false) when depth > 1,
+    do: paren_depth_closes_at_end?(rest, depth - 1, false)
+
+  defp paren_depth_closes_at_end?(<<_, rest::binary>>, depth, in_quotes?),
+    do: paren_depth_closes_at_end?(rest, depth, in_quotes?)
+
+  defp paren_depth_closes_at_end?(<<>>, _depth, _in_quotes?), do: false
 
   defp prepend_split_tokens(item, acc) do
     item
@@ -610,32 +664,36 @@ defmodule Creatio.OData.Query do
   defp split_top_level_commas(""), do: []
 
   defp split_top_level_commas(str) when is_binary(str) do
-    do_split_top_level_commas(str, 0, 0, 0, [])
+    do_split_top_level_commas(str, 0, 0, 0, false, [])
   end
 
-  defp do_split_top_level_commas(str, pos, start, _depth, acc) when pos == byte_size(str) do
+  defp do_split_top_level_commas(str, pos, start, _depth, _in_quotes?, acc)
+       when pos == byte_size(str) do
     tail = str |> binary_part(start, pos - start) |> String.trim()
     acc = if tail == "", do: acc, else: [tail | acc]
     Enum.reverse(acc)
   end
 
-  defp do_split_top_level_commas(str, pos, start, depth, acc) do
+  defp do_split_top_level_commas(str, pos, start, depth, in_quotes?, acc) do
     byte = :binary.at(str, pos)
 
     cond do
-      byte == ?( ->
-        do_split_top_level_commas(str, pos + 1, start, depth + 1, acc)
+      byte == ?' ->
+        do_split_top_level_commas(str, pos + 1, start, depth, not in_quotes?, acc)
 
-      byte == ?) ->
-        do_split_top_level_commas(str, pos + 1, start, max(depth - 1, 0), acc)
+      not in_quotes? and byte == ?( ->
+        do_split_top_level_commas(str, pos + 1, start, depth + 1, false, acc)
 
-      byte == ?, and depth == 0 ->
+      not in_quotes? and byte == ?) ->
+        do_split_top_level_commas(str, pos + 1, start, max(depth - 1, 0), false, acc)
+
+      not in_quotes? and byte == ?, and depth == 0 ->
         chunk = str |> binary_part(start, pos - start) |> String.trim()
         next_acc = if chunk == "", do: acc, else: [chunk | acc]
-        do_split_top_level_commas(str, pos + 1, pos + 1, 0, next_acc)
+        do_split_top_level_commas(str, pos + 1, pos + 1, 0, false, next_acc)
 
       true ->
-        do_split_top_level_commas(str, pos + 1, start, depth, acc)
+        do_split_top_level_commas(str, pos + 1, start, depth, in_quotes?, acc)
     end
   end
 

@@ -402,6 +402,80 @@ defmodule Creatio.OData.QueryTest do
       assert Query.to_params(q_accumulated)["$expand"] ==
                "Account($select=Id,Name,Web),City($select=Id,Name,Country)"
     end
+
+    test "expand/2 and filter helpers ignore parens and commas inside single-quoted OData strings" do
+      q =
+        Query.new("Contact")
+        |> Query.expand(
+          "Account($filter=Name eq 'Acme ) ''Quoted'', Inc.';$select=Id,Name), Owner($select=Id,Name)"
+        )
+
+      assert Query.to_params(q)["$expand"] ==
+               "Account($filter=Name eq 'Acme ) ''Quoted'', Inc.';$select=Id,Name),Owner($select=Id,Name)"
+
+      q_wrapped =
+        Query.new("Contact")
+        |> Query.and_filter("(Name eq 'Acme ) Corp')")
+        |> Query.or_filter("City eq 'A''s, (B)'")
+
+      assert Query.to_params(q_wrapped)["$filter"] ==
+               "((Name eq 'Acme ) Corp')) or (City eq 'A''s, (B)')"
+    end
+
+    test "wraps quoted-paren OR clauses, escaped quotes, uppercase OR, and whitespace OR safely" do
+      q_quoted_paren =
+        Query.new("Contact")
+        |> Query.filter("(Name eq 'a(') or (Name eq 'b)')")
+        |> Query.filter_eq("AccountId", "tenant-1")
+
+      assert Query.to_params(q_quoted_paren)["$filter"] ==
+               "((Name eq 'a(') or (Name eq 'b)')) and AccountId eq 'tenant-1'"
+
+      q_escaped =
+        Query.new("Contact")
+        |> Query.filter("(Name eq 'a''(') or (Name eq 'b)''')")
+        |> Query.filter_eq("Active", true)
+
+      assert Query.to_params(q_escaped)["$filter"] ==
+               "((Name eq 'a''(') or (Name eq 'b)''')) and Active eq true"
+
+      q_upper_or =
+        Query.new("Contact")
+        |> Query.filter("Name eq 'A' OR Name eq 'B'")
+        |> Query.filter_eq("Active", true)
+
+      assert Query.to_params(q_upper_or)["$filter"] ==
+               "(Name eq 'A' OR Name eq 'B') and Active eq true"
+
+      q_newline_or =
+        Query.new("Contact")
+        |> Query.filter("Name eq 'A'\n\tor\tName eq 'B'")
+        |> Query.filter_eq("Active", true)
+
+      assert Query.to_params(q_newline_or)["$filter"] ==
+               "(Name eq 'A'\n\tor\tName eq 'B') and Active eq true"
+
+      q_literal_or_only =
+        Query.new("Contact")
+        |> Query.filter("Name eq 'cat or dog'")
+        |> Query.filter_eq("Active", true)
+
+      assert Query.to_params(q_literal_or_only)["$filter"] ==
+               "Name eq 'cat or dog' and Active eq true"
+    end
+  end
+
+  describe "entity validation helpers" do
+    test "new/1 handles nil and trims whitespace, and require_entity!/2 rejects empty targets" do
+      assert Query.entity(Query.new(nil)) == ""
+      assert Query.entity(Query.new("  Contact  ")) == "Contact"
+
+      for invalid <- [Query.new(nil), Query.new("   "), nil, "   ", :Contact] do
+        assert_raise ArgumentError, fn ->
+          Query.require_entity!(invalid, "Creatio.OData.list/3")
+        end
+      end
+    end
   end
 
   describe "encapsulation accessors & stream helpers" do

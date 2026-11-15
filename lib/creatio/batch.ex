@@ -268,34 +268,20 @@ defmodule Creatio.Batch do
   def execute(client_or_req, %__MODULE__{} = batch, opts) do
     client = Client.ensure_client(client_or_req)
     requests = ordered_requests(batch)
-    raw_format = Keyword.get(opts, :format, :json)
-    format = if raw_format == :multipart, do: :multipart, else: :json
+    format = validate_batch_format!(opts, :json)
 
     Telemetry.span(
       :batch,
       %{format: format, operation_count: length(requests), base_url: client.base_url},
       fn ->
-        if client.read_only and has_mutation?(requests) do
-          {:error,
-           Error.new(
-             status: 403,
-             code: "ReadOnlyMode",
-             message: "Client is in read-only mode. Batch contains mutation requests."
-           )}
-        else
-          url = Keyword.get(opts, :url, "/0/odata/$batch")
-
-          prefer =
-            build_prefer(
-              batch.continue_on_error or Keyword.get(opts, :continue_on_error, false),
-              Keyword.get(opts, :return, batch.return)
-            )
-
-          case format do
-            :multipart -> execute_multipart(client, requests, url, prefer, opts)
-            :json -> execute_json(client, requests, url, prefer)
-          end
-        end
+        do_execute_requests(
+          client,
+          requests,
+          batch.continue_on_error or Keyword.get(opts, :continue_on_error, false),
+          Keyword.get(opts, :return, batch.return),
+          format,
+          opts
+        )
       end
     )
   end
@@ -309,24 +295,35 @@ defmodule Creatio.Batch do
   end
 
   def execute(client_or_req, requests, opts) when is_list(requests) do
-    normalized = Enum.map(requests, &normalize_raw_request/1)
-
-    batch = %__MODULE__{
-      requests: normalized,
-      count: length(normalized),
-      continue_on_error: Keyword.get(opts, :continue_on_error, false),
-      return: Keyword.get(opts, :return)
-    }
-
-    execute(client_or_req, batch, opts)
-  end
-
-  def execute(client_or_req, body, opts) when is_binary(body) do
     client = Client.ensure_client(client_or_req)
+    format = validate_batch_format!(opts, :json)
 
     Telemetry.span(
       :batch,
-      %{format: :multipart, operation_count: 0, base_url: client.base_url},
+      %{format: format, operation_count: length(requests), base_url: client.base_url},
+      fn ->
+        normalized = Enum.map(requests, &normalize_raw_request/1)
+
+        do_execute_requests(
+          client,
+          normalized,
+          Keyword.get(opts, :continue_on_error, false),
+          Keyword.get(opts, :return),
+          format,
+          opts
+        )
+      end
+    )
+  end
+
+  def execute(client_or_req, body, opts) when is_binary(body) do
+    _format = validate_batch_format!(opts, :multipart)
+    client = Client.ensure_client(client_or_req)
+    operation_count = count_multipart_operations(body)
+
+    Telemetry.span(
+      :batch,
+      %{format: :multipart, operation_count: operation_count, base_url: client.base_url},
       fn ->
         if client.read_only do
           {:error,
@@ -353,6 +350,43 @@ defmodule Creatio.Batch do
         end
       end
     )
+  end
+
+  defp do_execute_requests(client, requests, continue_on_error?, return_pref, format, opts) do
+    if client.read_only and has_mutation?(requests) do
+      {:error,
+       Error.new(
+         status: 403,
+         code: "ReadOnlyMode",
+         message: "Client is in read-only mode. Batch contains mutation requests."
+       )}
+    else
+      url = Keyword.get(opts, :url, "/0/odata/$batch")
+      prefer = build_prefer(continue_on_error?, return_pref)
+
+      case format do
+        :multipart -> execute_multipart(client, requests, url, prefer, opts)
+        :json -> execute_json(client, requests, url, prefer)
+      end
+    end
+  end
+
+  defp validate_batch_format!(opts, default) do
+    case Keyword.get(opts, :format, default) do
+      :json ->
+        :json
+
+      :multipart ->
+        :multipart
+
+      other ->
+        raise ArgumentError,
+              "invalid batch :format option #{inspect(other)}, expected :json or :multipart"
+    end
+  end
+
+  defp count_multipart_operations(body) when is_binary(body) do
+    length(Regex.scan(~r/content-type:\s*application\/http\b/i, body))
   end
 
   defp execute_json(client, requests, url, prefer) do
@@ -442,11 +476,8 @@ defmodule Creatio.Batch do
     cleaned_body = String.trim_leading(body_str, "\uFEFF")
 
     case Jason.decode(cleaned_body, strings: :copy) do
-      {:ok, %{"responses" => _} = map} ->
+      {:ok, %{} = map} ->
         parse_json_batch_response(%Req.Response{resp | body: map})
-
-      {:ok, %{} = entity} ->
-        parse_json_batch_response(%Req.Response{resp | body: entity})
 
       _ ->
         if String.starts_with?(String.trim_leading(cleaned_body), "--") do

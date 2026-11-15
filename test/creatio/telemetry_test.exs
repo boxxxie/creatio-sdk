@@ -520,7 +520,7 @@ defmodule Creatio.TelemetryTest do
       assert batch_stops == [
                {:json, 2, :ok, :ok},
                {:multipart, 2, :ok, :ok},
-               {:multipart, 0, :ok, :ok},
+               {:multipart, 1, :ok, :ok},
                {:json, 1, :error, :error}
              ]
     end
@@ -599,6 +599,220 @@ defmodule Creatio.TelemetryTest do
 
       assert_receive {:telemetry_event, [:creatio, :request, :stop], _,
                       %{base_url: "http://crm.test"}}
+    end
+  end
+
+  describe "pre-1.0 security and metadata hardening" do
+    test "redacts both response and details on Creatio.Error as well as lists and keyword lists" do
+      err_both = %Error{
+        status: 401,
+        message: "Unauthorized",
+        response: %Req.Response{
+          status: 401,
+          headers: %{"authorization" => ["Bearer secret-hdr"]},
+          body: %{
+            "refresh_token" => "secret-refresh",
+            "errors" => [%{"client_secret" => "nested-sec"}, [bpmcsrf: "kw-csrf"]]
+          }
+        },
+        details: %{
+          "access_token" => "secret-detail",
+          "items" => [%{"password" => "p1"}, %{"safe" => "ok"}],
+          "kw" => [bearer_token: "secret-bt", label: "keep"]
+        }
+      }
+
+      sanitized = Telemetry.sanitize_metadata(%{error: err_both})
+
+      assert sanitized.error.response.headers["authorization"] == ["[REDACTED]"]
+      assert sanitized.error.response.body["refresh_token"] == "[REDACTED]"
+
+      assert [%{"client_secret" => "[REDACTED]"}, [bpmcsrf: "[REDACTED]"]] =
+               sanitized.error.response.body["errors"]
+
+      assert sanitized.error.details["access_token"] == "[REDACTED]"
+
+      assert [%{"password" => "[REDACTED]"}, %{"safe" => "ok"}] =
+               sanitized.error.details["items"]
+
+      assert sanitized.error.details["kw"] == [bearer_token: "[REDACTED]", label: "keep"]
+    end
+
+    test "falls back to request URL origin when Client.from_req leaves base_url empty" do
+      plug = fn conn -> Req.Test.json(conn, %{"value" => []}) end
+
+      client = Client.from_req(Req.new(plug: plug))
+      assert client.base_url == ""
+
+      assert {:ok, %Req.Response{status: 200}} =
+               Req.get(client.req, url: "http://fallback.test:8443/0/odata/Contact")
+
+      assert_receive {:telemetry_event, [:creatio, :request, :stop], _,
+                      %{base_url: "http://fallback.test:8443"}}
+    end
+
+    test "reports Identity Service origin (with port) and auth_mode for OAuth and OIDC discovery" do
+      plug = fn conn ->
+        case conn.request_path do
+          "/.well-known/openid-configuration" ->
+            Req.Test.json(conn, %{"issuer" => "http://ids.example.com:8443"})
+
+          "/connect/token" ->
+            Req.Test.json(conn, %{
+              "access_token" => "tok-123",
+              "token_type" => "Bearer",
+              "expires_in" => 3600
+            })
+        end
+      end
+
+      client =
+        Client.new(
+          base_url: "https://crm.example.com",
+          identity_service_url: "http://ids.example.com:8443",
+          client_id: "cid",
+          client_secret: "csec",
+          bearer_token: "old-bearer",
+          req_options: [plug: plug]
+        )
+
+      assert {:ok, %{"issuer" => _}} = Auth.openid_configuration(client)
+
+      assert_receive {:telemetry_event, [:creatio, :request, :stop], _,
+                      %{
+                        base_url: "http://ids.example.com:8443",
+                        auth_mode: :openid_configuration
+                      }}
+
+      drain_events()
+
+      assert {:ok, _updated, _tok} = Auth.login_oauth(client)
+
+      assert_receive {:telemetry_event, [:creatio, :request, :stop], _,
+                      %{base_url: "http://ids.example.com:8443", auth_mode: :oauth}}
+    end
+
+    test "Batch.execute/3 emits batch telemetry spans for list and map payloads" do
+      plug = fn conn ->
+        Req.Test.json(conn, %{
+          "responses" => [%{"id" => "1", "status" => 200, "body" => %{"value" => []}}]
+        })
+      end
+
+      client = Client.new(base_url: "https://crm.test", req_options: [plug: plug])
+
+      assert {:ok, [%{id: "1"}]} =
+               Batch.execute(client, [%{method: "GET", url: "Contact"}])
+
+      assert_receive {:telemetry_event, [:creatio, :batch, :start], _, _}
+      assert_receive {:telemetry_event, [:creatio, :batch, :stop], _, %{result: :ok}}
+
+      drain_events()
+
+      assert {:ok, [%{id: "1"}]} =
+               Batch.execute(client, %{
+                 "requests" => [%{"id" => "1", "method" => "GET", "url" => "Contact"}]
+               })
+
+      assert_receive {:telemetry_event, [:creatio, :batch, :start], _, _}
+      assert_receive {:telemetry_event, [:creatio, :batch, :stop], _, %{result: :ok}}
+    end
+
+    test "all 5 domain :exception events emit documented metadata and redact secrets" do
+      sensitive_client =
+        Client.new(
+          base_url: "https://crm.example.com",
+          client_id: "cid-public",
+          client_secret: "super-secret-client-secret",
+          auth_token: "super-secret-bearer"
+        )
+
+      for domain <- [:odata, :odata3, :data_service, :auth, :batch] do
+        drain_events()
+
+        assert_raise Error, fn ->
+          Telemetry.span(domain, %{operation: :test_op, auth_token: "tok-leak"}, fn ->
+            # Capture sensitive_client inside exception struct to verify recursive redaction
+            raise Error,
+              status: 500,
+              message: "Authorization: Bearer raw-jwt-secret; BPMCSRF=csrf-leak",
+              details: %{client: sensitive_client, client_secret: "nested-secret"}
+          end)
+        end
+
+        assert_receive {:telemetry_event, [:creatio, ^domain, :start], _, start_meta}
+        refute Map.has_key?(start_meta, :auth_token) and start_meta.auth_token == "tok-leak"
+
+        assert_receive {:telemetry_event, [:creatio, ^domain, :exception], measurements, meta}
+        assert is_integer(measurements.duration) and measurements.duration >= 0
+        assert meta.result == :error
+        assert meta.status == :error
+        assert meta.kind == :error
+        assert meta.reason == meta.error
+        assert is_struct(meta.error, Error)
+        refute meta.error.message =~ "raw-jwt-secret"
+        refute meta.error.message =~ "csrf-leak"
+        assert meta.error.message =~ "[REDACTED]"
+        assert meta.error.details.client.client_secret == "[REDACTED]"
+        assert meta.error.details.client.auth_token == "[REDACTED]"
+        assert meta.error.details.client_secret == "[REDACTED]"
+
+        for {_m, _f, a, _loc} <- meta.stacktrace do
+          refute is_list(a)
+        end
+      end
+    end
+
+    test "Batch.execute/3 emits [:creatio, :batch, :exception] when list normalization fails inside span" do
+      client = Client.new(base_url: "https://crm.test")
+      drain_events()
+
+      assert_raise FunctionClauseError, fn ->
+        Batch.execute(client, [:not_a_map])
+      end
+
+      assert_receive {:telemetry_event, [:creatio, :batch, :start], _, _}
+
+      assert_receive {:telemetry_event, [:creatio, :batch, :exception], _,
+                      %{
+                        result: :error,
+                        status: :error,
+                        error: :function_clause,
+                        kind: :error
+                      }}
+    end
+
+    test "Req retries close every [:creatio, :request, :start] with a matching :stop event" do
+      {:ok, counter} = Agent.start_link(fn -> 0 end)
+      on_exit(fn -> if Process.alive?(counter), do: Agent.stop(counter) end)
+
+      plug = fn conn ->
+        attempt = Agent.get_and_update(counter, fn n -> {n + 1, n + 1} end)
+
+        if attempt == 1 do
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.send_resp(503, ~s({"error":"temporarily unavailable"}))
+        else
+          Req.Test.json(conn, %{"value" => [%{"Id" => "1"}]})
+        end
+      end
+
+      client =
+        Client.new(
+          base_url: "https://crm.test",
+          req_options: [plug: plug, retry: :transient, retry_delay: fn _ -> 0 end, max_retries: 2]
+        )
+
+      drain_events()
+      assert {:ok, [%{"Id" => "1"}]} = OData.list(client, "Contact")
+
+      events = drain_events()
+      starts = Enum.filter(events, fn {ev, _, _} -> ev == [:creatio, :request, :start] end)
+      stops = Enum.filter(events, fn {ev, _, _} -> ev == [:creatio, :request, :stop] end)
+
+      assert length(starts) == 2
+      assert length(stops) == 2
     end
   end
 end

@@ -3,6 +3,37 @@ defmodule Creatio.UtilTest do
 
   alias Creatio.Util
 
+  describe "prepare_field_value_request/4 transport safety" do
+    test "defaults Accept: */*, strips :method and :url, and preserves duplicate query params" do
+      req = Req.new(base_url: "https://crm.test")
+
+      {prepared_req, req_opts} =
+        Util.prepare_field_value_request(
+          req,
+          "/0/odata/Contact(1)/Photo/$value",
+          req_options: [
+            method: :delete,
+            url: "https://evil.test",
+            params: [{"$filter", "A"}, {"$filter", "B"}]
+          ]
+        )
+
+      assert Req.Request.get_header(prepared_req, "accept") == ["*/*"]
+      assert Keyword.fetch!(req_opts, :url) == "/0/odata/Contact(1)/Photo/$value"
+      refute Keyword.has_key?(req_opts, :method)
+      assert Keyword.fetch!(req_opts, :params) == [{"$filter", "A"}, {"$filter", "B"}]
+
+      {explicit_accept_req, _explicit_accept_opts} =
+        Util.prepare_field_value_request(
+          req,
+          "/0/odata/Contact(1)/Photo/$value",
+          headers: [{"Accept", "image/png"}]
+        )
+
+      assert Req.Request.get_header(explicit_accept_req, "accept") == ["image/png"]
+    end
+  end
+
   describe "response_header/2" do
     test "extracts header values case-insensitively from maps and tuple lists" do
       map_headers = %{
@@ -372,6 +403,85 @@ defmodule Creatio.UtilTest do
       assert req_opts[:decode_body] == false
       assert req_opts[:url] == "/0/odata/SysFile(1)/Data/$value"
       assert req_opts[:params] == %{"$select" => "Data", "a" => "top", "b" => "2"}
+    end
+
+    test "prepare_field_value_request/4 merges duplicate keyword headers/params and rejects unsafe req_options" do
+      base_req = Req.new(base_url: "https://crm.test")
+
+      {merged_req, req_opts} =
+        Util.prepare_field_value_request(
+          base_req,
+          "/0/odata/SysFile(1)/Data/$value",
+          req_options: [
+            headers: %{"x-one" => "1"},
+            headers: %{"x-two" => "2"},
+            params: %{"a" => "1", "c" => "old"},
+            params: %{"b" => "2", "c" => "new"}
+          ],
+          params: %{"a" => "top"}
+        )
+
+      assert merged_req.headers["x-one"] == ["1"]
+      assert merged_req.headers["x-two"] == ["2"]
+      assert req_opts[:params] == %{"a" => "top", "b" => "2", "c" => "new"}
+
+      assert_raise ArgumentError, ~r/unknown option key/, fn ->
+        Util.prepare_field_value_request(
+          base_req,
+          "/0/odata/SysFile(1)/Data/$value",
+          req_options: %{"definitely_unknown_creatio_opt_999" => true}
+        )
+      end
+
+      assert_raise ArgumentError, ~r/keyword list or plain map/, fn ->
+        Util.prepare_field_value_request(
+          base_req,
+          "/0/odata/SysFile(1)/Data/$value",
+          req_options: URI.parse("https://crm.test")
+        )
+      end
+
+      assert_raise ArgumentError, ~r/keyword list or plain map/, fn ->
+        Util.prepare_field_value_request(
+          base_req,
+          "/0/odata/SysFile(1)/Data/$value",
+          req_options: ["not_a_keyword"]
+        )
+      end
+    end
+
+    test "paginate_stream/5 parses valid string max_records and raises ArgumentError on invalid values" do
+      client = Creatio.Client.new(base_url: "https://crm.test", req_options: [plug: & &1])
+
+      page_fun = fn _c, _target, _opts ->
+        {:ok, [%{"Id" => "1"}, %{"Id" => "2"}, %{"Id" => "3"}]}
+      end
+
+      records =
+        Util.paginate_stream(client, "Contact", [max_records: "2"], :odata4, page_fun)
+        |> Enum.to_list()
+
+      assert records == [{:ok, %{"Id" => "1"}}, {:ok, %{"Id" => "2"}}]
+
+      top_limited =
+        Util.paginate_stream(
+          client,
+          Creatio.OData.Query.new("Contact") |> Creatio.OData.Query.top(2),
+          [],
+          :odata4,
+          page_fun
+        )
+        |> Enum.to_list()
+
+      assert top_limited == [{:ok, %{"Id" => "1"}}, {:ok, %{"Id" => "2"}}]
+
+      assert_raise ArgumentError, ~r/expected :max_records to be a non-negative integer/, fn ->
+        Util.paginate_stream(client, "Contact", [max_records: -1], :odata4, page_fun)
+      end
+
+      assert_raise ArgumentError, ~r/expected :max_records to be a non-negative integer/, fn ->
+        Util.paginate_stream(client, "Contact", [max_records: "abc"], :odata4, page_fun)
+      end
     end
   end
 end

@@ -242,7 +242,7 @@ defmodule Creatio.DataService do
             end
 
           resp.status in 200..299 ->
-            {:ok, resp.body}
+            {:error, Error.from_response(resp)}
 
           true ->
             {:error, Error.from_response(resp)}
@@ -299,11 +299,14 @@ defmodule Creatio.DataService do
             end
 
           case Req.request(req, req_opts) do
-            {:ok, %{status: status, body: body}} when status in 200..299 ->
-              {:ok, body}
+            {:ok, %Req.Response{} = raw_resp} ->
+              resp = Util.normalize_json_response(raw_resp)
 
-            {:ok, %Req.Response{} = resp} ->
-              {:error, Error.from_response(resp)}
+              if resp.status in 200..299 and not Util.html_or_xml_response?(resp) do
+                {:ok, resp.body}
+              else
+                {:error, Error.from_response(resp)}
+              end
 
             {:error, exception} ->
               Error.wrap_error(exception)

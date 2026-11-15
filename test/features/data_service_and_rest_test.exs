@@ -85,7 +85,7 @@ defmodule Creatio.Features.DataServiceAndRestTest do
                body: "plain ok response"
              )
       @upon running_select_query(%{"rootSchemaName" => "Contact"})
-      @then data_service_returned("plain ok response")
+      @then data_service_failed_with(status: 200, message: "plain ok response")
     end
   end
 
