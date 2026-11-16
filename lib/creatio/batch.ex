@@ -76,6 +76,13 @@ defmodule Creatio.Batch do
             return: :minimal | :representation | nil
           }
 
+  @type payload ::
+          t()
+          | %{required(:requests) => [map()]}
+          | %{required(String.t()) => [map()]}
+          | [map()]
+          | binary()
+
   @doc """
   Initializes a new batch request.
 
@@ -84,6 +91,7 @@ defmodule Creatio.Batch do
     * `:continue_on_error` - boolean. If `true`, adds header `Prefer: continue-on-error`.
     * `:return` - `:minimal` or `:representation`. Sets `Prefer: return=minimal` or `return=representation`.
   """
+  @spec new() :: t()
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
     %__MODULE__{
@@ -95,6 +103,7 @@ defmodule Creatio.Batch do
   @doc """
   Adds a generic request to the batch.
   """
+  @spec add(t(), String.t() | atom(), String.t()) :: t()
   @spec add(t(), String.t() | atom(), String.t(), keyword()) :: t()
   def add(%__MODULE__{} = batch, method, url, opts \\ []) do
     url = validate_batch_url!(url)
@@ -147,6 +156,7 @@ defmodule Creatio.Batch do
   - An entity collection or path: `add_get(batch, "Contact")` or `add_get(batch, "Contact", headers: ...)`
   - A single entity by ID: `add_get(batch, "Contact", "some-uuid")` or `add_get(batch, "Contact", "some-uuid", headers: ...)`
   """
+  @spec add_get(t(), String.t()) :: t()
   @spec add_get(t(), String.t(), keyword() | String.t()) :: t()
   def add_get(batch, entity_or_path, opts_or_id \\ [])
 
@@ -157,7 +167,7 @@ defmodule Creatio.Batch do
 
   def add_get(%__MODULE__{} = batch, entity, id)
       when is_binary(entity) and is_binary(id) do
-    entity = Util.require_entity_name!(entity, :add_get)
+    entity = Util.require_entity_name!(entity, "add_get/3")
     add(batch, "GET", "#{entity}(#{Util.clean_guid(id)})", [])
   end
 
@@ -167,34 +177,37 @@ defmodule Creatio.Batch do
   @spec add_get(t(), String.t(), String.t(), keyword()) :: t()
   def add_get(%__MODULE__{} = batch, entity, id, opts)
       when is_binary(entity) and is_binary(id) and is_list(opts) do
-    entity = Util.require_entity_name!(entity, :add_get)
+    entity = Util.require_entity_name!(entity, "add_get/4")
     add(batch, "GET", "#{entity}(#{Util.clean_guid(id)})", opts)
   end
 
   @doc """
   Adds an entity creation operation (`POST /0/odata/{Entity}`) to the batch.
   """
+  @spec add_create(t(), String.t(), map()) :: t()
   @spec add_create(t(), String.t(), map(), keyword()) :: t()
   def add_create(%__MODULE__{} = batch, entity, attrs, opts \\ []) do
-    entity = Util.require_entity_name!(entity, :add_create)
+    entity = Util.require_entity_name!(entity, "add_create/4")
     add(batch, "POST", entity, Keyword.put(opts, :body, attrs))
   end
 
   @doc """
   Adds an entity update operation (`PATCH /0/odata/{Entity}({id})`) to the batch.
   """
+  @spec add_update(t(), String.t(), String.t(), map()) :: t()
   @spec add_update(t(), String.t(), String.t(), map(), keyword()) :: t()
   def add_update(%__MODULE__{} = batch, entity, id, attrs, opts \\ []) do
-    entity = Util.require_entity_name!(entity, :add_update)
+    entity = Util.require_entity_name!(entity, "add_update/5")
     add(batch, "PATCH", "#{entity}(#{Util.clean_guid(id)})", Keyword.put(opts, :body, attrs))
   end
 
   @doc """
   Adds an entity deletion operation (`DELETE /0/odata/{Entity}({id})`) to the batch.
   """
+  @spec add_delete(t(), String.t(), String.t()) :: t()
   @spec add_delete(t(), String.t(), String.t(), keyword()) :: t()
   def add_delete(%__MODULE__{} = batch, entity, id, opts \\ []) do
-    entity = Util.require_entity_name!(entity, :add_delete)
+    entity = Util.require_entity_name!(entity, "add_delete/4")
     add(batch, "DELETE", "#{entity}(#{Util.clean_guid(id)})", opts)
   end
 
@@ -234,6 +247,7 @@ defmodule Creatio.Batch do
   @doc """
   Serializes the batch into `{boundary, iodata}` without copying intermediate payload buffers.
   """
+  @spec to_multipart_iodata(t()) :: {String.t(), iodata()}
   @spec to_multipart_iodata(t(), keyword()) :: {String.t(), iodata()}
   def to_multipart_iodata(%__MODULE__{} = batch, opts \\ []) do
     batch_boundary = resolve_batch_boundary!(opts)
@@ -247,6 +261,7 @@ defmodule Creatio.Batch do
   Serializes the batch to a multipart/mixed MIME body string.
   Returns `{boundary, body}`.
   """
+  @spec to_multipart(t()) :: {String.t(), String.t()}
   @spec to_multipart(t(), keyword()) :: {String.t(), String.t()}
   def to_multipart(%__MODULE__{} = batch, opts \\ []) do
     {boundary, iodata} = to_multipart_iodata(batch, opts)
@@ -267,7 +282,9 @@ defmodule Creatio.Batch do
   mutation requests (POST, PATCH, PUT, DELETE) or binary batch payloads are rejected with
   `{:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}}`.
   """
-  @spec execute(Client.t() | Req.Request.t(), t() | map() | list() | binary(), keyword()) ::
+  @spec execute(Client.t() | Req.Request.t(), payload()) ::
+          {:ok, [Response.t()]} | {:error, Error.t()}
+  @spec execute(Client.t() | Req.Request.t(), payload(), keyword()) ::
           {:ok, [Response.t()]} | {:error, Error.t()}
   def execute(client_or_req, batch, opts \\ [])
 
@@ -523,6 +540,8 @@ defmodule Creatio.Batch do
   @doc """
   Parses a multipart/mixed MIME response body into a list of `%Creatio.Batch.Response{}` structs.
   """
+  @spec parse_multipart_response(String.t()) ::
+          {:ok, [Response.t()]} | {:error, Error.t()}
   @spec parse_multipart_response(String.t(), String.t() | nil) ::
           {:ok, [Response.t()]} | {:error, Error.t()}
   def parse_multipart_response(body, boundary \\ nil) when is_binary(body) do

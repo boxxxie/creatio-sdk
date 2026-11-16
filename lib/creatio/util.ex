@@ -938,10 +938,6 @@ defmodule Creatio.Util do
     end
   end
 
-  defp next_link_query_params(next_link, _other) when is_binary(next_link) do
-    extract_next_link_tokens(URI.parse(next_link).query)
-  end
-
   defp extract_next_link_tokens(nil), do: %{}
   defp extract_next_link_tokens(""), do: %{}
 
