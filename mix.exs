@@ -39,7 +39,7 @@ defmodule Creatio.MixProject do
 
   defp deps do
     [
-      {:req, "~> 0.5"},
+      {:req, "~> 0.5 or ~> 0.6 or ~> 0.7"},
       {:jason, "~> 1.4"},
       {:telemetry, "~> 1.2"},
       {:plug, "~> 1.15", only: :test},

@@ -561,11 +561,18 @@ defmodule Creatio.ClientEnvTest do
         req_options: [plug: plug]
       )
 
-    assert :read_only_guard in ro_client.req.current_request_steps
+    assert Keyword.has_key?(ro_client.req.request_steps, :read_only_guard)
+
+    if Map.has_key?(ro_client.req, :current_request_steps) do
+      assert :read_only_guard in Map.get(ro_client.req, :current_request_steps, [])
+    end
 
     rw_client = Client.from_req(ro_client.req, read_only: false)
     refute Keyword.has_key?(rw_client.req.request_steps, :read_only_guard)
-    refute :read_only_guard in rw_client.req.current_request_steps
+
+    if Map.has_key?(rw_client.req, :current_request_steps) do
+      refute :read_only_guard in Map.get(rw_client.req, :current_request_steps, [])
+    end
 
     assert {:ok, %Req.Response{status: 200}} =
              Req.post(rw_client.req, url: "/0/odata/Contact", json: %{"Name" => "Alice"})

@@ -451,7 +451,7 @@ defmodule Creatio.Client do
 
         not client.read_only and
             (Keyword.has_key?(req.request_steps, :read_only_guard) or
-               :read_only_guard in req.current_request_steps) ->
+               :read_only_guard in Map.get(req, :current_request_steps, [])) ->
           detach_read_only_guard(req)
 
         true ->
@@ -463,14 +463,16 @@ defmodule Creatio.Client do
 
   @doc false
   @spec detach_read_only_guard(Req.Request.t()) :: Req.Request.t()
-  def detach_read_only_guard(
-        %Req.Request{request_steps: steps, current_request_steps: current} = req
-      ) do
-    %Req.Request{
-      req
-      | request_steps: Keyword.delete(steps, :read_only_guard),
-        current_request_steps: Enum.reject(current, &(&1 == :read_only_guard))
-    }
+  def detach_read_only_guard(%Req.Request{request_steps: steps} = req) do
+    req = %Req.Request{req | request_steps: Keyword.delete(steps, :read_only_guard)}
+
+    case Map.fetch(req, :current_request_steps) do
+      {:ok, current} when is_list(current) ->
+        Map.put(req, :current_request_steps, Enum.reject(current, &(&1 == :read_only_guard)))
+
+      _ ->
+        req
+    end
   end
 
   defp read_only_guard(req) do

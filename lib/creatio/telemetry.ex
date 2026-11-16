@@ -292,19 +292,19 @@ defmodule Creatio.Telemetry do
     end
   end
 
-  defp rearm_request_step(%Req.Request{current_request_steps: current, private: private} = req) do
-    updated_steps =
-      if :creatio_telemetry in current do
-        current
-      else
-        [:creatio_telemetry | current]
-      end
+  defp rearm_request_step(%Req.Request{private: private} = req) do
+    req = %Req.Request{req | private: Map.delete(private, :creatio_telemetry_start)}
 
-    %Req.Request{
-      req
-      | current_request_steps: updated_steps,
-        private: Map.delete(private, :creatio_telemetry_start)
-    }
+    case Map.fetch(req, :current_request_steps) do
+      {:ok, current} when is_list(current) ->
+        updated_steps =
+          if :creatio_telemetry in current, do: current, else: [:creatio_telemetry | current]
+
+        Map.put(req, :current_request_steps, updated_steps)
+
+      _ ->
+        req
+    end
   end
 
   @doc """
@@ -610,9 +610,7 @@ defmodule Creatio.Telemetry do
 
   defp outcome_metadata(_), do: %{result: :ok, status: :ok, error: nil}
 
-  defp attach_request_step(
-         %Req.Request{request_steps: steps, current_request_steps: current} = req
-       ) do
+  defp attach_request_step(%Req.Request{request_steps: steps} = req) do
     if Keyword.has_key?(steps, :creatio_telemetry) do
       req
     else
@@ -631,19 +629,27 @@ defmodule Creatio.Telemetry do
             [step | steps]
         end
 
-      updated_current =
-        cond do
-          anchor && anchor in current ->
-            insert_name_after(current, anchor, :creatio_telemetry)
+      req = %Req.Request{req | request_steps: updated_steps}
 
-          :read_only_guard in current ->
-            insert_name_before(current, :read_only_guard, :creatio_telemetry)
+      case Map.fetch(req, :current_request_steps) do
+        {:ok, current} when is_list(current) ->
+          updated_current =
+            cond do
+              anchor && anchor in current ->
+                insert_name_after(current, anchor, :creatio_telemetry)
 
-          true ->
-            [:creatio_telemetry | current]
-        end
+              :read_only_guard in current ->
+                insert_name_before(current, :read_only_guard, :creatio_telemetry)
 
-      %Req.Request{req | request_steps: updated_steps, current_request_steps: updated_current}
+              true ->
+                [:creatio_telemetry | current]
+            end
+
+          Map.put(req, :current_request_steps, updated_current)
+
+        _ ->
+          req
+      end
     end
   end
 
