@@ -187,7 +187,7 @@ defmodule Creatio.Features.BatchOperationsTest do
       @upon executing_batch(format: :multipart, continue_on_error: true)
       @then batch_responses_returned([%{id: "req_1", status: 200, success: true}])
       @then batch_prefer_header_sent("continue-on-error")
-      @then batch_multipart_request_sent(body_includes: "GET Contact(1)")
+      @then batch_multipart_request_sent(body_includes: "GET Contact('1')")
 
       @given batch_endpoint_failing(500, %{
                "error" => %{"code" => "BatchFailed", "message" => "Multipart batch error"}
