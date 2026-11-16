@@ -16,3 +16,8 @@ This file tracks all major tracks for getting `creatio` (`creatio-sdk`) from `v0
 
 - [x] **Track: 1.0 Polish, Telemetry & Release Readiness**
   *Link: [./tracks/v1_polish_and_release_20261115/](./tracks/v1_polish_and_release_20261115/)*
+
+---
+
+- [~] **Track: ATDD Test Suite Refactoring, Matrix Consolidation & Regression Deduplication**
+  *Link: [./tracks/atdd_test_suite_refactoring_20261116/](./tracks/atdd_test_suite_refactoring_20261116/)*
