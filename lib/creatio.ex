@@ -390,14 +390,18 @@ defmodule Creatio do
   @doc """
   Executes an OData batch request (`POST /0/odata/$batch`).
   """
-  @spec batch(Client.t() | Req.Request.t(), Batch.t() | map() | [map()] | binary(), keyword()) ::
+  @spec batch(Client.t() | Req.Request.t(), Batch.payload()) ::
+          {:ok, list() | any()} | {:error, Error.t()}
+  @spec batch(Client.t() | Req.Request.t(), Batch.payload(), keyword()) ::
           {:ok, list() | any()} | {:error, Error.t()}
   defdelegate batch(client, batch_or_requests, opts \\ []), to: OData
 
   @doc """
   Same as `batch/3`, raising `Creatio.Error` on failure.
   """
-  @spec batch!(Client.t() | Req.Request.t(), Batch.t() | map() | [map()] | binary(), keyword()) ::
+  @spec batch!(Client.t() | Req.Request.t(), Batch.payload()) ::
+          list() | any()
+  @spec batch!(Client.t() | Req.Request.t(), Batch.payload(), keyword()) ::
           list() | any()
   defdelegate batch!(client, batch_or_requests, opts \\ []), to: OData
 

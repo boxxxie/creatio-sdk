@@ -537,6 +537,4 @@ defmodule Creatio.Telemetry do
 
   defp extract_path(%URI{path: path}) when is_binary(path) and path != "", do: path
   defp extract_path(%URI{}), do: "/"
-  defp extract_path(url) when is_binary(url), do: url |> URI.parse() |> extract_path()
-  defp extract_path(_), do: "/"
 end

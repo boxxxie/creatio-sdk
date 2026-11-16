@@ -987,7 +987,9 @@ defmodule Creatio.OData do
   @doc """
   Executes an OData batch request.
   """
-  @spec batch(Client.t() | Req.Request.t(), Batch.t() | map() | [map()] | binary(), keyword()) ::
+  @spec batch(Client.t() | Req.Request.t(), Batch.payload()) ::
+          {:ok, list() | any()} | {:error, Error.t()}
+  @spec batch(Client.t() | Req.Request.t(), Batch.payload(), keyword()) ::
           {:ok, list() | any()} | {:error, Error.t()}
   def batch(client_or_req, batch_or_requests, opts \\ []) do
     client = Client.ensure_client(client_or_req)
@@ -997,7 +999,9 @@ defmodule Creatio.OData do
   @doc """
   Same as `batch/3`, but raises `Creatio.Error` on failure.
   """
-  @spec batch!(Client.t() | Req.Request.t(), Batch.t() | map() | [map()] | binary(), keyword()) ::
+  @spec batch!(Client.t() | Req.Request.t(), Batch.payload()) ::
+          list() | any()
+  @spec batch!(Client.t() | Req.Request.t(), Batch.payload(), keyword()) ::
           list() | any()
   def batch!(client, batch_or_requests, opts \\ []) do
     case batch(client, batch_or_requests, opts) do
@@ -1106,7 +1110,7 @@ defmodule Creatio.OData do
   defp pop_opt(opts, key) when is_map(opts), do: Map.pop(opts, key)
 
   defp drop_opt(opts, key) when is_list(opts),
-    do: Keyword.drop(opts, [key, Atom.to_string(key)])
+    do: Keyword.drop(opts, [key])
 
   defp drop_opt(opts, key) when is_map(opts),
     do: Map.drop(opts, [key, Atom.to_string(key)])
