@@ -1,8 +1,8 @@
 # Tech Stack: `creatio` (`creatio-sdk`)
 
 ## Language & Runtime
-- **Elixir:** `~> 1.15` (CI runs Elixir `1.15` / OTP `26` via `.github/workflows/ci.yml`)
-- **OTP:** Standard Erlang/OTP paired with Elixir 1.15+
+- **Elixir:** `~> 1.19` (CI runs Elixir `1.19` / OTP `28` via `.github/workflows/ci.yml`)
+- **OTP:** Standard Erlang/OTP paired with Elixir 1.19+ (OTP `28`)
 
 ## Runtime Dependencies (`mix.exs`)
 - **HTTP Client:** `req` (`~> 0.5` for `Req.Request` struct compatibility)

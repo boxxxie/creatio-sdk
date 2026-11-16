@@ -8,7 +8,7 @@ defmodule Creatio.MixProject do
     [
       app: :creatio,
       version: @version,
-      elixir: "~> 1.15",
+      elixir: "~> 1.19",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       test_coverage: [
