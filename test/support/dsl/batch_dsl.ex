@@ -66,6 +66,12 @@ defmodule Creatio.TestDSL.BatchDSL do
     |> CreatioServerDriver.stub_batch(status: status, single_entity: error_body)
   end
 
+  def batch_endpoint_returning_raw(ctx, opts) do
+    ctx
+    |> CreatioServerDriver.ensure_server()
+    |> CreatioServerDriver.stub_batch(opts)
+  end
+
   def raw_batch_requests(ctx, payload) when is_list(payload) or is_map(payload) do
     Map.put(ctx, :batch_payload, payload)
   end
@@ -190,6 +196,22 @@ defmodule Creatio.TestDSL.BatchDSL do
       if Keyword.has_key?(expected, :request_count) do
         assert length(last_req.decoded_body["requests"]) ==
                  Keyword.fetch!(expected, :request_count)
+      end
+
+      if Keyword.has_key?(expected, :first_request_headers) do
+        first_headers = hd(last_req.decoded_body["requests"])["headers"]
+
+        Enum.each(Keyword.fetch!(expected, :first_request_headers), fn {k, v} ->
+          assert first_headers[k] == v
+        end)
+      end
+
+      if Keyword.has_key?(expected, :omitted_first_request_headers) do
+        first_headers = hd(last_req.decoded_body["requests"])["headers"]
+
+        Enum.each(Keyword.fetch!(expected, :omitted_first_request_headers), fn k ->
+          refute Map.has_key?(first_headers, k)
+        end)
       end
 
       ctx

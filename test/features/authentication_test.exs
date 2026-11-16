@@ -4,6 +4,8 @@ defmodule Creatio.Features.AuthenticationTest do
   import Creatio.FeatureScenario
   import Creatio.TestDSL.AuthDSL
 
+  @waf_html "<html><body><iframe src=\"/_Incapsula_Resource\"></iframe></body></html>"
+
   describe "Forms Authentication (AuthService)" do
     scenario "authenticates with forms credentials and stores session cookies and CSRF token" do
       @given creatio_forms_auth_accepting(
@@ -80,6 +82,50 @@ defmodule Creatio.Features.AuthenticationTest do
              )
       @upon logging_in_with_forms("Supervisor", "Supervisor")
       @then authentication_fails_with(message: "<html>Gateway Error</html>")
+    end
+
+    scenario "preserves '+' characters in BPMCSRF cookies and deduplicates repeated Set-Cookie names" do
+      @given creatio_forms_auth_accepting(
+               cookies: [
+                 "BPMCSRF=old+val; Path=/",
+                 "bpmcsrf=abc+123%2B==; Path=/",
+                 ".ASPXAUTH=ticket1; Path=/"
+               ]
+             )
+      @upon logging_in_with_forms("Supervisor", "pw")
+      @then client_is_authenticated_via_forms(
+              csrf_token: "abc+123+==",
+              cookies_include: [".ASPXAUTH=ticket1"],
+              single_cookie_name: "bpmcsrf"
+            )
+    end
+
+    scenario "strips stale auth headers before forms login and upgrades a bare Req with base_url and req_options" do
+      @given creatio_forms_auth_accepting(
+               cookies: [".ASPXAUTH=fresh-auth; path=/", "BPMCSRF=fresh-csrf; path=/"]
+             )
+      @given creatio_client_with_oauth_config(
+               auth_token: "stale-bearer",
+               cookie: "stale-cookie",
+               bpmcsrf: "stale-csrf"
+             )
+      @upon logging_in_with_forms("user", "pass")
+      @then client_is_authenticated_via_forms(
+              csrf_token: "fresh-csrf",
+              cookies_include: ["BPMCSRF=fresh-csrf", ".ASPXAUTH=fresh-auth"]
+            )
+      @then request_omitted_headers(["authorization", "cookie", "bpmcsrf"])
+
+      @given creatio_forms_auth_accepting(cookies: ["BPMCSRF=c1; path=/"])
+      @given bare_req_without_base_url()
+      @upon logging_in_with_forms("u", "p",
+              base_url: "https://forms.example.com",
+              with_server_req_options: true
+            )
+      @then client_is_authenticated_via_forms(
+              csrf_token: "c1",
+              expected_base_url: "https://forms.example.com"
+            )
     end
   end
 
@@ -195,6 +241,125 @@ defmodule Creatio.Features.AuthenticationTest do
              )
       @upon fetching_openid_configuration()
       @then openid_discovery_fails_with_status(500)
+    end
+
+    scenario "preserves plug from Client.from_req/2, strips stale auth headers, and supports token_url" do
+      @given identity_openid_discovery(%{
+               "issuer" => "https://id.test",
+               "token_endpoint" => "https://id.test/connect/token"
+             })
+      @given creatio_client_from_req(
+               req_headers: [{"bpmcsrf", "stale"}, {"cookie", "stale=1"}],
+               identity_service_url: "https://id.test"
+             )
+      @upon fetching_openid_configuration()
+      @then openid_configuration_has(%{
+              "issuer" => "https://id.test",
+              "token_endpoint" => "https://id.test/connect/token"
+            })
+      @then request_omitted_headers(["bpmcsrf", "cookie"])
+
+      @given identity_service_issuing_token(access_token: "tok_from_plug", expires_in: 3600)
+      @given creatio_client_from_req(
+               req_headers: [{"bpmcsrf", "stale"}, {"cookie", "stale=1"}],
+               token_url: "https://id.test/connect/token",
+               client_id: "cid",
+               client_secret: "csecret"
+             )
+      @upon logging_in_with_oauth()
+      @then client_is_authenticated_via_oauth(
+              access_token: "tok_from_plug",
+              expires_in: 3600,
+              client_id: "cid",
+              client_secret: "csecret"
+            )
+      @then request_omitted_headers(["bpmcsrf", "cookie"])
+    end
+
+    scenario "normalizes identity_service_url, drops transient client_secret, and rejects blank tokens" do
+      @given identity_service_issuing_token(
+               path: "/0/connect/token",
+               access_token: "valid-jwt",
+               expires_in: 3600
+             )
+      @given creatio_client_with_oauth_config(client_id: "cid")
+      @upon logging_in_with_oauth(
+              identity_service_url: " https://id.creatio.com/0// ",
+              client_secret: "transient-sec"
+            )
+      @then client_is_authenticated_via_oauth(
+              access_token: "valid-jwt",
+              expires_in: 3600,
+              token_path: "/0/connect/token",
+              identity_service_url: "https://id.creatio.com/0",
+              clears_client_secret: true,
+              client_id: "cid",
+              client_secret: "transient-sec"
+            )
+
+      @upon attempting_blank_oauth_token_logins([nil, "", "   "])
+      @then all_token_attempts_failed_with(status: 200, code: "OAuthMissingToken")
+    end
+
+    scenario "validates OAuth and OpenID discovery base URLs locally without network calls" do
+      @given creatio_client_with_raw_urls(
+               base_url: "",
+               identity_service_url: nil,
+               client_id: "cid",
+               client_secret: "sec"
+             )
+      @upon fetching_openid_configuration()
+      @then authentication_fails_with(message_contains: "URL")
+      @upon logging_in_with_oauth(identity_service_url: "/relative-only")
+      @then authentication_fails_with(message_contains: "URL")
+    end
+
+    scenario "handles IIS text/html BOM JSON, Healthy checks, and rejects WAF HTML or corrupt JSON" do
+      @given creatio_oauth_health_status(
+               "\uFEFF" <> Jason.encode!(%{"HasProblem" => false}),
+               content_type: "text/html"
+             )
+      @upon checking_oauth_health()
+      @then oauth_health_is(%{"HasProblem" => false})
+
+      @given identity_openid_discovery(
+               "\uFEFF" <> Jason.encode!(%{"issuer" => "https://id.test"}),
+               content_type: "text/html"
+             )
+      @given creatio_client_with_oauth_config(identity_service_url: "https://crm.test")
+      @upon fetching_openid_configuration()
+      @then openid_configuration_has(%{"issuer" => "https://id.test"})
+
+      @given creatio_oauth_health_status("Healthy", content_type: "text/html")
+      @upon checking_oauth_health(with_server_req_options: true)
+      @then oauth_health_is("Healthy")
+
+      @given identity_service_issuing_token(content_type: "text/html", raw_body: @waf_html)
+      @given creatio_client_with_oauth_config(
+               identity_service_url: "https://crm.test",
+               client_id: "cid",
+               client_secret: "csec"
+             )
+      @upon logging_in_with_oauth()
+      @then authentication_fails_with(status: 200)
+
+      @given creatio_oauth_health_status(@waf_html, content_type: "text/html")
+      @upon checking_oauth_health()
+      @then authentication_fails_with(status: 200)
+
+      @given identity_openid_discovery(@waf_html, content_type: "text/html")
+      @upon fetching_openid_configuration()
+      @then openid_discovery_fails_with_status(200)
+      @upon fetching_openid_configuration(target: :url, url: "https://crm.test")
+      @then openid_discovery_fails_with_status(200)
+
+      @given creatio_oauth_health_status("{broken", content_type: "text/html")
+      @upon checking_oauth_health()
+      @then authentication_fails_with(status: 200)
+
+      @given creatio_oauth_health_status("{broken", content_type: "application/json")
+      @upon checking_oauth_health()
+      @then authentication_fails_with(status: nil)
     end
   end
 end

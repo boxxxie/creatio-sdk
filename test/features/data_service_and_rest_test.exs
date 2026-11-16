@@ -4,6 +4,8 @@ defmodule Creatio.Features.DataServiceAndRestTest do
   import Creatio.FeatureScenario
   import Creatio.TestDSL.DataServiceDSL
 
+  @waf_html "<html><body><iframe src=\"/_Incapsula_Resource\"></iframe></body></html>"
+
   describe "Creatio DataService SyncReply Queries" do
     scenario "executes SelectQuery against Creatio DataService" do
       @given data_service_endpoint("SelectQuery",
@@ -120,6 +122,36 @@ defmodule Creatio.Features.DataServiceAndRestTest do
       @given custom_rest_endpoint("SyncService", "Trigger", status: 204)
       @upon calling_custom_service("SyncService", "Trigger", %{"force" => true})
       @then custom_service_returned("")
+
+      @given custom_rest_endpoint("Svc", "EmptyList", echo: true)
+      @upon calling_custom_service("Svc", "EmptyList", [])
+      @then custom_service_returned([])
+      @then custom_service_sent_request(method: "POST", decoded_body: [])
+
+      @given custom_rest_endpoint("Svc", "Fetch", method: :get, body: %{"ok" => true})
+      @upon calling_custom_service("Svc", "Fetch",
+              method: :get,
+              params: %{"id" => "42", :extra => "yes"}
+            )
+      @then custom_service_returned(%{"ok" => true})
+
+      @then custom_service_sent_request(
+              method: "GET",
+              query_params: %{"id" => "42", "extra" => "yes"}
+            )
+
+      @given custom_rest_endpoint("Svc", "Remove", method: :delete, echo: true)
+      @upon calling_custom_service("Svc", "Remove", %{"ids" => ["1"]}, method: :delete)
+      @then custom_service_returned(%{"ids" => ["1"]})
+      @then custom_service_sent_request(method: "DELETE", decoded_body: %{"ids" => ["1"]})
+
+      @given custom_rest_endpoint("CustomSvc", "DoWork", echo: true)
+      @upon calling_custom_service("CustomSvc", "DoWork", alpha: 1, beta: "two")
+      @then custom_service_returned(%{"alpha" => 1, "beta" => "two"})
+      @then custom_service_sent_request(
+              method: "POST",
+              decoded_body: %{"alpha" => 1, "beta" => "two"}
+            )
     end
 
     scenario "returns HTTP errors across POST map, GET options, list payload, and DELETE method" do
@@ -145,6 +177,54 @@ defmodule Creatio.Features.DataServiceAndRestTest do
              )
       @upon calling_custom_service("BatchSvc", "Process", [1, 2, 3], bang: true)
       @then bang_raised_creatio_error("Batch failed")
+    end
+
+    scenario "decodes IIS text/html BOM JSON and rejects WAF HTML and corrupt payloads" do
+      @given data_service_endpoint("SelectQuery",
+               content_type: "text/html",
+               raw_body:
+                 "\uFEFF" <> Jason.encode!(%{"success" => true, "rows" => [%{"Id" => "ds-1"}]})
+             )
+      @upon running_select_query(%{"rootSchemaName" => "Contact"})
+      @then data_service_returned(%{"success" => true, "rows" => [%{"Id" => "ds-1"}]})
+
+      @given custom_rest_endpoint("MySvc", "Info",
+               method: :get,
+               content_type: "text/html",
+               raw_body: "\uFEFF" <> Jason.encode!(%{"ok" => true})
+             )
+      @upon calling_custom_service("MySvc", "Info", method: :get)
+      @then custom_service_returned(%{"ok" => true})
+
+      @given data_service_endpoint("SelectQuery", content_type: "text/html", raw_body: @waf_html)
+      @upon running_select_query(%{"rootSchemaName" => "Contact"})
+      @then data_service_failed_with(status: 200)
+
+      @given custom_rest_endpoint("MySvc", "Info",
+               method: :get,
+               content_type: "text/html",
+               raw_body: @waf_html
+             )
+      @upon calling_custom_service("MySvc", "Info", method: :get)
+      @then custom_service_failed_with_status(200)
+
+      @given data_service_endpoint("SelectQuery",
+               content_type: "application/json",
+               raw_body: "{broken"
+             )
+      @upon running_select_query(%{})
+      @then data_service_failed_with(status: nil)
+
+      @given data_service_endpoint("SelectQuery", content_type: "text/plain", raw_body: "{broken")
+      @upon running_select_query(%{})
+      @then data_service_failed_with(status: 200)
+
+      @given data_service_endpoint("SelectQuery",
+               content_type: "text/plain",
+               raw_body: "Gateway Timeout"
+             )
+      @upon running_select_query(%{})
+      @then data_service_failed_with(status: 200)
     end
   end
 end

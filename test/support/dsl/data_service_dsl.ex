@@ -107,6 +107,59 @@ defmodule Creatio.TestDSL.DataServiceDSL do
         assert err.message == Keyword.fetch!(expected, :message)
       end
 
+      if Keyword.has_key?(expected, :message_contains) do
+        assert String.contains?(err.message, Keyword.fetch!(expected, :message_contains))
+      end
+
+      ctx
+    end
+  end
+
+  defmacro custom_service_failed_with(ctx, opts) do
+    quote line: __CALLER__.line do
+      ctx = unquote(ctx)
+      expected = unquote(opts)
+
+      assert {:error, %Error{} = err} = Map.fetch!(ctx, :result)
+
+      if Keyword.has_key?(expected, :status) do
+        assert err.status == Keyword.fetch!(expected, :status)
+      end
+
+      if Keyword.has_key?(expected, :code) do
+        assert err.code == Keyword.fetch!(expected, :code)
+      end
+
+      if Keyword.has_key?(expected, :message_contains) do
+        assert String.contains?(err.message, Keyword.fetch!(expected, :message_contains))
+      end
+
+      ctx
+    end
+  end
+
+  defmacro custom_service_sent_request(ctx, opts) do
+    quote line: __CALLER__.line do
+      ctx = unquote(ctx)
+      expected = unquote(opts)
+      last_req = CreatioServerDriver.last_request(ctx)
+
+      if Keyword.has_key?(expected, :method) do
+        assert last_req.method == Keyword.fetch!(expected, :method)
+      end
+
+      if Keyword.has_key?(expected, :request_path) do
+        assert last_req.request_path == Keyword.fetch!(expected, :request_path)
+      end
+
+      if Keyword.has_key?(expected, :query_params) do
+        assert last_req.query_params == Keyword.fetch!(expected, :query_params)
+      end
+
+      if Keyword.has_key?(expected, :decoded_body) do
+        assert last_req.decoded_body == Keyword.fetch!(expected, :decoded_body)
+      end
+
       ctx
     end
   end

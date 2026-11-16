@@ -52,6 +52,47 @@ defmodule Creatio.Features.BatchOperationsTest do
       @then batch_prefer_header_sent("continue-on-error")
     end
 
+    scenario "sends Prefer return=minimal and minimal metadata headers alongside continue-on-error" do
+      @given batch_endpoint_returning_responses([
+               %{"id" => "req_1", "status" => 200, "body" => %{"Id" => "1"}}
+             ])
+      @given new_batch(continue_on_error: true, return: :minimal)
+      @given batch_get_operation("Contact", "1")
+      @upon executing_batch()
+      @then batch_prefer_header_sent("continue-on-error, return=minimal")
+      @then batch_json_request_sent(
+              request_count: 1,
+              first_request_headers: %{
+                "Accept" => "application/json; odata.metadata=minimal",
+                "Prefer" => "continue-on-error, return=minimal"
+              },
+              omitted_first_request_headers: ["Content-Type"]
+            )
+    end
+
+    scenario "decodes IIS text/html BOM JSON responses and rejects HTML WAF interstitials" do
+      @given batch_endpoint_returning_raw(
+               content_type: "text/html",
+               raw_body:
+                 "\uFEFF" <>
+                   Jason.encode!(%{
+                     "responses" => [%{"id" => "req_1", "status" => 200, "body" => %{}}]
+                   })
+             )
+      @given batch_get_operation("Contact")
+      @upon executing_batch()
+      @then batch_responses_returned([%{id: "req_1", status: 200, success: true}])
+
+      @given batch_endpoint_returning_raw(
+               content_type: "text/html",
+               raw_body:
+                 "<html><body><iframe src=\"/_Incapsula_Resource\"></iframe></body></html>"
+             )
+      @given batch_get_operation("Contact")
+      @upon executing_batch()
+      @then batch_failed_with(status: 200)
+    end
+
     scenario "handles single-entity JSON fallback response from Creatio batch endpoint" do
       @given batch_endpoint_returning_single_entity(%{"Id" => "solo-1", "Name" => "Solo"})
       @given batch_get_operation("Contact", "solo-1")

@@ -7,7 +7,7 @@ defmodule Creatio.TestDSL.SafetyDSL do
   alias Creatio.Batch.Response, as: BatchResponse
   alias Creatio.Client
   alias Creatio.Error
-  alias Creatio.TestDrivers.{CreatioServerDriver, CRMClientDriver, FacadeDriver}
+  alias Creatio.TestDrivers.{CreatioServerDriver, CRMClientDriver}
 
   # ---------------------------------------------------------------------------
   # @given steps
@@ -59,10 +59,6 @@ defmodule Creatio.TestDSL.SafetyDSL do
     |> CreatioServerDriver.use_transport_timeout()
   end
 
-  def crm_facade_server(ctx) do
-    FacadeDriver.stub_full_crm_server(ctx)
-  end
-
   # ---------------------------------------------------------------------------
   # @upon / @whenever steps
   # ---------------------------------------------------------------------------
@@ -71,13 +67,34 @@ defmodule Creatio.TestDSL.SafetyDSL do
     CRMClientDriver.invoke_operation(ctx, op)
   end
 
+  def attempting_all_operations(ctx, entries) when is_list(entries) do
+    results =
+      Enum.map(entries, fn {label, op} ->
+        before_count = length(CreatioServerDriver.recorded_requests(ctx))
+        after_ctx = CRMClientDriver.invoke_operation(ctx, op)
+        after_count = length(CreatioServerDriver.recorded_requests(after_ctx))
+        {label, Map.fetch!(after_ctx, :result), after_count - before_count}
+      end)
+
+    Map.put(ctx, :matrix_results, results)
+  end
+
   def sending_transport_request(ctx, method, endpoint_kind) do
     path = resolve_transport_endpoint(endpoint_kind)
     CRMClientDriver.invoke_operation(ctx, {:raw_req, method, path})
   end
 
-  def invoking_facade(ctx, spec) do
-    FacadeDriver.invoke_facade(ctx, spec)
+  def sending_transport_requests(ctx, entries) when is_list(entries) do
+    results =
+      Enum.map(entries, fn {label, method, endpoint_kind} ->
+        path = resolve_transport_endpoint(endpoint_kind)
+        before_count = length(CreatioServerDriver.recorded_requests(ctx))
+        after_ctx = CRMClientDriver.invoke_operation(ctx, {:raw_req, method, path})
+        after_count = length(CreatioServerDriver.recorded_requests(after_ctx))
+        {label, Map.fetch!(after_ctx, :result), after_count - before_count}
+      end)
+
+    Map.put(ctx, :matrix_results, results)
   end
 
   # ---------------------------------------------------------------------------
@@ -105,6 +122,43 @@ defmodule Creatio.TestDSL.SafetyDSL do
     end
   end
 
+  defmacro all_operations_succeeded(ctx) do
+    quote line: __CALLER__.line do
+      ctx = unquote(ctx)
+      results = Map.fetch!(ctx, :matrix_results)
+      assert results != []
+
+      Enum.each(results, fn {label, res, req_delta} ->
+        assert {:ok, _} = res,
+               "Expected {:ok, _} for #{label}, got: #{inspect(res)}"
+
+        assert req_delta == 1,
+               "Expected 1 HTTP request for #{label}, saw #{req_delta}"
+      end)
+
+      ctx
+    end
+  end
+
+  defmacro all_operations_blocked_locally(ctx) do
+    quote line: __CALLER__.line do
+      ctx = unquote(ctx)
+      results = Map.fetch!(ctx, :matrix_results)
+      assert results != []
+
+      Enum.each(results, fn {label, res, req_delta} ->
+        assert {:error, %Error{status: 403, code: "ReadOnlyMode"}} = res,
+               "Expected 403 ReadOnlyMode for #{label}, got: #{inspect(res)}"
+
+        assert req_delta == 0,
+               "Expected 0 HTTP requests for #{label}, saw #{req_delta}"
+      end)
+
+      assert CreatioServerDriver.recorded_requests(ctx) == []
+      ctx
+    end
+  end
+
   defmacro blocked_at_transport_by_read_only_mode(ctx) do
     quote line: __CALLER__.line do
       ctx = unquote(ctx)
@@ -112,6 +166,43 @@ defmodule Creatio.TestDSL.SafetyDSL do
       assert {:error, %Error{status: 403, code: "ReadOnlyMode"}} = Map.fetch!(ctx, :result)
       assert CreatioServerDriver.recorded_requests(ctx) == []
 
+      ctx
+    end
+  end
+
+  defmacro all_transport_requests_succeeded(ctx) do
+    quote line: __CALLER__.line do
+      ctx = unquote(ctx)
+      results = Map.fetch!(ctx, :matrix_results)
+      assert results != []
+
+      Enum.each(results, fn {label, res, req_delta} ->
+        assert {:ok, %Req.Response{status: 200}} = res,
+               "Expected 200 OK for #{label}, got: #{inspect(res)}"
+
+        assert req_delta == 1,
+               "Expected 1 HTTP request for #{label}, saw #{req_delta}"
+      end)
+
+      ctx
+    end
+  end
+
+  defmacro all_transport_requests_blocked(ctx) do
+    quote line: __CALLER__.line do
+      ctx = unquote(ctx)
+      results = Map.fetch!(ctx, :matrix_results)
+      assert results != []
+
+      Enum.each(results, fn {label, res, req_delta} ->
+        assert {:error, %Error{status: 403, code: "ReadOnlyMode"}} = res,
+               "Expected 403 ReadOnlyMode for #{label}, got: #{inspect(res)}"
+
+        assert req_delta == 0,
+               "Expected 0 HTTP requests for #{label}, saw #{req_delta}"
+      end)
+
+      assert CreatioServerDriver.recorded_requests(ctx) == []
       ctx
     end
   end
@@ -178,6 +269,32 @@ defmodule Creatio.TestDSL.SafetyDSL do
         assert err.status == Keyword.fetch!(expected, :status)
       end
 
+      if Keyword.has_key?(expected, :message) do
+        assert err.message == Keyword.fetch!(expected, :message)
+      end
+
+      ctx
+    end
+  end
+
+  defmacro stream_yielded_prefix_then_error(ctx, expected_records, opts \\ []) do
+    quote line: __CALLER__.line do
+      ctx = unquote(ctx)
+      expected_prefix = Enum.map(unquote(expected_records), &{:ok, &1})
+      expected = unquote(opts)
+
+      assert {:ok, items} = Map.fetch!(ctx, :result)
+      assert {prefix, [{:error, %Error{} = err}]} = Enum.split(items, length(expected_prefix))
+      assert prefix == expected_prefix
+
+      if Keyword.has_key?(expected, :status) do
+        assert err.status == Keyword.fetch!(expected, :status)
+      end
+
+      if Keyword.has_key?(expected, :message) do
+        assert err.message == Keyword.fetch!(expected, :message)
+      end
+
       ctx
     end
   end
@@ -217,24 +334,6 @@ defmodule Creatio.TestDSL.SafetyDSL do
     end
   end
 
-  defmacro facade_result_matches(ctx, expected) do
-    quote line: __CALLER__.line do
-      ctx = unquote(ctx)
-      actual = Map.fetch!(ctx, :result)
-
-      case unquote(expected) do
-        {:batch_response_count, expected_count} ->
-          assert {:ok, [%BatchResponse{} | _] = responses} = actual
-          assert length(responses) == expected_count
-
-        expected_value ->
-          assert actual == expected_value
-      end
-
-      ctx
-    end
-  end
-
   # ---------------------------------------------------------------------------
   # Private Helpers
   # ---------------------------------------------------------------------------
@@ -248,4 +347,7 @@ defmodule Creatio.TestDSL.SafetyDSL do
   defp resolve_transport_endpoint(:oauth_token), do: "/connect/token"
   defp resolve_transport_endpoint(:batch_endpoint), do: "/0/odata/$batch"
   defp resolve_transport_endpoint(:custom_rest), do: "/0/rest/SomeService/Method"
+
+  defp resolve_transport_endpoint(:path_traversal_custom_rest),
+    do: "/0/odata/Contact/../../rest/Trigger"
 end

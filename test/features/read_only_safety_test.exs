@@ -16,8 +16,30 @@ defmodule Creatio.Features.ReadOnlySafetyTest do
     {"DataService InsertQuery", {:data_service_insert, %{"rootSchemaName" => "Contact"}}},
     {"DataService UpdateQuery", {:data_service_update, %{"rootSchemaName" => "Contact"}}},
     {"DataService DeleteQuery", {:data_service_delete, %{"rootSchemaName" => "Contact"}}},
+    {"DataService BatchQuery", {:data_service_batch, %{"items" => []}}},
+    {"DataService execute_query InsertQuery",
+     {:data_service_execute, "InsertQuery", %{"rootSchemaName" => "Contact"}}},
+    {"DataService select_query :url override to DeleteQuery",
+     {:data_service_select_opts, %{}, [url: "/0/DataService/json/SyncReply/DeleteQuery"]}},
+    {"DataService execute_query :url override to InsertQuery",
+     {:data_service_execute_opts, "SelectQuery", %{},
+      [url: "/0/DataService/json/SyncReply/InsertQuery"]}},
+    {"Custom REST POST service call", {:custom_service, "MySvc", "Mutate", %{"x" => 1}, []}},
+    {"Custom REST DELETE service call",
+     {:custom_service_opts, "MySvc", "DeleteIt", [method: :delete]}},
     {"OData $batch containing write operations",
-     {:batch_mutation, "Contact", %{"Name" => "Alice"}}}
+     {:batch_mutation, "Contact", %{"Name" => "Alice"}}},
+    {"OData $batch raw operation list mutation",
+     {:batch_list_mutation, [%{method: "POST", url: "Contact", body: %{"Name" => "A"}}]}}
+  ]
+
+  @allowed_read_only_operations [
+    {"DataService execute_query SelectQuery",
+     {:data_service_execute, "SelectQuery", %{"rootSchemaName" => "Contact"}}},
+    {"Custom REST GET service call", {:custom_service_opts, "MySvc", "Ping", [method: :get]}},
+    {"Custom REST HEAD service call", {:custom_service_opts, "MySvc", "Ping", [method: :head]}},
+    {"Custom REST OPTIONS service call",
+     {:custom_service_opts, "MySvc", "Ping", [method: :options]}}
   ]
 
   @allowed_transport_requests [
@@ -32,7 +54,8 @@ defmodule Creatio.Features.ReadOnlySafetyTest do
   @blocked_transport_requests [
     {"POST OData collection creation", :post, :odata_collection},
     {"POST DataService InsertQuery", :post, :insert_query},
-    {"POST custom REST mutation", :post, :custom_rest}
+    {"POST custom REST mutation", :post, :custom_rest},
+    {"GET OData dot-segment path traversal to custom REST", :get, :path_traversal_custom_rest}
   ]
 
   describe "Read-Only Client Configuration & Local SDK Guards" do
@@ -41,13 +64,17 @@ defmodule Creatio.Features.ReadOnlySafetyTest do
       @then client_is_in_read_only_mode()
     end
 
-    for {label, operation} <- @blocked_mutations do
-      scenario "blocks #{label} locally without sending any HTTP request" do
-        @given crm_server_accepting_requests()
-        @given read_only_crm_client()
-        @upon attempting_operation(unquote(Macro.escape(operation)))
-        @then blocked_locally_by_read_only_mode()
-      end
+    scenario "blocks all write operations locally without sending any HTTP request" do
+      @given crm_server_accepting_requests()
+      @given read_only_crm_client()
+      @upon attempting_all_operations(@blocked_mutations)
+      @then all_operations_blocked_locally()
+    end
+
+    scenario "permits read-only DataService SelectQuery and GET/HEAD/OPTIONS custom services" do
+      @given read_only_crm_client_with_server()
+      @upon attempting_all_operations(@allowed_read_only_operations)
+      @then all_operations_succeeded()
     end
 
     scenario "allows read-only GET-only $batch requests" do
@@ -66,20 +93,16 @@ defmodule Creatio.Features.ReadOnlySafetyTest do
   end
 
   describe "Transport-Layer Req Read-Only Guard" do
-    for {label, method, endpoint} <- @allowed_transport_requests do
-      scenario "permits #{label} through read-only transport guard" do
-        @given read_only_crm_client_with_server()
-        @upon sending_transport_request(unquote(method), unquote(endpoint))
-        @then raw_request_succeeded()
-      end
+    scenario "permits read-only and auth endpoints through read-only transport guard" do
+      @given read_only_crm_client_with_server()
+      @upon sending_transport_requests(@allowed_transport_requests)
+      @then all_transport_requests_succeeded()
     end
 
-    for {label, method, endpoint} <- @blocked_transport_requests do
-      scenario "blocks #{label} at transport guard before network dispatch" do
-        @given read_only_crm_client_with_server()
-        @upon sending_transport_request(unquote(method), unquote(endpoint))
-        @then blocked_at_transport_by_read_only_mode()
-      end
+    scenario "blocks mutation endpoints at transport guard before network dispatch" do
+      @given read_only_crm_client_with_server()
+      @upon sending_transport_requests(@blocked_transport_requests)
+      @then all_transport_requests_blocked()
     end
   end
 end

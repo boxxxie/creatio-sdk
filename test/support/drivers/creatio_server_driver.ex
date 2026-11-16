@@ -238,24 +238,30 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   def stub_oauth_token(ctx, opts \\ []) do
     path = Keyword.get(opts, :path, "/connect/token")
     status = Keyword.get(opts, :status, 200)
+    content_type = Keyword.get(opts, :content_type, "application/json")
 
     body =
-      Keyword.get_lazy(opts, :body, fn ->
-        %{
-          "access_token" => Keyword.get(opts, :access_token, "oauth_access_token_12345"),
-          "expires_in" => Keyword.get(opts, :expires_in, 3600),
-          "token_type" => Keyword.get(opts, :token_type, "Bearer"),
-          "scope" => Keyword.get(opts, :scope, "ApplicationAccess_xyz")
-        }
-      end)
+      cond do
+        Keyword.has_key?(opts, :raw_body) ->
+          Keyword.fetch!(opts, :raw_body)
+
+        Keyword.has_key?(opts, :body) ->
+          Keyword.fetch!(opts, :body)
+
+        true ->
+          %{
+            "access_token" => Keyword.get(opts, :access_token, "oauth_access_token_12345"),
+            "expires_in" => Keyword.get(opts, :expires_in, 3600),
+            "token_type" => Keyword.get(opts, :token_type, "Bearer"),
+            "scope" => Keyword.get(opts, :scope, "ApplicationAccess_xyz")
+          }
+      end
 
     add_route(
       ctx,
       fn req -> req.method == "POST" and req.request_path == path end,
       fn conn, _req ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(status, Jason.encode!(body))
+        send_stub_response(conn, status, body, content_type: content_type)
       end
     )
   end
@@ -265,15 +271,20 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   """
   def stub_oauth_health(ctx, opts \\ []) do
     status = Keyword.get(opts, :status, 200)
-    body = Keyword.get(opts, :body, %{"status" => "Healthy"})
+    content_type = Keyword.get(opts, :content_type, "application/json")
+
+    body =
+      if Keyword.has_key?(opts, :raw_body) do
+        Keyword.fetch!(opts, :raw_body)
+      else
+        Keyword.get(opts, :body, %{"status" => "Healthy"})
+      end
 
     add_route(
       ctx,
       fn req -> req.method == "GET" and req.request_path == "/0/api/OAuthHealthCheck" end,
       fn conn, _req ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(status, Jason.encode!(body))
+        send_stub_response(conn, status, body, content_type: content_type)
       end
     )
   end
@@ -284,7 +295,14 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   def stub_openid_configuration(ctx, opts \\ []) do
     path = Keyword.get(opts, :path, "/.well-known/openid-configuration")
     status = Keyword.get(opts, :status, 200)
-    body = Keyword.get(opts, :body, %{"token_endpoint" => "https://identity/connect/token"})
+    content_type = Keyword.get(opts, :content_type, "application/json")
+
+    body =
+      if Keyword.has_key?(opts, :raw_body) do
+        Keyword.fetch!(opts, :raw_body)
+      else
+        Keyword.get(opts, :body, %{"token_endpoint" => "https://identity/connect/token"})
+      end
 
     add_route(
       ctx,
@@ -293,9 +311,7 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
           req.request_path in [path, "/identity/.well-known/openid-configuration"]
       end,
       fn conn, _req ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(status, Jason.encode!(body))
+        send_stub_response(conn, status, body, content_type: content_type)
       end
     )
   end
@@ -311,33 +327,36 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
     status = Keyword.get(opts, :status, 200)
     records = Keyword.get(opts, :records, [])
     count = Keyword.get(opts, :count)
+    next_link = Keyword.get(opts, :next_link)
     bare_array? = Keyword.get(opts, :bare_array, false)
     content_type = Keyword.get(opts, :content_type, "application/json")
 
     payload =
       cond do
+        Keyword.has_key?(opts, :raw_body) ->
+          Keyword.fetch!(opts, :raw_body)
+
         Keyword.has_key?(opts, :error) ->
           Keyword.fetch!(opts, :error)
 
         bare_array? ->
           records
 
-        is_nil(count) ->
-          %{"value" => records}
-
         true ->
-          %{"@odata.count" => count, "value" => records}
+          %{"value" => records}
+          |> then(fn map ->
+            if is_nil(count), do: map, else: Map.put(map, "@odata.count", count)
+          end)
+          |> then(fn map ->
+            if is_nil(next_link), do: map, else: Map.put(map, "@odata.nextLink", next_link)
+          end)
       end
 
     add_route(
       ctx,
       fn req -> req.method == "GET" and req.request_path == "/0/odata/#{entity}" end,
       fn conn, _req ->
-        raw_payload = if is_binary(payload), do: payload, else: Jason.encode!(payload)
-
-        conn
-        |> put_resp_content_type(content_type)
-        |> send_resp(status, raw_payload)
+        send_stub_response(conn, status, payload, content_type: content_type)
       end
     )
   end
@@ -362,11 +381,36 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   end
 
   @doc """
+  Stubs stateful or multi-page OData 4 collection responses using a list of page specs
+  or a `callback.(req, call_index)` function returning `{status, body}` or
+  `{status, headers, body}`.
+  """
+  def stub_odata_pages(ctx, entity, pages_or_fun)
+      when is_list(pages_or_fun) or is_function(pages_or_fun, 2) do
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+    path = "/0/odata/#{entity}"
+
+    add_route(
+      ctx,
+      fn req -> req.method == "GET" and req.request_path == path end,
+      fn conn, req ->
+        idx = Agent.get_and_update(counter, fn n -> {n, n + 1} end)
+        spec = resolve_page_spec(pages_or_fun, req, idx, %{"value" => []})
+        send_page_spec(conn, spec)
+      end
+    )
+  end
+
+  @doc """
   Stubs an OData 4 single-entity endpoint (`GET /0/odata/{entity}({id})`).
   """
   def stub_odata_get(ctx, entity, id, opts \\ []) do
     status = Keyword.get(opts, :status, 200)
-    body = Keyword.get(opts, :body) || Keyword.get(opts, :record, %{"Id" => id})
+
+    body =
+      Keyword.get(opts, :raw_body) || Keyword.get(opts, :body) ||
+        Keyword.get(opts, :record, %{"Id" => id})
+
     content_type = Keyword.get(opts, :content_type, "application/json")
 
     add_route(
@@ -387,9 +431,12 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   """
   def stub_odata_navigation(ctx, entity, id, nav, opts \\ []) do
     status = Keyword.get(opts, :status, 200)
+    content_type = Keyword.get(opts, :content_type, "application/json")
 
     body =
       cond do
+        status == 204 -> ""
+        Keyword.has_key?(opts, :raw_body) -> Keyword.fetch!(opts, :raw_body)
         Keyword.has_key?(opts, :body) -> Keyword.fetch!(opts, :body)
         Keyword.has_key?(opts, :records) -> %{"value" => Keyword.fetch!(opts, :records)}
         Keyword.has_key?(opts, :record) -> Keyword.fetch!(opts, :record)
@@ -402,9 +449,7 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
         req.method == "GET" and req.request_path == "/0/odata/#{entity}(#{id})/#{nav}"
       end,
       fn conn, _req ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(status, Jason.encode!(body))
+        send_stub_response(conn, status, body, content_type: content_type)
       end
     )
   end
@@ -415,24 +460,35 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   def stub_odata_field(ctx, entity, id, field, opts \\ []) do
     status = Keyword.get(opts, :status, 200)
     raw? = Keyword.get(opts, :raw, false)
+    headers = Keyword.get(opts, :headers, [])
+    chunked_body = Keyword.get(opts, :chunked_body)
     suffix = if raw?, do: "/$value", else: ""
     path = "/0/odata/#{entity}(#{id})/#{field}#{suffix}"
+
+    default_ct = if raw?, do: "text/plain", else: "application/json"
+    content_type = Keyword.get(opts, :content_type, default_ct)
+
+    body =
+      cond do
+        status == 204 -> ""
+        chunked_body != nil -> chunked_body
+        Keyword.has_key?(opts, :raw_body) -> Keyword.fetch!(opts, :raw_body)
+        raw? -> to_string(Keyword.fetch!(opts, :value))
+        true -> Keyword.get(opts, :body, %{"value" => Keyword.get(opts, :value)})
+      end
 
     add_route(
       ctx,
       fn req -> req.method == "GET" and req.request_path == path end,
       fn conn, _req ->
-        if raw? do
-          conn
-          |> put_resp_content_type("text/plain")
-          |> send_resp(status, to_string(Keyword.fetch!(opts, :value)))
-        else
-          body = Keyword.get(opts, :body, %{"value" => Keyword.get(opts, :value)})
-
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(status, Jason.encode!(body))
-        end
+        send_stub_response(
+          conn,
+          status,
+          body,
+          content_type: content_type,
+          headers: headers,
+          chunked?: chunked_body != nil
+        )
       end
     )
   end
@@ -444,7 +500,8 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
     status = Keyword.get(opts, :status, 200)
     strategy = Keyword.get(opts, :strategy, :path)
     format = Keyword.get(opts, :format, :plain_text)
-    count_value = Keyword.fetch!(opts, :count)
+    count_value = Keyword.get(opts, :count)
+    content_type = Keyword.get(opts, :content_type)
 
     path =
       case strategy do
@@ -456,7 +513,16 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
       ctx,
       fn req -> req.method == "GET" and req.request_path == path end,
       fn conn, _req ->
-        send_odata_count_response(conn, status, format, count_value)
+        if Keyword.has_key?(opts, :raw_body) do
+          send_stub_response(
+            conn,
+            status,
+            Keyword.fetch!(opts, :raw_body),
+            content_type: content_type || "text/html"
+          )
+        else
+          send_odata_count_response(conn, status, format, count_value, content_type)
+        end
       end
     )
   end
@@ -493,16 +559,12 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
           send_resp(conn, 204, "")
         else
           created =
-            case Keyword.get(opts, :body) do
+            case Keyword.get(opts, :raw_body, Keyword.get(opts, :body)) do
               nil -> Map.put(req.decoded_body || %{}, "Id", assigned_id)
               explicit -> explicit
             end
 
-          raw_body = if is_binary(created), do: created, else: Jason.encode!(created)
-
-          conn
-          |> put_resp_content_type(content_type)
-          |> send_resp(status, raw_body)
+          send_stub_response(conn, status, created, content_type: content_type)
         end
       end
     )
@@ -513,15 +575,31 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   """
   def stub_odata_update(ctx, entity, id, opts \\ []) do
     status = Keyword.get(opts, :status, 204)
+    content_type = Keyword.get(opts, :content_type, "application/json")
 
     add_route(
       ctx,
       fn req -> req.method == "PATCH" and req.request_path == "/0/odata/#{entity}(#{id})" end,
       fn conn, _req ->
-        if Keyword.has_key?(opts, :body) do
-          send_json_or_raw(conn, status, Keyword.fetch!(opts, :body))
-        else
-          send_resp(conn, status, "")
+        cond do
+          Keyword.has_key?(opts, :raw_body) ->
+            send_stub_response(
+              conn,
+              status,
+              Keyword.fetch!(opts, :raw_body),
+              content_type: content_type
+            )
+
+          Keyword.has_key?(opts, :body) ->
+            send_stub_response(
+              conn,
+              status,
+              Keyword.fetch!(opts, :body),
+              content_type: content_type
+            )
+
+          true ->
+            send_resp(conn, status, "")
         end
       end
     )
@@ -532,12 +610,14 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   """
   def stub_odata_delete(ctx, entity, id, opts \\ []) do
     status = Keyword.get(opts, :status, 204)
+    content_type = Keyword.get(opts, :content_type, "application/json")
+    body = Keyword.get(opts, :raw_body, Keyword.get(opts, :body, ""))
 
     add_route(
       ctx,
       fn req -> req.method == "DELETE" and req.request_path == "/0/odata/#{entity}(#{id})" end,
       fn conn, _req ->
-        send_resp(conn, status, "")
+        send_stub_response(conn, status, body, content_type: content_type)
       end
     )
   end
@@ -547,6 +627,8 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   """
   def stub_odata_update_field(ctx, entity, id, field, opts \\ []) do
     status = Keyword.get(opts, :status, 204)
+    content_type = Keyword.get(opts, :content_type, "application/json")
+    body = Keyword.get(opts, :raw_body, Keyword.get(opts, :body, ""))
 
     add_route(
       ctx,
@@ -554,7 +636,7 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
         req.method == "PUT" and req.request_path == "/0/odata/#{entity}(#{id})/#{field}"
       end,
       fn conn, _req ->
-        send_resp(conn, status, "")
+        send_stub_response(conn, status, body, content_type: content_type)
       end
     )
   end
@@ -564,6 +646,8 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   """
   def stub_odata_delete_field(ctx, entity, id, field, opts \\ []) do
     status = Keyword.get(opts, :status, 204)
+    content_type = Keyword.get(opts, :content_type, "application/json")
+    body = Keyword.get(opts, :raw_body, Keyword.get(opts, :body, ""))
 
     add_route(
       ctx,
@@ -571,7 +655,7 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
         req.method == "DELETE" and req.request_path == "/0/odata/#{entity}(#{id})/#{field}"
       end,
       fn conn, _req ->
-        send_resp(conn, status, "")
+        send_stub_response(conn, status, body, content_type: content_type)
       end
     )
   end
@@ -587,15 +671,39 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
     status = Keyword.get(opts, :status, 200)
     records = Keyword.get(opts, :records, [])
     count = Keyword.get(opts, :count)
+    next_link = Keyword.get(opts, :next_link)
     count_key = Keyword.get(opts, :count_key, "__count")
     envelope = Keyword.get(opts, :envelope, :results)
+    content_type = Keyword.get(opts, :content_type, "application/json")
     collection = collection_name(entity)
 
-    d_payload =
-      case {envelope, count} do
-        {:d_list, _} -> records
-        {_, nil} -> %{"results" => records}
-        {_, _} -> %{"results" => records, count_key => count}
+    body =
+      cond do
+        Keyword.has_key?(opts, :raw_body) ->
+          Keyword.fetch!(opts, :raw_body)
+
+        Keyword.has_key?(opts, :body) ->
+          Keyword.fetch!(opts, :body)
+
+        true ->
+          d_payload =
+            case {envelope, count} do
+              {:d_list, _} ->
+                records
+
+              {_, nil} ->
+                %{"results" => records}
+
+              {_, _} ->
+                %{"results" => records, count_key => count}
+            end
+            |> then(fn payload ->
+              if is_map(payload) and next_link != nil,
+                do: Map.put(payload, "__next", next_link),
+                else: payload
+            end)
+
+          %{"d" => d_payload}
       end
 
     add_route(
@@ -604,9 +712,7 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
         req.method == "GET" and req.request_path == "#{@odata3_base_path}/#{collection}"
       end,
       fn conn, _req ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(status, Jason.encode!(%{"d" => d_payload}))
+        send_stub_response(conn, status, body, content_type: content_type)
       end
     )
   end
@@ -635,12 +741,40 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   end
 
   @doc """
+  Stubs stateful or multi-page OData 3 collection responses using a list of page specs
+  or a `callback.(req, call_index)` function.
+  """
+  def stub_odata3_pages(ctx, entity, pages_or_fun)
+      when is_list(pages_or_fun) or is_function(pages_or_fun, 2) do
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+    collection = collection_name(entity)
+    path = "#{@odata3_base_path}/#{collection}"
+
+    add_route(
+      ctx,
+      fn req -> req.method == "GET" and req.request_path == path end,
+      fn conn, req ->
+        idx = Agent.get_and_update(counter, fn n -> {n, n + 1} end)
+        spec = resolve_page_spec(pages_or_fun, req, idx, %{"d" => %{"results" => []}})
+        send_page_spec(conn, spec)
+      end
+    )
+  end
+
+  @doc """
   Stubs an OData 3 single-entity endpoint (`...Collection(guid'{id}')`).
   """
   def stub_odata3_get(ctx, entity, id, opts \\ []) do
     status = Keyword.get(opts, :status, 200)
+    content_type = Keyword.get(opts, :content_type, "application/json")
     collection = collection_name(entity)
-    body = Keyword.get(opts, :body) || %{"d" => Keyword.get(opts, :record, %{"Id" => id})}
+
+    body =
+      cond do
+        Keyword.has_key?(opts, :raw_body) -> Keyword.fetch!(opts, :raw_body)
+        Keyword.has_key?(opts, :body) -> Keyword.fetch!(opts, :body)
+        true -> %{"d" => Keyword.get(opts, :record, %{"Id" => id})}
+      end
 
     add_route(
       ctx,
@@ -649,9 +783,7 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
           req.request_path == "#{@odata3_base_path}/#{collection}(guid'#{id}')"
       end,
       fn conn, _req ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(status, Jason.encode!(body))
+        send_stub_response(conn, status, body, content_type: content_type)
       end
     )
   end
@@ -661,10 +793,17 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   """
   def stub_odata3_navigation(ctx, entity, id, nav, opts \\ []) do
     status = Keyword.get(opts, :status, 200)
+    content_type = Keyword.get(opts, :content_type, "application/json")
     collection = collection_name(entity)
 
     body =
       cond do
+        status == 204 ->
+          ""
+
+        Keyword.has_key?(opts, :raw_body) ->
+          Keyword.fetch!(opts, :raw_body)
+
         Keyword.has_key?(opts, :body) ->
           Keyword.fetch!(opts, :body)
 
@@ -685,9 +824,7 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
           req.request_path == "#{@odata3_base_path}/#{collection}(guid'#{id}')/#{nav}"
       end,
       fn conn, _req ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(status, Jason.encode!(body))
+        send_stub_response(conn, status, body, content_type: content_type)
       end
     )
   end
@@ -698,23 +835,36 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   def stub_odata3_field(ctx, entity, id, field, opts \\ []) do
     status = Keyword.get(opts, :status, 200)
     raw? = Keyword.get(opts, :raw, false)
+    headers = Keyword.get(opts, :headers, [])
+    chunked_body = Keyword.get(opts, :chunked_body)
     collection = collection_name(entity)
     suffix = if raw?, do: "/$value", else: ""
     path = "#{@odata3_base_path}/#{collection}(guid'#{id}')/#{field}#{suffix}"
+
+    default_ct = if raw?, do: "text/plain", else: "application/json"
+    content_type = Keyword.get(opts, :content_type, default_ct)
+
+    body =
+      cond do
+        status == 204 -> ""
+        chunked_body != nil -> chunked_body
+        Keyword.has_key?(opts, :raw_body) -> Keyword.fetch!(opts, :raw_body)
+        raw? -> to_string(Keyword.fetch!(opts, :value))
+        true -> Keyword.get(opts, :body, %{"d" => %{field => Keyword.get(opts, :value)}})
+      end
 
     add_route(
       ctx,
       fn req -> req.method == "GET" and req.request_path == path end,
       fn conn, _req ->
-        if raw? do
-          send_resp(conn, status, to_string(Keyword.fetch!(opts, :value)))
-        else
-          body = Keyword.get(opts, :body, %{"d" => %{field => Keyword.get(opts, :value)}})
-
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(status, Jason.encode!(body))
-        end
+        send_stub_response(
+          conn,
+          status,
+          body,
+          content_type: content_type,
+          headers: headers,
+          chunked?: chunked_body != nil
+        )
       end
     )
   end
@@ -726,6 +876,7 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
     status = Keyword.get(opts, :status, 200)
     strategy = Keyword.get(opts, :strategy, :path)
     format = Keyword.get(opts, :format, :plain_text)
+    content_type = Keyword.get(opts, :content_type)
     collection = collection_name(entity)
     count_value = Keyword.get(opts, :count)
 
@@ -734,7 +885,7 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
         :query ->
           fn req ->
             req.method == "GET" and req.request_path == "#{@odata3_base_path}/#{collection}" and
-              req.query_string == "/$count"
+              (req.query_string == "/$count" or String.starts_with?(req.query_string, "/$count&"))
           end
 
         _ ->
@@ -745,34 +896,15 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
       end
 
     add_route(ctx, matcher, fn conn, _req ->
-      case format do
-        :d_count_int ->
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(status, Jason.encode!(%{"d" => count_value}))
-
-        :d_nested_count ->
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(
-            status,
-            Jason.encode!(%{"d" => %{"results" => [], "count" => count_value}})
-          )
-
-        :bom_plain_text ->
-          conn
-          |> put_resp_content_type("text/plain")
-          |> send_resp(status, "\uFEFF#{count_value}")
-
-        :json_integer ->
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(status, Jason.encode!(count_value))
-
-        _ ->
-          conn
-          |> put_resp_content_type("text/plain")
-          |> send_resp(status, to_string(count_value))
+      if Keyword.has_key?(opts, :raw_body) do
+        send_stub_response(
+          conn,
+          status,
+          Keyword.fetch!(opts, :raw_body),
+          content_type: content_type || "text/html"
+        )
+      else
+        send_odata3_count_response(conn, status, format, count_value, content_type)
       end
     end)
   end
@@ -782,6 +914,7 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   """
   def stub_odata3_create(ctx, entity, opts \\ []) do
     status = Keyword.get(opts, :status, 201)
+    content_type = Keyword.get(opts, :content_type, "application/json")
     collection = collection_name(entity)
     assigned_id = Keyword.get(opts, :assigned_id, "guid-new")
 
@@ -792,13 +925,18 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
       end,
       fn conn, req ->
         body =
-          Keyword.get_lazy(opts, :body, fn ->
-            Map.put(req.decoded_body || %{}, "Id", assigned_id)
-          end)
+          cond do
+            Keyword.has_key?(opts, :raw_body) ->
+              Keyword.fetch!(opts, :raw_body)
 
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(status, Jason.encode!(body))
+            Keyword.has_key?(opts, :body) ->
+              Keyword.fetch!(opts, :body)
+
+            true ->
+              Map.put(req.decoded_body || %{}, "Id", assigned_id)
+          end
+
+        send_stub_response(conn, status, body, content_type: content_type)
       end
     )
   end
@@ -808,6 +946,7 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   """
   def stub_odata3_update(ctx, entity, id, opts \\ []) do
     status = Keyword.get(opts, :status, 204)
+    content_type = Keyword.get(opts, :content_type, "application/json")
     collection = collection_name(entity)
 
     add_route(
@@ -817,10 +956,25 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
           req.request_path == "#{@odata3_base_path}/#{collection}(guid'#{id}')"
       end,
       fn conn, _req ->
-        if Keyword.has_key?(opts, :body) do
-          send_json_or_raw(conn, status, Keyword.fetch!(opts, :body))
-        else
-          send_resp(conn, status, "")
+        cond do
+          Keyword.has_key?(opts, :raw_body) ->
+            send_stub_response(
+              conn,
+              status,
+              Keyword.fetch!(opts, :raw_body),
+              content_type: content_type
+            )
+
+          Keyword.has_key?(opts, :body) ->
+            send_stub_response(
+              conn,
+              status,
+              Keyword.fetch!(opts, :body),
+              content_type: content_type
+            )
+
+          true ->
+            send_resp(conn, status, "")
         end
       end
     )
@@ -831,6 +985,8 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   """
   def stub_odata3_delete(ctx, entity, id, opts \\ []) do
     status = Keyword.get(opts, :status, 204)
+    content_type = Keyword.get(opts, :content_type, "application/json")
+    body = Keyword.get(opts, :raw_body, Keyword.get(opts, :body, ""))
     collection = collection_name(entity)
 
     add_route(
@@ -840,7 +996,7 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
           req.request_path == "#{@odata3_base_path}/#{collection}(guid'#{id}')"
       end,
       fn conn, _req ->
-        send_resp(conn, status, "")
+        send_stub_response(conn, status, body, content_type: content_type)
       end
     )
   end
@@ -854,6 +1010,7 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   """
   def stub_batch(ctx, opts \\ []) do
     status = Keyword.get(opts, :status, 200)
+    content_type = Keyword.get(opts, :content_type, "application/json")
 
     add_route(
       ctx,
@@ -868,17 +1025,31 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
             |> put_resp_header("content-type", "multipart/mixed; boundary=#{boundary}")
             |> send_resp(status, body)
 
+          Keyword.has_key?(opts, :raw_body) ->
+            send_stub_response(
+              conn,
+              status,
+              Keyword.fetch!(opts, :raw_body),
+              content_type: content_type
+            )
+
           Keyword.has_key?(opts, :single_entity) ->
-            conn
-            |> put_resp_content_type("application/json")
-            |> send_resp(status, Jason.encode!(Keyword.fetch!(opts, :single_entity)))
+            send_stub_response(
+              conn,
+              status,
+              Keyword.fetch!(opts, :single_entity),
+              content_type: content_type
+            )
 
           true ->
             responses = Keyword.get(opts, :responses, [])
 
-            conn
-            |> put_resp_content_type("application/json")
-            |> send_resp(status, Jason.encode!(%{"responses" => responses}))
+            send_stub_response(
+              conn,
+              status,
+              %{"responses" => responses},
+              content_type: content_type
+            )
         end
       end
     )
@@ -890,7 +1061,7 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   def stub_data_service(ctx, action, opts \\ []) do
     status = Keyword.get(opts, :status, 200)
     content_type = Keyword.get(opts, :content_type, "application/json")
-    body = Keyword.get(opts, :body, %{"success" => true})
+    body = Keyword.get(opts, :raw_body, Keyword.get(opts, :body, %{"success" => true}))
 
     add_route(
       ctx,
@@ -898,11 +1069,7 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
         req.method == "POST" and req.request_path == "/0/DataService/json/SyncReply/#{action}"
       end,
       fn conn, _req ->
-        encoded = if is_binary(body), do: body, else: Jason.encode!(body)
-
-        conn
-        |> put_resp_content_type(content_type)
-        |> send_resp(status, encoded)
+        send_stub_response(conn, status, body, content_type: content_type)
       end
     )
   end
@@ -914,7 +1081,8 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
     method = opts |> Keyword.get(:method, :post) |> to_string() |> String.upcase()
     status = Keyword.get(opts, :status, 200)
     echo? = Keyword.get(opts, :echo, false)
-    body = Keyword.get(opts, :body, %{})
+    content_type = Keyword.get(opts, :content_type, "application/json")
+    body = Keyword.get(opts, :raw_body, Keyword.get(opts, :body, %{}))
 
     add_route(
       ctx,
@@ -932,9 +1100,7 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
             |> send_resp(status, req.raw_body)
 
           true ->
-            conn
-            |> put_resp_content_type("application/json")
-            |> send_resp(status, Jason.encode!(body))
+            send_stub_response(conn, status, body, content_type: content_type)
         end
       end
     )
@@ -1004,46 +1170,128 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
     |> send_resp(status, Jason.encode!(body))
   end
 
-  defp send_odata_count_response(conn, status, :plain_text, count_value) do
-    conn
-    |> put_resp_content_type("text/plain")
-    |> send_resp(status, to_string(count_value))
+  defp send_stub_response(conn, status, body, opts) do
+    content_type = Keyword.get(opts, :content_type, "application/json")
+    headers = Keyword.get(opts, :headers, [])
+    chunked? = Keyword.get(opts, :chunked?, false)
+
+    conn =
+      Enum.reduce(headers, conn, fn {k, v}, acc ->
+        put_resp_header(acc, String.downcase(to_string(k)), to_string(v))
+      end)
+
+    cond do
+      chunked? and is_list(body) ->
+        conn =
+          conn
+          |> put_resp_content_type(content_type)
+          |> send_chunked(status)
+
+        Enum.reduce(body, conn, fn piece, acc ->
+          {:ok, next_conn} = chunk(acc, piece)
+          next_conn
+        end)
+
+      status == 204 and body == "" ->
+        send_resp(conn, 204, "")
+
+      is_binary(body) ->
+        conn
+        |> put_resp_content_type(content_type)
+        |> send_resp(status, body)
+
+      true ->
+        conn
+        |> put_resp_content_type(content_type)
+        |> send_resp(status, Jason.encode!(body))
+    end
   end
 
-  defp send_odata_count_response(conn, status, :bom_plain_text, count_value) do
-    conn
-    |> put_resp_content_type("text/plain")
-    |> send_resp(status, "\uFEFF#{count_value}")
+  defp resolve_page_spec(fun, req, idx, _fallback) when is_function(fun, 2), do: fun.(req, idx)
+
+  defp resolve_page_spec(pages, _req, idx, fallback) when is_list(pages) do
+    Enum.at(pages, idx, {200, fallback})
   end
 
-  defp send_odata_count_response(conn, status, :json_integer, count_value) do
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(status, Jason.encode!(count_value))
+  defp send_page_spec(conn, {status, body}), do: send_stub_response(conn, status, body, [])
+
+  defp send_page_spec(conn, {status, headers, body}) do
+    {content_type, rest_headers} = pop_content_type_header(headers)
+
+    send_stub_response(
+      conn,
+      status,
+      body,
+      content_type: content_type,
+      headers: rest_headers
+    )
   end
 
-  defp send_odata_count_response(conn, status, :odata_count, count_value) do
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(status, Jason.encode!(%{"@odata.count" => count_value}))
+  defp pop_content_type_header(headers) do
+    case Enum.split_with(headers, fn {k, _} -> String.downcase(to_string(k)) == "content-type" end) do
+      {[{_k, ct} | _], rest} -> {ct, rest}
+      {[], rest} -> {"application/json", rest}
+    end
   end
 
-  defp send_odata_count_response(conn, status, :odata_count_string, count_value) do
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(status, Jason.encode!(%{"@odata.count" => to_string(count_value)}))
+  defp send_odata_count_response(conn, status, format, count_value, content_type) do
+    default_ct =
+      case format do
+        f when f in [:plain_text, :bom_plain_text] -> "text/plain"
+        _ -> "application/json"
+      end
+
+    ct = content_type || default_ct
+
+    payload =
+      case format do
+        :plain_text ->
+          to_string(count_value)
+
+        :bom_plain_text ->
+          "\uFEFF#{count_value}"
+
+        :json_integer ->
+          count_value
+
+        :odata_count ->
+          %{"@odata.count" => count_value}
+
+        :odata_count_string ->
+          %{"@odata.count" => to_string(count_value)}
+
+        :value_string ->
+          %{"value" => to_string(count_value)}
+
+        :value_and_count ->
+          %{"value" => elem(count_value, 0), "@odata.count" => elem(count_value, 1)}
+      end
+
+    send_stub_response(conn, status, payload, content_type: ct)
   end
 
-  defp send_odata_count_response(conn, status, :value_string, count_value) do
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(status, Jason.encode!(%{"value" => to_string(count_value)}))
-  end
+  defp send_odata3_count_response(conn, status, format, count_value, content_type) do
+    default_ct =
+      case format do
+        f when f in [:plain_text, :bom_plain_text] -> "text/plain"
+        _ -> "application/json"
+      end
 
-  defp send_odata_count_response(conn, status, :value_and_count, {val, count_value}) do
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(status, Jason.encode!(%{"value" => val, "@odata.count" => count_value}))
+    ct = content_type || default_ct
+
+    payload =
+      case format do
+        :d_count_int -> %{"d" => count_value}
+        :d_count_obj -> %{"d" => %{"count" => count_value}}
+        :d_nested_count -> %{"d" => %{"results" => [], "count" => count_value}}
+        :d_nested_dunder_count -> %{"d" => %{"results" => [], "__count" => count_value}}
+        :d_dunder_count -> %{"d" => %{"__count" => count_value}}
+        :bom_plain_text -> "\uFEFF#{count_value}"
+        :json_integer -> count_value
+        _ -> to_string(count_value)
+      end
+
+    send_stub_response(conn, status, payload, content_type: ct)
   end
 
   defp parse_int_param(nil, default), do: default

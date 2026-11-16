@@ -14,12 +14,14 @@ defmodule Creatio.TestDSL.AuthDSL do
   def creatio_forms_auth_accepting(ctx, opts \\ []) do
     cookies = build_cookie_headers(opts)
 
+    default_ct =
+      if Keyword.get(opts, :plain_text, false), do: "text/plain", else: "application/json"
+
     stub_opts =
       [
         cookies: cookies,
         bpmcsrf_header: Keyword.get(opts, :csrf_header),
-        content_type:
-          if(Keyword.get(opts, :plain_text, false), do: "text/plain", else: "application/json")
+        content_type: Keyword.get(opts, :content_type, default_ct)
       ]
       |> maybe_put_opt(:raw_body, Keyword.get(opts, :raw_body))
 
@@ -56,6 +58,25 @@ defmodule Creatio.TestDSL.AuthDSL do
     |> then(fn c -> Map.put(c, :raw_req, CreatioServerDriver.req(c)) end)
   end
 
+  def bare_req_without_base_url(ctx) do
+    ctx
+    |> CreatioServerDriver.ensure_server()
+    |> then(fn c -> Map.put(c, :raw_req, Req.new()) end)
+  end
+
+  def creatio_client_from_req(ctx, opts) do
+    ctx = CreatioServerDriver.ensure_server(ctx)
+    {req_headers, client_opts} = Keyword.pop(opts, :req_headers, [])
+    req = CreatioServerDriver.req(ctx, headers: req_headers)
+    Map.put(ctx, :client, Client.from_req(req, client_opts))
+  end
+
+  def creatio_client_with_raw_urls(ctx, opts) do
+    ctx
+    |> CreatioServerDriver.ensure_server()
+    |> Map.put(:client, Client.new(opts))
+  end
+
   def creatio_client_with_oauth_config(ctx, opts) do
     ctx = CreatioServerDriver.ensure_server(ctx)
     client = CreatioServerDriver.client(ctx, opts)
@@ -81,16 +102,30 @@ defmodule Creatio.TestDSL.AuthDSL do
     )
   end
 
-  def creatio_oauth_health_status(ctx, body) do
+  def creatio_oauth_health_status(ctx, body, opts \\ []) do
+    stub_opts =
+      if is_binary(body) do
+        opts |> Keyword.put_new(:raw_body, body)
+      else
+        opts |> Keyword.put_new(:body, body)
+      end
+
     ctx
     |> CreatioServerDriver.ensure_server()
-    |> CreatioServerDriver.stub_oauth_health(body: body)
+    |> CreatioServerDriver.stub_oauth_health(stub_opts)
   end
 
-  def identity_openid_discovery(ctx, body) do
+  def identity_openid_discovery(ctx, body, opts \\ []) do
+    stub_opts =
+      if is_binary(body) do
+        opts |> Keyword.put_new(:raw_body, body)
+      else
+        opts |> Keyword.put_new(:body, body)
+      end
+
     ctx
     |> CreatioServerDriver.ensure_server()
-    |> CreatioServerDriver.stub_openid_configuration(body: body)
+    |> CreatioServerDriver.stub_openid_configuration(stub_opts)
   end
 
   def identity_openid_discovery_unavailable(ctx, status) do
@@ -103,16 +138,38 @@ defmodule Creatio.TestDSL.AuthDSL do
   # @upon steps
   # ---------------------------------------------------------------------------
 
-  def logging_in_with_forms(ctx, username, password) do
-    CRMClientDriver.login_forms(ctx, username, password)
+  def logging_in_with_forms(ctx, username, password, opts \\ []) do
+    CRMClientDriver.login_forms(ctx, username, password, opts)
   end
 
   def logging_in_with_oauth(ctx, opts \\ []) do
     CRMClientDriver.login_oauth(ctx, opts)
   end
 
-  def checking_oauth_health(ctx) do
-    CRMClientDriver.oauth_health_check(ctx)
+  def attempting_blank_oauth_token_logins(ctx, tokens) when is_list(tokens) do
+    results =
+      Enum.map(tokens, fn tok ->
+        step_ctx =
+          ctx
+          |> CreatioServerDriver.ensure_server()
+          |> CreatioServerDriver.stub_oauth_token(
+            path: "/0/connect/token",
+            body: %{"access_token" => tok}
+          )
+          |> creatio_client_with_oauth_config(
+            identity_service_url: "https://id.creatio.com/0///",
+            client_id: "cid"
+          )
+          |> CRMClientDriver.login_oauth(client_secret: "transient-sec")
+
+        {tok, Map.fetch!(step_ctx, :result)}
+      end)
+
+    Map.put(ctx, :matrix_results, results)
+  end
+
+  def checking_oauth_health(ctx, opts \\ []) do
+    CRMClientDriver.oauth_health_check(ctx, opts)
   end
 
   def fetching_openid_configuration(ctx, opts \\ []) do
@@ -138,6 +195,15 @@ defmodule Creatio.TestDSL.AuthDSL do
 
       if Keyword.has_key?(expected, :exact_cookie) do
         assert authed.cookie == Keyword.fetch!(expected, :exact_cookie)
+      end
+
+      if Keyword.has_key?(expected, :expected_base_url) do
+        assert authed.base_url == Keyword.fetch!(expected, :expected_base_url)
+      end
+
+      if Keyword.has_key?(expected, :single_cookie_name) do
+        name = Keyword.fetch!(expected, :single_cookie_name)
+        assert length(Regex.scan(~r/#{Regex.escape(name)}=/i, authed.cookie)) == 1
       end
 
       assert authed.req.headers["bpmcsrf"] == [authed.bpmcsrf]
@@ -167,17 +233,45 @@ defmodule Creatio.TestDSL.AuthDSL do
       expected_token = Keyword.fetch!(expected, :access_token)
 
       assert token_data["access_token"] == expected_token
-      assert token_data["expires_in"] == Keyword.fetch!(expected, :expires_in)
+
+      if Keyword.has_key?(expected, :expires_in) do
+        assert token_data["expires_in"] == Keyword.fetch!(expected, :expires_in)
+      end
+
       assert authed.auth_mode == :bearer
       assert authed.auth_token == expected_token
       assert authed.req.headers["authorization"] == ["Bearer #{expected_token}"]
 
+      if Keyword.has_key?(expected, :identity_service_url) do
+        assert authed.identity_service_url == Keyword.fetch!(expected, :identity_service_url)
+      end
+
+      if Keyword.get(expected, :clears_client_secret, false) do
+        assert authed.client_secret == nil
+      end
+
       last_req = CreatioServerDriver.last_request(ctx)
       assert last_req.method == "POST"
-      assert last_req.request_path == "/connect/token"
+      assert last_req.request_path == Keyword.get(expected, :token_path, "/connect/token")
       assert last_req.decoded_body["grant_type"] == "client_credentials"
       assert last_req.decoded_body["client_id"] == Keyword.fetch!(expected, :client_id)
       assert last_req.decoded_body["client_secret"] == Keyword.fetch!(expected, :client_secret)
+
+      ctx
+    end
+  end
+
+  defmacro request_omitted_headers(ctx, header_names) do
+    quote line: __CALLER__.line do
+      ctx = unquote(ctx)
+      last_req = CreatioServerDriver.last_request(ctx)
+
+      Enum.each(unquote(header_names), fn h ->
+        key = String.downcase(to_string(h))
+
+        assert Map.get(last_req.headers, key, []) == [],
+               "Expected request header #{inspect(key)} to be omitted, got: #{inspect(last_req.headers[key])}"
+      end)
 
       ctx
     end
@@ -244,6 +338,30 @@ defmodule Creatio.TestDSL.AuthDSL do
     quote line: __CALLER__.line do
       ctx = unquote(ctx)
       assert {:error, %Error{status: unquote(expected_status)}} = Map.fetch!(ctx, :result)
+      ctx
+    end
+  end
+
+  defmacro all_token_attempts_failed_with(ctx, opts) do
+    quote line: __CALLER__.line do
+      ctx = unquote(ctx)
+      expected = unquote(opts)
+      results = Map.fetch!(ctx, :matrix_results)
+      assert results != []
+
+      Enum.each(results, fn {tok, res} ->
+        assert {:error, %Error{} = err} = res,
+               "Expected error for token #{inspect(tok)}, got: #{inspect(res)}"
+
+        if Keyword.has_key?(expected, :status) do
+          assert err.status == Keyword.fetch!(expected, :status)
+        end
+
+        if Keyword.has_key?(expected, :code) do
+          assert err.code == Keyword.fetch!(expected, :code)
+        end
+      end)
+
       ctx
     end
   end
