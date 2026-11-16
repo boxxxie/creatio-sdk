@@ -7,7 +7,7 @@
 3. **Test-Driven / ATDD Development:** Write failing unit tests or 4-layer ATDD feature specs (`test/features/` + `test/support/`) before implementing behavior changes.
 4. **High Code Coverage & Strict Gates:** Maintain test coverage above the `mix.exs` threshold (`>84%`), targeting `>85%` per module, with zero Credo/Dialyzer/compiler warnings.
 5. **Backwards-Compatibility Awareness:** Document every breaking change clearly in `CHANGELOG.md` and migration notes ahead of `v1.0.0`.
-6. **Non-Interactive & CI-Aware:** Always run Mix commands matching `.gitlab-ci.yml` (`mix test --cover`, `mix format --check-formatted`, `mix credo --strict`, `mix dialyzer`, `mix docs`).
+6. **Non-Interactive & CI-Aware:** Always run Mix commands matching `.github/workflows/ci.yml` (`mix test --cover`, `mix format --check-formatted`, `mix credo --strict`, `mix dialyzer`, `mix docs`).
 
 ## Task Workflow
 

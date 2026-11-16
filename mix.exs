@@ -2,7 +2,7 @@ defmodule Creatio.MixProject do
   use Mix.Project
 
   @version "1.0.0"
-  @source_url "https://gitlab.nvestiv.com/caasa/creatio-sdk"
+  @source_url "https://github.com/boxxxie/creatio-sdk"
 
   def project do
     [
@@ -59,7 +59,7 @@ defmodule Creatio.MixProject do
       files:
         ~w(lib docs/CREATIO_API_INTEGRATION.md docs/USE_CASES_SYNCING_USERS.md .formatter.exs mix.exs README.md CHANGELOG.md LICENSE usage-rules.md),
       licenses: ["MIT"],
-      links: %{"GitLab" => @source_url}
+      links: %{"GitHub" => @source_url}
     ]
   end
 

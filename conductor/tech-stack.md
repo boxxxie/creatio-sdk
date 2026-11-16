@@ -1,7 +1,7 @@
 # Tech Stack: `creatio` (`creatio-sdk`)
 
 ## Language & Runtime
-- **Elixir:** `~> 1.15` (CI runs `elixir:1.15` Docker image via `.gitlab-ci.yml`)
+- **Elixir:** `~> 1.15` (CI runs Elixir `1.15` / OTP `26` via `.github/workflows/ci.yml`)
 - **OTP:** Standard Erlang/OTP paired with Elixir 1.15+
 
 ## Runtime Dependencies (`mix.exs`)
@@ -23,6 +23,6 @@
   - Coverage gate: `mix test --cover` minimum threshold `84%` (configured in `mix.exs`)
 
 ## CI & Distribution
-- **CI:** `.gitlab-ci.yml` (`mix test`, `mix format --check-formatted`, `mix credo --strict`, `mix dialyzer`)
+- **CI:** `.github/workflows/ci.yml` (`mix test`, `mix format --check-formatted`, `mix credo --strict`, `mix dialyzer`)
 - **Package Registry:** Hex.pm (`creatio`) + HexDocs (`creatio.hexdocs.pm`)
 - **Versioning:** Semantic Versioning (`v0.4.0` current, targeting `v1.0.0`)
