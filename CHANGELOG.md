@@ -5,21 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] - 2026-11-15
+## [1.0.0] - 2026-11-16
 
 ### Added
 
-- **`:telemetry` Observability & Credential Redaction (`Creatio.Telemetry`)**:
+- **`:telemetry` Observability & Credential Redaction (`Creatio.Telemetry` & `Inspect`)**:
   - Added `{:telemetry, "~> 1.2"}` runtime dependency and `Creatio.Telemetry` with zero runtime GenServers.
-  - Emits `[:creatio, :request, :start | :stop | :exception]` via `Req` lifecycle steps attached by `Creatio.Client`.
-  - Emits domain-level `:telemetry.span/3` events across OData 4 (`[:creatio, :odata, *]`), OData 3 (`[:creatio, :odata3, *]`), DataService (`[:creatio, :data_service, *]`), Auth (`[:creatio, :auth, *]`), and Batch (`[:creatio, :batch, *]`).
-  - Automatically redacts sensitive headers (`authorization`, `cookie`, `set-cookie`, `bpmcsrf`, `x-api-key`, `proxy-authorization`) and credential metadata (`auth_token`, `client_secret`, `cookie`, `bpmcsrf`, passwords, OAuth tokens) to `"[REDACTED]"`.
-- **Exception-Raising Streams (`stream!/3`, `odata3_stream!/3`)**:
+  - Emits `[:creatio, :request, :start | :stop | :exception]` (with `monotonic_time` measurements) via `Req` lifecycle steps attached by `Creatio.Client`.
+  - Emits domain-level `:telemetry.span/3` events across OData 4 (`[:creatio, :odata, *]`), OData 3 (`[:creatio, :odata3, *]`), DataService (`[:creatio, :data_service, *]`), Auth (`[:creatio, :auth, *]`), and Batch (`[:creatio, :batch, *]`, including `error_count` metadata on `[:creatio, :batch, :stop]`).
+  - Automatically redacts sensitive headers (`authorization`, `cookie`, `set-cookie`, `bpmcsrf`, `x-api-key`, `proxy-authorization`) and credential metadata (`auth_token`, `client_secret`, `cookie`, `bpmcsrf`, passwords, OAuth tokens) to `"[REDACTED]"`, and implements a custom `Inspect` protocol on `Creatio.Client` that redacts credentials and sensitive options.
+- **Exception-Raising Streams (`stream!/3`, `odata3_stream!/3`) & Streaming Enhancements**:
   - Added `Creatio.stream!/3`, `Creatio.OData.stream!/3`, `Creatio.odata3_stream!/3`, and `Creatio.OData3.stream!/3` returning plain `record` maps and raising `%Creatio.Error{}` on failure.
-- **Field Value Transport Option Forwarding**:
-  - Extended `Creatio.get_field_value/5`, `Creatio.OData.get_field_value/5`, `Creatio.odata3_get_field_value/5`, and `Creatio.OData3.get_field_value/5` to forward `:headers`, `:req_options`, and query options alongside `:into` while preserving `decode_body: false`.
-- **Opaque Builder Public Accessors & Full Facade `@spec` Coverage**:
+  - Added `@odata.nextLink` and `__next` (`$skiptoken` / `$deltatoken`) automatic continuation in `stream/3` and `odata3_stream/3` (and `!` variants), along with composite `(cursor_field, Id)` tie-breaking and auto-selected cursor fields for keyset pagination.
+- **Field Value Transport Option Forwarding & Sink Gating**:
+  - Extended `Creatio.get_field_value/5`, `Creatio.OData.get_field_value/5`, `Creatio.odata3_get_field_value/5`, and `Creatio.OData3.get_field_value/5` to forward `:headers`, `:req_options`, and query options alongside `:into` while preserving `decode_body: false`, supporting HTTP `206 Partial Content`, and gating `into:` `Collectable` sinks on `2xx` responses and WAF/HTML checks.
+  - Added `%IO.Stream{}` support alongside `File.Stream` and `Stream` uploads in `Creatio.OData.update_field/6`.
+- **Opaque Builder Public Accessors, Query Counts & Full Facade `@spec` Coverage**:
   - Added public accessors `Creatio.Batch.size/1`, `Creatio.Batch.requests/1`, `Creatio.OData.Query.entity/1`, `Creatio.OData.Query.get_top/1`, and `Creatio.OData.Query.get_skip/1`.
+  - Added `Creatio.OData.Query.t()` and map option support in `Creatio.count/3`, `Creatio.OData.count/3`, `Creatio.odata3_count/3`, and `Creatio.OData3.count/3` (and `!` variants).
   - Added explicit `@spec` annotations across every `defdelegate` in `Creatio`.
 - **`usage-rules.md` & Opt-In Live Wire Verification**:
   - Added `usage-rules.md` in the repository root and bundled it in the Hex package manifest and ExDoc extras.
@@ -27,9 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Elixir & OTP Minimum Requirement**: Updated minimum Elixir requirement to `~> 1.19` (OTP 28+).
 - **Opaque Builder Contracts (`@opaque t`)**: Converted `Creatio.OData.Query.t()` and `Creatio.Batch.t()` from `@type` to `@opaque` so internal representation fields are excluded from the public SemVer contract.
 - **Tuple-Emitting Non-Bang Streams**: Updated `Creatio.stream/3`, `Creatio.OData.stream/3`, `Creatio.odata3_stream/3`, and `Creatio.OData3.stream/3` to yield `{:ok, record}` items and emit `{:error, %Creatio.Error{}}` before halting cleanly on failure instead of raising mid-stream.
 - **Explicit `from_req/2` Scoping**: Removed the implicit `System.get_env("CREATIO_BASE_URL")` fallback from `Creatio.Client.from_req/2` (it now uses `:base_url` from `opts` or `req.options[:base_url]`, defaulting to `""`). Environment/application config fallback remains exclusively in `Creatio.Client.new/1`.
+- **Strict Validation & Response Hardening**: Enforced strict identifier/GUID/URL validation, path-traversal guards in `read_only: true`, and HTML/WAF/IIS `text/html` JSON response guards across OData 4, OData 3, Auth, Batch, and DataService.
 - **Tightened Dependency Upper Bound**: Updated `:req` dependency constraint from `>= 0.5.0` to `~> 0.5`.
 
 ### Upgrading from 0.4.x to 1.0.0
@@ -49,7 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 3. **`Creatio.Client.from_req/2` no longer reads `CREATIO_BASE_URL`:**
    - Pass `base_url:` via `Req.new(base_url: ...)` or `Creatio.from_req(req, base_url: "...")`, or initialize with `Creatio.new/1` when relying on environment configuration.
 4. **Dependency updates:**
-   - `:creatio` `1.0.0` requires `{:req, "~> 0.5"}` and introduces `{:telemetry, "~> 1.2"}`.
+   - `:creatio` `1.0.0` requires Elixir `~> 1.19`, `{:req, "~> 0.5"}`, and introduces `{:telemetry, "~> 1.2"}`.
 
 ## [0.4.0] - 2026-11-15
 
