@@ -5,7 +5,7 @@ Guidance for humans and coding agents using the `:creatio` Elixir SDK (`~> 1.0`)
 ## Client Initialization & Configuration
 
 - Use `Creatio.new(opts)` (or `Creatio.Client.new(opts)`) for standard applications. It reads fallback values from `Application.get_env(:creatio, ...)` and environment variables (`CREATIO_BASE_URL`, `CREATIO_AUTH_TOKEN`, `CREATIO_BEARER_TOKEN`, `CREATIO_IDENTITY_URL`, `CREATIO_IDENTITY_SERVICE_URL`, `CREATIO_CLIENT_ID`, `CREATIO_CLIENT_SECRET`, `CREATIO_READ_ONLY`).
-- Use `Creatio.from_req(req, opts)` (or `Creatio.Client.from_req(req, opts)`) when wrapping an existing `%Req.Request{}`. Unlike `new/1`, `from_req/2` does **not** read `CREATIO_BASE_URL` from the environment; pass `base_url:` in `opts` or configure it on `req`.
+- Use `Creatio.from_req(req, opts)` (or `Creatio.Client.from_req(req, opts)`) when wrapping an existing `%Req.Request{}`. Unlike `new/1`, `from_req/2` does **not** read `CREATIO_BASE_URL`, `CREATIO_READ_ONLY`, or `Application.get_env(:creatio, ...)` defaults; pass `base_url:` or `read_only:` explicitly in `opts` or configure them on `req`.
 - Pass custom transport/test/retry options through `req_options: [...]` on `Creatio.new/1`.
 - Never manually strip or hand-build Creatio auth headers alongside mixed auth modes: `Creatio.Client.put_bearer_token/2` and `Creatio.Client.put_forms_auth/3` mutually clear conflicting credentials before updating `client.req`.
 
@@ -18,15 +18,16 @@ Guidance for humans and coding agents using the `:creatio` Elixir SDK (`~> 1.0`)
 ## Read-Only Safety Mode (`read_only: true`)
 
 - Enable `read_only: true` (or `CREATIO_READ_ONLY=true`) on read replicas, analytics pipelines, or verification scripts.
-- All mutation operations (`create/4`, `update/5`, `delete/4`, `update_field/6`, `delete_field/5`, DataService write actions, mutating `custom_service/5` calls, and batches containing write methods) are blocked locally with `{:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}}` and reinforced by a `Req` request step.
+- All mutation operations (`create/4`, `update/5`, `delete/4`, `update_field/6`, `delete_field/5`, `odata3_create/4`, `odata3_update/5`, `odata3_delete/4`, DataService write actions, mutating `custom_service/5` calls, and batches containing write methods or raw binary multipart bodies) are blocked locally with `{:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}}` and reinforced by a `Req` request step.
 
 ## Opaque Builders (`Creatio.OData.Query` & `Creatio.Batch`)
 
 - Both `Creatio.OData.Query.t()` and `Creatio.Batch.t()` are `@opaque`.
 - **Do not** pattern-match on or directly read internal struct fields (such as `select_rev`, `filters_rev`, `orderby_rev`, `expand_rev`, `ops`, or `requests`).
 - **Always** use the public constructors, pipes, and accessors:
-  - Query: `Creatio.query("Contact")`, `Query.select/2`, `Query.filter_eq/4`, `Query.and_filter/2`, `Query.or_filter_eq/4`, `Query.order_by/2`, `Query.top/2`, `Query.skip/2`, `Query.expand/2`, `Query.entity/1`, `Query.get_top/1`, `Query.get_skip/1`, `Query.to_params/1`, `Query.to_query_string/1`.
-  - Batch: `Creatio.batch_new(opts)`, `Batch.add_get/2..4`, `Batch.add_create/4`, `Batch.add_update/5`, `Batch.add_delete/4`, `Batch.size/1`, `Batch.requests/1`, `Batch.to_payload/1`, `Batch.to_multipart_iodata/2`, `Batch.to_multipart/2`.
+  - Query: `Creatio.query("Contact")`, `Query.select/2`, `Query.filter_eq/4`, `Query.filter_guid/4`, `Query.filter_in/4`, `Query.filter_in_ids/4`, `Query.and_filter/2`, `Query.or_filter_eq/4`, `Query.order_by/2`, `Query.top/2`, `Query.skip/2`, `Query.expand/2`, `Query.entity/1`, `Query.get_top/1`, `Query.get_skip/1`, `Query.to_params/1`, `Query.to_query_string/1`.
+  - Creatio OData 4 does **not** support the OData `in` operator and expects unquoted GUID literals (`Id eq 00000000-...`, whereas legacy OData 3 uses `guid'...'`). Use `Query.filter_in/4`, `Query.filter_in_ids/4`, and `Query.filter_guid/4` instead of writing raw `in (...)` clauses.
+  - Batch: `Creatio.batch_new(opts)`, `Batch.add_get/2..4`, `Batch.add_create/3..4`, `Batch.add_update/3..5`, `Batch.add_delete/2..4`, `Batch.size/1`, `Batch.requests/1`, `Batch.to_payload/1`, `Batch.to_multipart_iodata/2`, `Batch.to_multipart/2`, and inspect `%Creatio.Batch.Response{}` items with `Batch.Response.success?/1`, `Batch.Response.error?/1`, and `Batch.Response.to_error/1`.
 
 ```elixir
 # DO: construct and inspect via public builders and accessors
@@ -66,8 +67,8 @@ client |> Creatio.stream(query) |> Enum.map(& &1["Id"])
 - Use `Creatio.get_field_value(client, entity, id, field, opts)` (or `odata3_get_field_value/5`) to fetch raw scalars or binary streams without automatic JSON decoding (`decode_body: false` is always enforced, even if `:req_options` passes `decode_body: true`).
 - Forward `:into` (e.g. `into: File.stream!("/path/to/file")`), `:headers`, `:req_options`, and OData query options cleanly through `get_field_value/5`.
 - When `:into` is a `Collectable` (such as `File.stream!/1`) or a 2-arity callback (`fn {:data, chunk}, {req, resp} -> ... end`), chunk forwarding is gated to valid `2xx` responses (`204` returns `{:ok, nil}` without opening or invoking the sink): non-`2xx` error bodies (up to 64 KB) and `200` WAF/HTML/JSON error envelopes stay buffered so error payloads never corrupt the sink and are preserved in `%Creatio.Error{}`.
-- Upload binaries, `File.Stream`, or arbitrary `Stream` chunks via `Creatio.update_field(client, entity, id, field, data, opts)` (uses `application/octet-stream` for binary/stream bodies or `Jason.encode_to_iodata!/1` for scalar/map values).
-- Pass `return: :minimal` on `create/4`, `update/5`, or `Batch.new/1` / `Batch.add/4` to send `Prefer: return=minimal` and extract `Id` / `@odata.id` from `204` `odata-entityid` / `location` headers.
+- Upload binaries, `File.Stream`, `IO.Stream`, or arbitrary `Stream` chunks via `Creatio.update_field(client, entity, id, field, data, opts)` (uses `application/octet-stream` for binary/stream bodies, `Jason.encode_to_iodata!/1` for scalar/map values, and delegates `nil` values to `delete_field/5`).
+- Pass `return: :minimal` on `create/4`, `update/5`, `Batch.new/1`, `Batch.add/4`, `Batch.add_create/4`, or `Batch.add_update/5` to send `Prefer: return=minimal` and extract `Id` / `@odata.id` from `204` `odata-entityid` / `location` headers.
 
 ## Batch Requests
 
