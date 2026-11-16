@@ -322,14 +322,22 @@ defmodule Creatio.Telemetry do
   @spec sanitize_metadata(map()) :: map()
   def sanitize_metadata(meta) when is_map(meta) and not is_struct(meta) do
     Map.new(meta, fn {k, v} ->
-      {k, sanitize_meta_entry(k, v)}
+      {sanitize_map_key(k), sanitize_meta_entry(k, v)}
     end)
   end
 
   def sanitize_metadata(other), do: other
 
+  defp sanitize_map_key(k) when is_atom(k) or is_binary(k) or is_number(k), do: k
+  defp sanitize_map_key(k), do: sanitize_meta_value(k)
+
+  defp safe_key_downcase(key) when is_binary(key), do: String.downcase(key)
+  defp safe_key_downcase(key) when is_atom(key), do: key |> Atom.to_string() |> String.downcase()
+  defp safe_key_downcase(key) when is_number(key), do: to_string(key)
+  defp safe_key_downcase(_key), do: ""
+
   defp sanitize_meta_entry(key, val) do
-    key_down = key |> to_string() |> String.downcase()
+    key_down = safe_key_downcase(key)
 
     cond do
       key_down in ["headers", "req_headers", "resp_headers"] ->
@@ -416,7 +424,7 @@ defmodule Creatio.Telemetry do
   defp sanitize_uri_query_pair(pair) do
     case String.split(pair, "=", parts: 2) do
       [raw_key, _raw_val] ->
-        key_down = raw_key |> URI.decode() |> String.downcase()
+        key_down = raw_key |> safe_uri_decode() |> String.downcase()
 
         if MapSet.member?(@sensitive_meta_keys, key_down) do
           "#{raw_key}=[REDACTED]"
@@ -427,6 +435,12 @@ defmodule Creatio.Telemetry do
       _ ->
         pair
     end
+  end
+
+  defp safe_uri_decode(str) when is_binary(str) do
+    URI.decode(str)
+  rescue
+    ArgumentError -> str
   end
 
   defp sanitize_struct(%{__struct__: _mod} = struct) do
@@ -479,7 +493,7 @@ defmodule Creatio.Telemetry do
       "\\1=[REDACTED]"
     )
     |> String.replace(
-      ~r/("?(?:auth_token|bearer_token|access_token|refresh_token|client_secret|cookie|bpmcsrf|password|user_password|userpassword)"?\s*(?::|=>)\s*)"(?:\\.|[^"\\])*"/i,
+      ~r/("?(?:auth_token|bearer_token|access_token|refresh_token|client_secret|cookie|bpmcsrf|password|user_password|userpassword)"?\s*(?::|=>)\s*)"(?:\\.|[^"\\])*\\?(?:"|\z)/i,
       "\\1\"[REDACTED]\""
     )
     |> String.replace(
@@ -554,17 +568,18 @@ defmodule Creatio.Telemetry do
   defp count_remaining_items(_improper_tail, acc), do: acc + 1
 
   defp sanitize_response_entry({k, v}, depth) do
-    key_down = k |> to_string() |> String.downcase()
+    key_down = safe_key_downcase(k)
+    safe_k = sanitize_map_key(k)
 
     cond do
       key_down == "headers" ->
-        {k, sanitize_headers(v)}
+        {safe_k, sanitize_headers(v)}
 
       MapSet.member?(@sensitive_meta_keys, key_down) ->
-        {k, if(is_nil(v), do: nil, else: "[REDACTED]")}
+        {safe_k, if(is_nil(v), do: nil, else: "[REDACTED]")}
 
       true ->
-        {k, sanitize_response_body(v, depth + 1)}
+        {safe_k, sanitize_response_body(v, depth + 1)}
     end
   end
 

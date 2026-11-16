@@ -1507,5 +1507,182 @@ defmodule Creatio.UtilTest do
 
       assert_receive {:into_chunk, "small-ok"}
     end
+
+    test "handles folded Set-Cookie headers, $-prefixed atom stream opts, blank filters, naive ISO cursors, RFC 2046 boundaries, blank update_field content_type, and custom_service params precedence" do
+      alias Creatio.Validation
+
+      # BUG-003: comma-folded Set-Cookie header inside Req's header list
+      folded_plug = fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header(
+          "set-cookie",
+          "BPMLOADER=loader1; Path=/, BPMCSRF=csrf_folded; Path=/; HttpOnly"
+        )
+        |> Req.Test.json(%{"Code" => 0})
+      end
+
+      ro_client = Client.new(base_url: "https://crm.test", req_options: [plug: folded_plug])
+      assert {:ok, authed} = Auth.login_forms(ro_client, "user", "pass")
+      assert authed.bpmcsrf == "csrf_folded"
+      assert authed.cookie == "BPMLOADER=loader1; BPMCSRF=csrf_folded"
+
+      # BUG-011 & BUG-017 & BUG-020: $-prefixed atom stream opts, whitespace filter, naive ISO cursor in OData v4
+      parent = self()
+      {:ok, page_agent} = Agent.start_link(fn -> 0 end)
+      on_exit(fn -> if Process.alive?(page_agent), do: Agent.stop(page_agent) end)
+
+      atom_stream_items =
+        Util.paginate_stream!(
+          ro_client,
+          "Contact",
+          [
+            "$filter": "Active eq true",
+            "$orderby": "CreatedOn desc",
+            "$top": 3,
+            "$skip": 1,
+            page_size: 2,
+            cursor_field: "CreatedOn",
+            after_cursor: "2026-01-01T12:00:00"
+          ],
+          :odata4,
+          fn _c, _t, opts ->
+            idx = Agent.get_and_update(page_agent, fn n -> {n, n + 1} end)
+            params = Util.normalize_odata_params(opts, %{}, {"$count", "true"})
+            send(parent, {:atom_stream_page, idx, params})
+
+            case idx do
+              0 ->
+                {:ok,
+                 [
+                   %{"Id" => "1", "CreatedOn" => "2026-01-01T11:00:00"},
+                   %{"Id" => "2", "CreatedOn" => "2026-01-01T10:00:00"}
+                 ]}
+
+              1 ->
+                {:ok, [%{"Id" => "3", "CreatedOn" => "2026-01-01T09:00:00"}]}
+            end
+          end
+        )
+        |> Enum.to_list()
+
+      assert length(atom_stream_items) == 3
+      assert_receive {:atom_stream_page, 0, page0_params}
+      assert page0_params["$top"] == "2"
+      assert page0_params["$orderby"] == "CreatedOn desc, Id desc"
+      assert page0_params["$filter"] == "(Active eq true) and (CreatedOn lt 2026-01-01T12:00:00Z)"
+      refute Map.has_key?(page0_params, "$skip")
+
+      assert_receive {:atom_stream_page, 1, page1_params}
+      assert page1_params["$top"] == "1"
+
+      assert page1_params["$filter"] ==
+               "(Active eq true) and ((CreatedOn lt 2026-01-01T10:00:00Z or (CreatedOn eq 2026-01-01T10:00:00Z and Id lt '2')))"
+
+      # Verify $top and $skip atom keys in offset pagination
+      {:ok, offset_agent} = Agent.start_link(fn -> 0 end)
+      on_exit(fn -> if Process.alive?(offset_agent), do: Agent.stop(offset_agent) end)
+
+      offset_items =
+        Util.paginate_stream!(
+          ro_client,
+          "Contact",
+          ["$top": 3, "$skip": 1, page_size: 2],
+          :odata4,
+          fn _c, _t, opts ->
+            idx = Agent.get_and_update(offset_agent, fn n -> {n, n + 1} end)
+            params = Util.normalize_odata_params(opts, %{}, {"$count", "true"})
+            send(parent, {:atom_offset_page, idx, params})
+
+            case idx do
+              0 -> {:ok, [%{"Id" => "1"}, %{"Id" => "2"}]}
+              1 -> {:ok, [%{"Id" => "3"}]}
+            end
+          end
+        )
+        |> Enum.to_list()
+
+      assert length(offset_items) == 3
+      assert_receive {:atom_offset_page, 0, %{"$top" => "2", "$skip" => "1"}}
+      assert_receive {:atom_offset_page, 1, %{"$top" => "1", "$skip" => "3"}}
+
+      # Whitespace-only base filter does not emit `(   ) and (...)` on page 2+
+      {:ok, blank_filter_agent} = Agent.start_link(fn -> 0 end)
+      on_exit(fn -> if Process.alive?(blank_filter_agent), do: Agent.stop(blank_filter_agent) end)
+
+      blank_filter_items =
+        Util.paginate_stream!(
+          ro_client,
+          "Contact",
+          [filter: "   ", page_size: 1, cursor_field: "Id"],
+          :odata4,
+          fn _c, _t, opts ->
+            idx = Agent.get_and_update(blank_filter_agent, fn n -> {n, n + 1} end)
+            params = Util.normalize_odata_params(opts, %{}, {"$count", "true"})
+            send(parent, {:blank_filter_page, idx, params})
+
+            case idx do
+              0 -> {:ok, [%{"Id" => "00000000-0000-0000-0000-000000000001"}]}
+              _ -> {:ok, []}
+            end
+          end
+        )
+        |> Enum.to_list()
+
+      assert length(blank_filter_items) == 1
+      assert_receive {:blank_filter_page, 0, bf0}
+      refute Map.has_key?(bf0, "$filter")
+      assert_receive {:blank_filter_page, 1, bf1}
+      assert bf1["$filter"] == "Id gt 00000000-0000-0000-0000-000000000001"
+
+      # BUG-018 & BUG-019: quoted boundaries with spaces/semicolons/single quotes and `--` suffixes
+      assert Validation.extract_boundary_from_header(~s(multipart/mixed; boundary="batch 1;a")) ==
+               "batch 1;a"
+
+      assert Validation.extract_boundary_from_header("multipart/mixed; boundary='batch'") ==
+               "'batch'"
+
+      dash_body =
+        "--batch--\r\nContent-Type: application/http\r\n\r\nGET A\r\n" <>
+          "--batch--\r\nContent-Type: application/http\r\n\r\nGET B\r\n" <>
+          "--batch----\r\n"
+
+      assert length(Validation.split_multipart_parts(dash_body, "batch--")) == 2
+
+      # BUG-016 & BUG-013: blank :content_type in update_field/6 and duplicate :params in custom_service/5
+      api_plug = fn conn ->
+        send(
+          parent,
+          {:api_req, conn.method, conn.request_path, conn.query_string, conn.req_headers}
+        )
+
+        case conn.request_path do
+          "/0/odata/Contact('1')/Notes" -> Plug.Conn.send_resp(conn, 204, "")
+          "/0/rest/Svc/Ep" -> Req.Test.json(conn, %{"ok" => true})
+        end
+      end
+
+      api_client = Client.new(base_url: "https://crm.test", req_options: [plug: api_plug])
+
+      assert :ok =
+               OData.update_field(api_client, "Contact", "1", "Notes", "hi", content_type: "   ")
+
+      assert_receive {:api_req, "PUT", "/0/odata/Contact('1')/Notes", _, put_headers}
+
+      assert List.keyfind(put_headers, "content-type", 0) ==
+               {"content-type", "application/json; IEEE754Compatible=true"}
+
+      assert {:ok, %{"ok" => true}} =
+               DataService.custom_service(
+                 api_client,
+                 "Svc",
+                 "Ep",
+                 %{"id" => "from_payload", "extra" => "1"},
+                 method: :get,
+                 params: %{"id" => "from_params"}
+               )
+
+      assert_receive {:api_req, "GET", "/0/rest/Svc/Ep", qs, _}
+      assert URI.decode_query(qs) == %{"id" => "from_payload", "extra" => "1"}
+    end
   end
 end

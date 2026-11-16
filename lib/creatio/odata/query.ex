@@ -450,16 +450,16 @@ defmodule Creatio.OData.Query do
   Specifies maximum records to return (`$top`).
   """
   @spec top(t(), non_neg_integer()) :: t()
-  def top(%__MODULE__{} = query, n) when is_integer(n) and n >= 0 do
-    %__MODULE__{query | top: n}
+  def top(%__MODULE__{custom_params: params} = query, n) when is_integer(n) and n >= 0 do
+    %__MODULE__{query | top: n, custom_params: Map.delete(params, "$top")}
   end
 
   @doc """
   Specifies number of records to skip (`$skip`).
   """
   @spec skip(t(), non_neg_integer()) :: t()
-  def skip(%__MODULE__{} = query, n) when is_integer(n) and n >= 0 do
-    %__MODULE__{query | skip: n}
+  def skip(%__MODULE__{custom_params: params} = query, n) when is_integer(n) and n >= 0 do
+    %__MODULE__{query | skip: n, custom_params: Map.delete(params, "$skip")}
   end
 
   @doc """
@@ -489,7 +489,14 @@ defmodule Creatio.OData.Query do
   """
   @spec param(t(), String.t() | atom(), any()) :: t()
   def param(%__MODULE__{custom_params: params} = query, key, value) do
-    %__MODULE__{query | custom_params: Map.put(params, to_string(key), to_string(value))}
+    key_str = to_string(key)
+    next_params = Map.put(params, key_str, to_string(value))
+
+    case key_str do
+      "$top" -> %__MODULE__{query | top: nil, custom_params: next_params}
+      "$skip" -> %__MODULE__{query | skip: nil, custom_params: next_params}
+      _ -> %__MODULE__{query | custom_params: next_params}
+    end
   end
 
   @doc """
@@ -515,7 +522,7 @@ defmodule Creatio.OData.Query do
   """
   @spec get_top(t()) :: non_neg_integer() | nil
   def get_top(%__MODULE__{top: top_val, custom_params: custom_params}) do
-    top_val || parse_non_neg_custom_param(custom_params["$top"])
+    parse_non_neg_custom_param(custom_params["$top"]) || top_val
   end
 
   @doc """
@@ -529,7 +536,7 @@ defmodule Creatio.OData.Query do
   """
   @spec get_skip(t()) :: non_neg_integer() | nil
   def get_skip(%__MODULE__{skip: skip_val, custom_params: custom_params}) do
-    skip_val || parse_non_neg_custom_param(custom_params["$skip"])
+    parse_non_neg_custom_param(custom_params["$skip"]) || skip_val
   end
 
   defp parse_non_neg_custom_param(val) when is_integer(val) and val >= 0, do: val

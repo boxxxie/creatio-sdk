@@ -946,7 +946,7 @@ defmodule Creatio.OData do
           url = "/0/odata/#{entity}(#{clean})/#{field_name}"
 
           {body_payload, default_ct} = encode_field_payload(value, opts)
-          content_type = Util.get_opt(opts, :content_type) || default_ct
+          content_type = non_blank_opt(Util.get_opt(opts, :content_type)) || default_ct
 
           base_req =
             client.req

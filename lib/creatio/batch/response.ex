@@ -19,7 +19,13 @@ defmodule Creatio.Batch.Response do
   Returns `true` if the batch response status is in the 2xx range.
   """
   @spec success?(t()) :: boolean()
-  def success?(%__MODULE__{status: status}) when is_integer(status), do: status in 200..299
+  def success?(%__MODULE__{status: status}) do
+    case normalize_status(status) do
+      int when is_integer(int) -> int in 200..299
+      _ -> false
+    end
+  end
+
   def success?(_), do: false
 
   @doc """

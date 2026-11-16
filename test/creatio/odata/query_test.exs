@@ -543,6 +543,30 @@ defmodule Creatio.OData.QueryTest do
       stripped_params = q |> Query.strip_filter_and_order() |> Query.to_params()
       refute Map.has_key?(stripped_params, "$filter")
       refute Map.has_key?(stripped_params, "$orderby")
+
+      q_top_after_param =
+        Query.new("Contact")
+        |> Query.param("$top", 10)
+        |> Query.top(25)
+        |> Query.param("$skip", 5)
+        |> Query.skip(15)
+
+      assert Query.get_top(q_top_after_param) == 25
+      assert Query.get_skip(q_top_after_param) == 15
+      assert Query.to_params(q_top_after_param)["$top"] == "25"
+      assert Query.to_params(q_top_after_param)["$skip"] == "15"
+
+      q_param_after_top =
+        Query.new("Contact")
+        |> Query.top(25)
+        |> Query.param("$top", 10)
+        |> Query.skip(15)
+        |> Query.param("$skip", 5)
+
+      assert Query.get_top(q_param_after_top) == 10
+      assert Query.get_skip(q_param_after_top) == 5
+      assert Query.to_params(q_param_after_top)["$top"] == "10"
+      assert Query.to_params(q_param_after_top)["$skip"] == "5"
     end
   end
 end

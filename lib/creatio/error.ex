@@ -114,10 +114,15 @@ defmodule Creatio.Error do
 
   def sanitize_headers(other), do: other
 
-  defp sensitive_header?(key) do
-    key_down = key |> to_string() |> String.downcase()
-    MapSet.member?(@sensitive_headers, key_down)
+  defp sensitive_header?(key) when is_binary(key) do
+    MapSet.member?(@sensitive_headers, String.downcase(key))
   end
+
+  defp sensitive_header?(key) when is_atom(key) do
+    MapSet.member?(@sensitive_headers, key |> Atom.to_string() |> String.downcase())
+  end
+
+  defp sensitive_header?(_key), do: false
 
   defp redact_header_value(vals) when is_list(vals), do: Enum.map(vals, fn _ -> "[REDACTED]" end)
   defp redact_header_value(nil), do: nil
@@ -129,29 +134,23 @@ defmodule Creatio.Error do
 
   defp parse_error_body(%{"error" => %{} = err}) do
     code = first_non_blank([err["code"], err["Code"], err["errorCode"], err["ErrorCode"]])
-    raw_msg = err["message"] || err["Message"]
 
     msg =
-      case raw_msg do
-        %{"value" => v} when is_binary(v) ->
-          v
-
-        v when is_binary(v) ->
-          v
-
-        v when not is_nil(v) ->
-          inspect(v)
-
-        _ ->
-          first_non_blank([err["error_description"], code])
-      end
+      extract_error_msg_candidate(err["message"]) ||
+        extract_error_msg_candidate(err["Message"]) ||
+        first_non_blank([err["error_description"], code])
 
     details = err["innererror"] || err["innerError"]
     {code, msg, details}
   end
 
-  defp parse_error_body(%{"error" => err, "error_description" => desc}) do
-    {err, desc, nil}
+  defp parse_error_body(%{"error" => err, "error_description" => desc} = body)
+       when is_binary(err) or is_binary(desc) do
+    code =
+      first_non_blank([err, body["code"], body["Code"], body["errorCode"], body["ErrorCode"]])
+
+    msg = first_non_blank([desc, body["message"], body["Message"], err])
+    {code, msg, nil}
   end
 
   defp parse_error_body(%{"error" => err}) when is_binary(err) do
@@ -282,24 +281,20 @@ defmodule Creatio.Error do
     {code, if(is_binary(msg), do: msg, else: nil), ex}
   end
 
-  defp parse_error_body(%{"Message" => msg} = body) when is_map(body) do
-    code = first_non_blank([body["Code"], body["code"], body["errorCode"], body["ErrorCode"]])
-    {code, msg, body["Exception"]}
+  defp parse_error_body(%{"Message" => _} = body) when is_map(body) do
+    extract_top_level_message(body)
   end
 
-  defp parse_error_body(%{"ExceptionMessage" => msg} = body) when is_map(body) do
-    code = first_non_blank([body["Code"], body["code"], body["errorCode"], body["ErrorCode"]])
-    {code, msg, body["Exception"]}
+  defp parse_error_body(%{"ExceptionMessage" => _} = body) when is_map(body) do
+    extract_top_level_message(body)
   end
 
   defp parse_error_body(%{"message" => %{"value" => msg}} = body) when is_binary(msg) do
-    code = first_non_blank([body["code"], body["Code"], body["errorCode"], body["ErrorCode"]])
-    {code, msg, nil}
+    extract_top_level_message(body)
   end
 
   defp parse_error_body(%{"message" => msg} = body) when is_binary(msg) do
-    code = first_non_blank([body["code"], body["Code"], body["errorCode"], body["ErrorCode"]])
-    {code, msg, nil}
+    extract_top_level_message(body)
   end
 
   defp parse_error_body(body) when is_binary(body) do
@@ -348,6 +343,32 @@ defmodule Creatio.Error do
       |> IO.iodata_to_binary()
     end
   end
+
+  defp extract_top_level_message(body) do
+    code = first_non_blank([body["Code"], body["code"], body["errorCode"], body["ErrorCode"]])
+
+    msg =
+      extract_body_string_message(body["Message"]) ||
+        extract_body_string_message(body["ExceptionMessage"]) ||
+        extract_body_string_message(body["message"]) ||
+        extract_body_string_message(body["error_description"])
+
+    {code, msg, body["Exception"]}
+  end
+
+  defp extract_error_msg_candidate(%{"value" => v}), do: non_blank_binary(v)
+  defp extract_error_msg_candidate(v) when is_binary(v), do: non_blank_binary(v)
+  defp extract_error_msg_candidate(nil), do: nil
+  defp extract_error_msg_candidate(v), do: inspect(v)
+
+  defp extract_body_string_message(%{"value" => val}), do: non_blank_binary(val)
+  defp extract_body_string_message(val), do: non_blank_binary(val)
+
+  defp non_blank_binary(val) when is_binary(val) do
+    if String.trim(val) != "", do: val, else: nil
+  end
+
+  defp non_blank_binary(_), do: nil
 
   defp first_non_blank(values) do
     Enum.find(values, fn

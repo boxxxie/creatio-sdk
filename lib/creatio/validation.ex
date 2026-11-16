@@ -241,9 +241,15 @@ defmodule Creatio.Validation do
   """
   @spec extract_boundary_from_header(String.t()) :: String.t() | nil
   def extract_boundary_from_header(header) when is_binary(header) do
-    case Regex.run(~r/boundary="?([^";\s\r\n]+)"?/i, header) do
-      [_, boundary] -> clean_boundary_str(boundary)
-      _ -> nil
+    case Regex.run(~r/boundary=(?:"([^"\r\n]+)"|([^;\s\r\n]+))/i, header) do
+      [_, quoted] when is_binary(quoted) and quoted != "" ->
+        clean_boundary_str(quoted)
+
+      [_, _, unquoted] when is_binary(unquoted) and unquoted != "" ->
+        clean_boundary_str(unquoted)
+
+      _ ->
+        nil
     end
   end
 
@@ -254,7 +260,7 @@ defmodule Creatio.Validation do
   """
   @spec clean_boundary_str(String.t()) :: String.t()
   def clean_boundary_str(boundary) when is_binary(boundary) do
-    boundary |> String.trim() |> String.trim("\"") |> String.trim("'")
+    boundary |> String.trim() |> String.trim("\"") |> String.trim()
   end
 
   @doc """
@@ -272,20 +278,28 @@ defmodule Creatio.Validation do
       pattern =
         ~r/(?:\r\n|\n|\A)--#{Regex.escape(clean_boundary)}(?:--)?[ \t]*(?=\r\n|\n|\z)/
 
+      closing_marker = "--#{clean_boundary}--"
+
       case Regex.split(pattern, body, include_captures: true) do
-        [_preamble | rest] -> collect_open_parts(rest, [])
+        [_preamble | rest] -> collect_open_parts(rest, closing_marker, [])
         _ -> []
       end
     end
   end
 
-  defp collect_open_parts([delimiter, content | rest], acc) do
-    if String.ends_with?(String.trim_trailing(delimiter), "--") do
+  defp collect_open_parts([delimiter, content | rest], closing_marker, acc) do
+    trimmed_delim =
+      delimiter
+      |> String.trim_leading("\r\n")
+      |> String.trim_leading("\n")
+      |> String.trim_trailing()
+
+    if trimmed_delim == closing_marker do
       Enum.reverse(acc)
     else
-      collect_open_parts(rest, [content | acc])
+      collect_open_parts(rest, closing_marker, [content | acc])
     end
   end
 
-  defp collect_open_parts(_other, acc), do: Enum.reverse(acc)
+  defp collect_open_parts(_other, _closing_marker, acc), do: Enum.reverse(acc)
 end

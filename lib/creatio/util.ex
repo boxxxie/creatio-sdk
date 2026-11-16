@@ -750,11 +750,24 @@ defmodule Creatio.Util do
     "orderby" => :orderby,
     "order_by" => :orderby,
     "$orderby" => :orderby,
+    "$order_by" => :orderby,
     "expand" => :expand,
     "$expand" => :expand,
     "params" => :params,
     "req_options" => :req_options
   }
+
+  defp normalize_stream_atom_key(:order_by), do: :orderby
+  defp normalize_stream_atom_key(:"$select"), do: :select
+  defp normalize_stream_atom_key(:"$filter"), do: :filter
+  defp normalize_stream_atom_key(:"$orderby"), do: :orderby
+  defp normalize_stream_atom_key(:"$order_by"), do: :orderby
+  defp normalize_stream_atom_key(:"$top"), do: :top
+  defp normalize_stream_atom_key(:"$skip"), do: :skip
+  defp normalize_stream_atom_key(:"$expand"), do: :expand
+  defp normalize_stream_atom_key(:"$count"), do: :count
+  defp normalize_stream_atom_key(:"$inlinecount"), do: :inlinecount
+  defp normalize_stream_atom_key(key), do: key
 
   defp normalize_stream_opts(opts) when is_map(opts) do
     opts
@@ -766,7 +779,7 @@ defmodule Creatio.Util do
     {kw, extra_params} =
       Enum.reduce(opts, {[], %{}}, fn
         {key, val}, {acc_kw, acc_params} when is_atom(key) ->
-          normalized_key = if key == :order_by, do: :orderby, else: key
+          normalized_key = normalize_stream_atom_key(key)
 
           if normalized_key == :params do
             {acc_kw, merge_extra_params(acc_params, val)}
@@ -870,8 +883,15 @@ defmodule Creatio.Util do
     user_params = Keyword.get(base_opts, :params, %{})
     query_params = if is_binary(base_target), do: %{}, else: Query.to_params(base_target)
 
-    base_filter =
+    raw_base_filter =
       Keyword.get(base_opts, :filter) || user_params["$filter"] || query_params["$filter"]
+
+    base_filter =
+      if is_binary(raw_base_filter) and String.trim(raw_base_filter) != "" do
+        raw_base_filter
+      else
+        nil
+      end
 
     requested_orderby =
       Keyword.get(base_opts, :orderby) || user_params["$orderby"] || query_params["$orderby"]
@@ -1286,7 +1306,13 @@ defmodule Creatio.Util do
     end
   end
 
-  defp format_iso_datetime_cursor(val, _protocol), do: val
+  defp format_iso_datetime_cursor(val, _protocol) do
+    if Regex.match?(~r/(?:Z|[+-]\d{2}:\d{2})\z/, val) do
+      val
+    else
+      val <> "Z"
+    end
+  end
 
   defp parse_ms_ajax_datetime(val) do
     case Regex.run(~r/\A\/Date\((-?\d+)(?:([+-])(\d{2})(\d{2}))?\)\/\z/, val) do

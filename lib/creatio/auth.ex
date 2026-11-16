@@ -33,6 +33,7 @@ defmodule Creatio.Auth do
 
         base_req =
           client.req
+          |> Client.detach_read_only_guard()
           |> Req.Request.delete_header("authorization")
           |> Req.Request.delete_header("cookie")
           |> Req.Request.delete_header("bpmcsrf")
@@ -463,6 +464,7 @@ defmodule Creatio.Auth do
     {ordered_names, by_name} =
       list
       |> Enum.filter(&is_binary/1)
+      |> Enum.flat_map(&split_folded_set_cookie/1)
       |> Enum.reduce({[], %{}}, fn cookie_str, {names, acc} ->
         case parse_set_cookie_entry(cookie_str) do
           {:ok, name_key, cookie_kv, path, cleared?} ->
@@ -490,6 +492,22 @@ defmodule Creatio.Auth do
       {cookie_kv, _path} = Map.fetch!(by_name, name_key)
       cookie_kv
     end)
+  end
+
+  defp split_folded_set_cookie(cookie_str) when is_binary(cookie_str) do
+    case String.split(cookie_str, ";", parts: 2) do
+      [kv_part, attrs_tail] ->
+        case Regex.split(~r/,\s*(?=[A-Za-z0-9_.-]+=)/, attrs_tail, parts: 2) do
+          [first_attrs, next_cookie] ->
+            ["#{kv_part};#{first_attrs}" | split_folded_set_cookie(next_cookie)]
+
+          [only_attrs] ->
+            ["#{kv_part};#{only_attrs}"]
+        end
+
+      [kv_only] ->
+        [kv_only]
+    end
   end
 
   defp parse_set_cookie_entry(cookie_str) do

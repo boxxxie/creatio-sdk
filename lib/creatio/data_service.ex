@@ -288,18 +288,27 @@ defmodule Creatio.DataService do
         else
           url = "/0/rest/#{service_name}/#{endpoint}"
 
-          {params, req_opts} = Keyword.pop(req_opts, :params, %{})
-          {custom_headers, req_opts} = Keyword.pop(req_opts, :headers, %{})
-          {_dropped_req_options, inline_req_opts} = Keyword.pop(req_opts, :req_options, [])
-          inline_req_opts = Keyword.drop(inline_req_opts, [:url, :method, :json, :body])
+          {params_list, req_opts} = Keyword.pop_values(req_opts, :params)
+          params = Enum.reduce(params_list, %{}, &Map.merge(&2, stringify_keys(&1)))
+
+          {headers_list, req_opts} = Keyword.pop_values(req_opts, :headers)
+          {_dropped_req_options, inline_req_opts} = Keyword.pop_values(req_opts, :req_options)
+
+          inline_req_opts =
+            Keyword.drop(inline_req_opts, [:url, :method, :json, :body, :params, :headers])
 
           {final_payload, final_params} =
             resolve_custom_payload_and_params(http_method, payload, params)
 
+          base_req =
+            Enum.reduce(headers_list, client.req, fn hdrs, acc_req ->
+              apply_custom_headers(acc_req, hdrs)
+            end)
+
           {req_with_extra_headers, prepared_opts} =
             Util.prepare_req_call(
-              apply_custom_headers(client.req, custom_headers),
-              opts_kw,
+              base_req,
+              [req_options: Keyword.get(opts_kw, :req_options)],
               [url: url, method: http_method],
               stringify_keys(final_params),
               [:url, :method, :json, :body]
@@ -442,6 +451,8 @@ defmodule Creatio.DataService do
   defp stringify_keys(list) when is_list(list) do
     Map.new(list, fn {k, v} -> {to_string(k), v} end)
   end
+
+  defp apply_custom_headers(req, nil), do: req
 
   defp apply_custom_headers(req, headers) when is_map(headers) or is_list(headers) do
     Enum.reduce(headers, req, fn {k, v}, r ->

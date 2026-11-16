@@ -644,4 +644,67 @@ defmodule Creatio.ClientEnvTest do
     assert updated.auth_token == "new-tok"
     assert Req.Request.get_header(updated.req, "authorization") == ["Bearer new-tok"]
   end
+
+  test "normalizes blank auth_token in from_req/2, allows mixed-case read-only multipart batches, and permits Auth.login_forms/4 with custom url in read_only mode" do
+    bearer_req =
+      Req.new(
+        base_url: "https://mycreatio.com",
+        headers: [{"authorization", "Bearer stale-tok"}]
+      )
+
+    cleared = Client.from_req(bearer_req, auth_token: "")
+    assert cleared.auth_mode == :none
+    assert cleared.auth_token == nil
+    assert Req.Request.get_header(cleared.req, "authorization") == []
+
+    switched = Client.from_req(bearer_req, auth_token: "   ", cookie: "sid=1", bpmcsrf: "csrf-1")
+    assert switched.auth_mode == :forms
+    assert switched.auth_token == nil
+    assert switched.cookie == "sid=1"
+    assert switched.bpmcsrf == "csrf-1"
+    assert Req.Request.get_header(switched.req, "authorization") == []
+    assert Req.Request.get_header(switched.req, "cookie") == ["sid=1"]
+
+    plug = fn conn ->
+      case conn.request_path do
+        "/0/odata/$batch" ->
+          Req.Test.json(conn, %{"responses" => [%{"id" => "1", "status" => 200, "body" => %{}}]})
+
+        "/CustomAuth/Login" ->
+          conn
+          |> Plug.Conn.put_resp_header("set-cookie", "BPMCSRF=csrf-ro; Path=/")
+          |> Req.Test.json(%{"Code" => 0})
+      end
+    end
+
+    ro =
+      Client.new(
+        base_url: "https://mycreatio.com",
+        read_only: true,
+        req_options: [plug: plug]
+      )
+
+    mixed_case_batch =
+      "--Batch_RO_AbC\r\n" <>
+        "Content-Type: multipart/mixed; boundary=Changeset_Inner_X\r\n\r\n" <>
+        "--Changeset_Inner_X\r\n" <>
+        "Content-Type: application/http\r\n\r\n" <>
+        "GET Contact HTTP/1.1\r\n\r\n" <>
+        "--Changeset_Inner_X--\r\n" <>
+        "--Batch_RO_AbC--\r\n"
+
+    assert {:ok, %Req.Response{status: 200}} =
+             Req.post(ro.req,
+               url: "/0/odata/$batch",
+               headers: %{"content-type" => "multipart/mixed; boundary=Batch_RO_AbC"},
+               body: mixed_case_batch
+             )
+
+    assert {:ok, authed_ro} =
+             Creatio.Auth.login_forms(ro, "Supervisor", "Pass", url: "/CustomAuth/Login")
+
+    assert authed_ro.read_only == true
+    assert authed_ro.bpmcsrf == "csrf-ro"
+    assert Keyword.has_key?(authed_ro.req.request_steps, :read_only_guard)
+  end
 end

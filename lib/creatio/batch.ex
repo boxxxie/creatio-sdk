@@ -536,10 +536,11 @@ defmodule Creatio.Batch do
        when status in 200..299 do
     case Util.decode_api_response(raw_resp) do
       {:html_or_xml, resp} ->
-        content_type = resp |> get_resp_content_type() |> String.downcase()
+        raw_ct = get_resp_content_type(resp)
+        content_type = String.downcase(raw_ct)
 
         if String.contains?(content_type, "multipart/mixed") and is_binary(resp.body) do
-          parse_multipart_with_resp(resp, extract_boundary_from_header(content_type))
+          parse_multipart_with_resp(resp, extract_boundary_from_header(raw_ct))
         else
           {:error, Error.from_response(resp)}
         end
@@ -548,11 +549,12 @@ defmodule Creatio.Batch do
         parse_json_batch_response(resp)
 
       {:ok, %Req.Response{body: resp_body} = resp} when is_binary(resp_body) ->
-        content_type = resp |> get_resp_content_type() |> String.downcase()
+        raw_ct = get_resp_content_type(resp)
+        content_type = String.downcase(raw_ct)
 
         cond do
           String.contains?(content_type, "multipart/mixed") ->
-            parse_multipart_with_resp(resp, extract_boundary_from_header(content_type))
+            parse_multipart_with_resp(resp, extract_boundary_from_header(raw_ct))
 
           Util.blank_body?(resp_body) ->
             {:ok, []}
@@ -592,19 +594,40 @@ defmodule Creatio.Batch do
     end
   end
 
-  defp parse_json_batch_response(%Req.Response{body: %{"responses" => raw_responses}}) do
-    responses =
-      Enum.map(raw_responses, fn r ->
-        %Response{
-          id: r["id"],
-          status: parse_status_code(r["status"]),
-          headers: r["headers"] || %{},
-          body: r["body"],
-          atomicity_group: r["atomicityGroup"]
-        }
-      end)
+  defp parse_json_batch_response(%Req.Response{body: %{"responses" => raw_responses}} = resp)
+       when is_list(raw_responses) do
+    if Enum.all?(raw_responses, &is_map/1) do
+      responses =
+        Enum.map(raw_responses, fn r ->
+          %Response{
+            id: r["id"],
+            status: parse_status_code(r["status"]),
+            headers: r["headers"] || %{},
+            body: r["body"],
+            atomicity_group: r["atomicityGroup"]
+          }
+        end)
 
-    {:ok, responses}
+      {:ok, responses}
+    else
+      {:error,
+       Error.new(
+         status: resp.status,
+         message: "Malformed JSON batch response: expected list of response objects",
+         details: resp.body,
+         response: resp
+       )}
+    end
+  end
+
+  defp parse_json_batch_response(%Req.Response{body: %{"responses" => _}} = resp) do
+    {:error,
+     Error.new(
+       status: resp.status,
+       message: "Malformed JSON batch response: expected \"responses\" to be a list",
+       details: resp.body,
+       response: resp
+     )}
   end
 
   defp parse_json_batch_response(%Req.Response{body: body_str} = resp) when is_binary(body_str) do

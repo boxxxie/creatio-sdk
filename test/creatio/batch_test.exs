@@ -686,5 +686,46 @@ defmodule Creatio.BatchTest do
 
       assert {:ok, []} = Batch.execute(bom_empty_client, Batch.new() |> Batch.add_get("Contact"))
     end
+
+    test "preserves mixed-case multipart boundaries, classifies string 2xx statuses, and rejects malformed JSON responses" do
+      mixed_body =
+        "--batchresponse_AbCd123\r\n" <>
+          "Content-Type: application/http\r\n" <>
+          "Content-ID: 1\r\n\r\n" <>
+          "HTTP/1.1 200 OK\r\n" <>
+          "Content-Type: application/json\r\n\r\n" <>
+          ~s({"Id":"1"}) <>
+          "\r\n--batchresponse_AbCd123--\r\n"
+
+      mixed_plug = fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header(
+          "content-type",
+          "multipart/mixed; boundary=batchresponse_AbCd123"
+        )
+        |> Plug.Conn.send_resp(200, mixed_body)
+      end
+
+      client =
+        Creatio.Client.new(base_url: "https://mycreatio.com", req_options: [plug: mixed_plug])
+
+      assert {:ok, [%Response{id: "1", status: 200, body: %{"Id" => "1"}}]} =
+               Batch.execute(client, Batch.new() |> Batch.add_get("Contact"))
+
+      assert Response.success?(%Response{status: "200"}) == true
+      assert Response.error?(%Response{status: "200"}) == false
+      assert Response.success?(%Response{status: "204"}) == true
+      assert Response.error?(%Response{status: "404"}) == true
+
+      for malformed_body <- [%{"responses" => nil}, %{"responses" => ["not_a_map"]}] do
+        bad_plug = fn conn -> Req.Test.json(conn, malformed_body) end
+
+        bad_client =
+          Creatio.Client.new(base_url: "https://mycreatio.com", req_options: [plug: bad_plug])
+
+        assert {:error, %Error{status: 200}} =
+                 Batch.execute(bad_client, Batch.new() |> Batch.add_get("Contact"))
+      end
+    end
   end
 end

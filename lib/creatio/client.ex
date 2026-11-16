@@ -97,8 +97,8 @@ defmodule Creatio.Client do
          "")
       |> normalize_base_url()
 
-    cookie = Keyword.get(opts_list, :cookie)
-    bpmcsrf = Keyword.get(opts_list, :bpmcsrf)
+    cookie = opts_list |> Keyword.get(:cookie) |> normalize_optional_string()
+    bpmcsrf = opts_list |> Keyword.get(:bpmcsrf) |> normalize_optional_string()
     auth_token = resolve_auth_token(opts_list, cookie, bpmcsrf)
 
     identity_service_url =
@@ -176,9 +176,12 @@ defmodule Creatio.Client do
     base_url =
       Keyword.get(opts_list, :base_url) || req.options[:base_url] || ""
 
-    opt_auth_token = Keyword.get(opts_list, :auth_token) || Keyword.get(opts_list, :bearer_token)
-    opt_cookie = Keyword.get(opts_list, :cookie)
-    opt_bpmcsrf = Keyword.get(opts_list, :bpmcsrf)
+    opt_auth_token =
+      normalize_optional_string(Keyword.get(opts_list, :auth_token)) ||
+        normalize_optional_string(Keyword.get(opts_list, :bearer_token))
+
+    opt_cookie = opts_list |> Keyword.get(:cookie) |> normalize_optional_string()
+    opt_bpmcsrf = opts_list |> Keyword.get(:bpmcsrf) |> normalize_optional_string()
 
     has_auth_token_opt? =
       Keyword.has_key?(opts_list, :auth_token) or Keyword.has_key?(opts_list, :bearer_token)
@@ -491,9 +494,9 @@ defmodule Creatio.Client do
           req
         else
           allowed_suffixes = [
-            "/DataService/json/SyncReply/SelectQuery",
-            "/ServiceModel/AuthService.svc/Login",
-            "/AuthService.svc/Login",
+            "/dataservice/json/syncreply/selectquery",
+            "/servicemodel/authservice.svc/login",
+            "/authservice.svc/login",
             "/connect/token"
           ]
 
@@ -505,7 +508,7 @@ defmodule Creatio.Client do
 
           allowed? =
             req.method == :post and not rest_path? and
-              (Enum.any?(allowed_suffixes, &String.ends_with?(path, &1)) or
+              (Enum.any?(allowed_suffixes, &String.ends_with?(path_down, &1)) or
                  (String.ends_with?(path_down, "/odata/$batch") and
                     read_only_batch_request?(req)))
 
@@ -537,13 +540,13 @@ defmodule Creatio.Client do
         if is_binary(raw_body) or is_list(raw_body) do
           bin = IO.iodata_to_binary(raw_body)
 
-          ct =
-            req |> Req.Request.get_header("content-type") |> List.first("") |> String.downcase()
+          raw_ct = req |> Req.Request.get_header("content-type") |> List.first("")
+          ct = String.downcase(raw_ct)
 
           cond do
             String.contains?(ct, "multipart/mixed") or
                 String.starts_with?(String.trim_leading(bin), "--") ->
-              read_only_multipart_batch?(bin, ct)
+              read_only_multipart_batch?(bin, raw_ct)
 
             String.contains?(ct, "application/json") or
                 String.starts_with?(
@@ -608,11 +611,12 @@ defmodule Creatio.Client do
       {pos, len} ->
         mime_head = binary_part(part, 0, pos)
         mime_body = binary_part(part, pos + len, byte_size(part) - (pos + len))
-        ct = extract_mime_content_type(mime_head)
+        raw_ct = extract_mime_content_type(mime_head)
+        ct = String.downcase(raw_ct)
 
         cond do
           String.contains?(ct, "multipart/mixed") ->
-            read_only_multipart_batch?(mime_body, ct)
+            read_only_multipart_batch?(mime_body, raw_ct)
 
           String.contains?(ct, "application/http") ->
             first_line =
@@ -648,7 +652,7 @@ defmodule Creatio.Client do
       case :binary.split(line, ":") do
         [k, v] ->
           if String.downcase(String.trim(k)) == "content-type",
-            do: String.downcase(String.trim(v))
+            do: String.trim(v)
 
         _ ->
           nil

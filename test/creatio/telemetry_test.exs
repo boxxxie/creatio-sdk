@@ -1035,5 +1035,40 @@ defmodule Creatio.TelemetryTest do
       events = drain_events()
       refute Enum.any?(events, fn {ev, _, _} -> ev == [:creatio, :request, :start] end)
     end
+
+    test "redacts secrets crossing 4096-byte truncation, handles non-String.Chars map keys, and survives malformed URI percent-encoding" do
+      prefix = String.duplicate("x", 4_080)
+      crossing_body = ~s(#{prefix}"access_token":"secret_token_crossing_boundary_12345")
+
+      sanitized_crossing = Telemetry.sanitize_metadata(%{body: crossing_body})
+      refute sanitized_crossing.body =~ "secret_token_crossing_boundary"
+      assert sanitized_crossing.body =~ ~s("access_token":"[REDACTED]")
+      assert sanitized_crossing.body =~ "[TRUNCATED"
+
+      weird_meta = %{
+        {:tuple, :key} => "ok",
+        non_str_map: %{{:nested, :tuple} => "val", "client_secret" => "sec-1"},
+        resp: %Req.Response{
+          status: 500,
+          headers: %{{:weird_hdr} => ["v"], "authorization" => ["Bearer tok"]},
+          body: %{{:body_key} => "val", "password" => "pw-1"}
+        },
+        bad_uri: URI.parse("https://crm.test/?100%=1&access_token=tok123#bad%zz=2&bpmcsrf=csrf9")
+      }
+
+      sanitized = Telemetry.sanitize_metadata(weird_meta)
+      assert sanitized[{:tuple, :key}] == "ok"
+      assert sanitized.non_str_map[{:nested, :tuple}] == "val"
+      assert sanitized.non_str_map["client_secret"] == "[REDACTED]"
+      assert sanitized.resp.headers["authorization"] == ["[REDACTED]"]
+      assert sanitized.resp.body[{:body_key}] == "val"
+      assert sanitized.resp.body["password"] == "[REDACTED]"
+      refute sanitized.bad_uri.query =~ "tok123"
+      assert sanitized.bad_uri.query =~ "100%=1"
+      assert sanitized.bad_uri.query =~ "access_token=[REDACTED]"
+      refute sanitized.bad_uri.fragment =~ "csrf9"
+      assert sanitized.bad_uri.fragment =~ "bad%zz=2"
+      assert sanitized.bad_uri.fragment =~ "bpmcsrf=[REDACTED]"
+    end
   end
 end
