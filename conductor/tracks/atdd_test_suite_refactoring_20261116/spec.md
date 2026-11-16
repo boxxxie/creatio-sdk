@@ -34,12 +34,12 @@ The `creatio` test suite currently contains `408` active ExUnit tests (`418` inc
 - [x] `test/features/sdk_facade_and_resilience_test.exs` no longer uses `@given crm_facade_server()` or generates `169` loop scenarios, while 100% of facade delegations and error/timeout contracts remain verified.
 - [x] All user-facing `v0.4.0`/`v1.0.0` behaviors from `test/creatio/regressions_test.exs` are expressed as explicit 4-layer ATDD scenarios in `test/features/`, low-level parser/guard checks live in their owning `test/creatio/*_test.exs` files, and `test/creatio/regressions_test.exs` is retired.
 - [x] Unused switchboard code in `test/support/drivers/facade_driver.ex`, `test/support/drivers/crm_client_driver.ex`, and `test/support/dsl/safety_dsl.ex` is removed.
-- [x] Active `mix test` count is reduced to `~160–220` tests (`179` active tests, `10` live excluded) with `>84%` coverage (`89.11%`) and zero warnings/errors across all CI quality gates (except pre-existing `lib/` Dialyzer warnings noted below).
+- [x] Active `mix test` count is reduced to `~160–220` tests (`179` active tests, `10` live excluded) with `>84%` coverage (`89.11%`) and zero warnings/errors across all CI quality gates (including `mix dialyzer`).
 
 ## Out of Scope
 - Modifying production SDK behavior or public API contracts under `lib/`.
 - Changing the opt-in `@moduletag :live` integration suite in `test/live/creatio_live_test.exs`.
 
-## Deviation Note (2026-11-16)
-- `mix format --check-formatted`, `mix compile --warnings-as-errors` (`dev` & `MIX_ENV=test`), `mix credo --strict`, `mix test --cover` (`179 tests, 0 failures`, `89.11%` total coverage), and `mix docs` all pass with zero warnings/errors.
-- `mix dialyzer` exits with code `2` due to `20` pre-existing `@spec` / unreachable-clause warnings solely inside untouched `lib/creatio/{batch,odata,telemetry,util}.ex` files (`Batch.add_*` passing atom function names to `Util.require_entity_name!/2`, `OData.put_opt/3` map guard, `Telemetry.extract_path/1`, and `Util.next_link_query_params/2`). Those files were intentionally left unmodified in accordance with the Out of Scope boundary above.
+## Resolution Note (2026-11-16)
+- `mix format --check-formatted`, `mix compile --warnings-as-errors` (`dev` & `MIX_ENV=test`), `mix credo --strict`, `mix dialyzer`, `mix test --cover` (`179 tests, 0 failures`), and `mix docs` all pass with zero warnings/errors.
+- The 20 pre-existing `@spec` / unreachable-clause Dialyzer warnings in `lib/creatio/{odata,odata3,telemetry,util}.ex` were resolved as part of `v1.0.0` release preparation without altering public API behavior.

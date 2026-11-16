@@ -19,5 +19,5 @@ This file tracks all major tracks for getting `creatio` (`creatio-sdk`) from `v0
 
 ---
 
-- [~] **Track: ATDD Test Suite Refactoring, Matrix Consolidation & Regression Deduplication**
+- [x] **Track: ATDD Test Suite Refactoring, Matrix Consolidation & Regression Deduplication**
   *Link: [./tracks/atdd_test_suite_refactoring_20261116/](./tracks/atdd_test_suite_refactoring_20261116/)*

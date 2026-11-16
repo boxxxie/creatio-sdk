@@ -34,6 +34,6 @@
     - [x] Remove `test/support/drivers/facade_driver.ex` (or reduce to any still-used helpers) and prune unused dispatch clauses from `test/support/drivers/crm_client_driver.ex` and `test/support/dsl/safety_dsl.ex`.
     - [x] Verify all remaining Layer 2 `@then` macros preserve `__CALLER__.line` failure attribution and Layer 1 scenarios contain zero opaque zero-argument setup steps.
 - [x] Task: Run full CI quality gates and verify test count and coverage targets
-    - [x] Run `mix format --check-formatted && mix compile --warnings-as-errors && mix credo --strict && mix dialyzer && mix test --cover && mix docs` *(all gates passed except `mix dialyzer` which reports 20 pre-existing `@spec`/unreachable-clause warnings solely inside untouched `lib/` files; see `spec.md` Deviation Note)*.
+    - [x] Run `mix format --check-formatted && mix compile --warnings-as-errors && mix credo --strict && mix dialyzer && mix test --cover && mix docs` *(all gates pass with 0 warnings/errors, including `mix dialyzer` after resolving the 20 `@spec`/unreachable-clause warnings in `lib/creatio/{odata,odata3,telemetry,util}.ex`)*.
     - [x] Confirm active test count is in the `~160–220` range (`179` active tests), total coverage exceeds `84%` (`89.11%`), and 0 warnings/errors are emitted by compiler, Credo, ExUnit, or ExDoc.
 - [x] Task: Conductor - User Manual Verification 'Phase 4: Prune Layer 2/3 Driver Bloat & Final Quality Gate Audit' (Protocol in workflow.md)
