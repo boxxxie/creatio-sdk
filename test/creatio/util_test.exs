@@ -1,7 +1,7 @@
 defmodule Creatio.UtilTest do
   use ExUnit.Case, async: true
 
-  alias Creatio.{Client, DataService, OData, OData3, Util}
+  alias Creatio.{Auth, Client, DataService, Error, OData, OData3, Util}
   alias Creatio.OData.Query
 
   describe "prepare_field_value_request/4 transport safety" do
@@ -580,6 +580,269 @@ defmodule Creatio.UtilTest do
       assert_raise ArgumentError, fn ->
         DataService.custom_service(client, "Svc/..", "Op", %{})
       end
+    end
+  end
+
+  describe "security, streaming, pagination, and protocol regression fixes" do
+    test "rejects external :url overrides and IIS path bypasses across DataService and Auth" do
+      client = Client.new(base_url: "https://crm.test", auth_token: "secret-tok")
+      ro_client = Client.new(base_url: "https://crm.test", read_only: true)
+
+      for bad_url <- [
+            "https://attacker.example/0/DataService/json/SyncReply/SelectQuery",
+            "//attacker.example/0/DataService/json/SyncReply/SelectQuery",
+            "/0/DataService/json/SyncReply/DeleteQuery/..%5cSelectQuery",
+            "/0/DataService/json/SyncReply/DeleteQuery/.%2e/SelectQuery",
+            "/0/DataService/json/SyncReply/DeleteQuery/%252e%252e/SelectQuery"
+          ] do
+        assert_raise ArgumentError, fn ->
+          DataService.execute_query(ro_client, "SelectQuery", %{}, url: bad_url)
+        end
+      end
+
+      assert {:error, %Error{message: msg}} =
+               Auth.oauth_health_check(client, url: "https://attacker.example/steal")
+
+      assert msg =~ "origin"
+
+      assert {:error, %Error{message: login_msg}} =
+               Auth.login_forms(client, "u", "p", url: "https://attacker.example/steal")
+
+      assert login_msg =~ "origin"
+    end
+
+    test "Auth handles empty Set-Cookie on Code: 0 and map/stripped :req_options in openid_configuration" do
+      no_cookie_client =
+        Client.new(
+          base_url: "https://crm.test",
+          req_options: [
+            plug: fn conn -> Req.Test.json(conn, %{"Code" => 0}) end
+          ]
+        )
+
+      assert {:error, %Error{code: "FormsMissingCookies"}} =
+               Auth.login_forms(no_cookie_client, "u", "p")
+
+      parent = self()
+
+      oidc_plug = fn conn ->
+        send(parent, {:oidc_path, conn.request_path})
+        Req.Test.json(conn, %{"issuer" => "https://id.crm.test"})
+      end
+
+      assert {:ok, %{"issuer" => "https://id.crm.test"}} =
+               Auth.openid_configuration("https://id.crm.test/.well-known/openid-configuration",
+                 req_options: %{plug: oidc_plug, url: "https://attacker.example/evil"}
+               )
+
+      assert_receive {:oidc_path, "/.well-known/openid-configuration"}
+    end
+
+    test "DataService.custom_service/5 supports 4-arity Req opts and preserves req_options[:params]" do
+      parent = self()
+
+      plug = fn conn ->
+        send(parent, {:custom_req, conn.method, conn.query_string, Plug.Conn.read_body(conn)})
+        Req.Test.json(conn, %{"ok" => true})
+      end
+
+      client = Client.new(base_url: "https://crm.test", req_options: [plug: plug])
+
+      assert {:ok, %{"ok" => true}} =
+               DataService.custom_service(client, "Svc", "Ping", receive_timeout: 15_000)
+
+      assert_receive {:custom_req, "POST", "", {:ok, "{}", _}}
+
+      assert {:ok, %{"ok" => true}} =
+               DataService.custom_service(client, "Svc", "Echo", %{"a" => 1},
+                 params: %{"x" => "1"},
+                 req_options: [params: %{"y" => "2", "x" => "old"}]
+               )
+
+      assert_receive {:custom_req, "POST", qs, {:ok, ~s({"a":1}), _}}
+      assert URI.decode_query(qs) == %{"x" => "1", "y" => "2"}
+    end
+
+    test "fetch_field_value/4 does not corrupt File.stream! on retry and blocks HTML-typed JSON errors >= 1024 bytes" do
+      tmp_dir = System.tmp_dir!()
+      retry_path = Path.join(tmp_dir, "creatio_retry_#{System.unique_integer([:positive])}.bin")
+      err_path = Path.join(tmp_dir, "creatio_json_err_#{System.unique_integer([:positive])}.bin")
+      on_exit(fn -> Enum.each([retry_path, err_path], &File.rm/1) end)
+
+      attempts = :counters.new(1, [:atomics])
+      chunk_1500 = String.duplicate("A", 1500)
+
+      retry_adapter = fn req ->
+        n = :counters.get(attempts, 1) + 1
+        :counters.put(attempts, 1, n)
+
+        if n == 1 do
+          resp = %Req.Response{status: 200, headers: %{}, body: ""}
+
+          case req.into.(
+                 {:data, chunk_1500},
+                 {req, resp}
+               ) do
+            {:cont, _} -> {req, %Req.TransportError{reason: :closed}}
+            {:halt, _} -> {req, %Req.TransportError{reason: :closed}}
+          end
+        else
+          resp = %Req.Response{status: 200, headers: %{}, body: ""}
+          {:cont, {req2, resp2}} = req.into.({:data, "FINAL_BODY"}, {req, resp})
+          {req2, resp2}
+        end
+      end
+
+      assert {:ok, %File.Stream{}} =
+               Util.fetch_field_value(
+                 Req.new(base_url: "https://crm.test"),
+                 "/0/odata/Contact(1)/Photo/$value",
+                 into: File.stream!(retry_path),
+                 req_options: [adapter: retry_adapter, retry: :transient, retry_delay: 0]
+               )
+
+      assert File.read!(retry_path) == "FINAL_BODY"
+
+      large_json_err = Jason.encode!(%{"error" => %{"message" => String.duplicate("E", 1200)}})
+
+      html_json_plug = fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/html")
+        |> Plug.Conn.send_resp(200, large_json_err)
+      end
+
+      assert {:error, %Error{status: 200}} =
+               Util.fetch_field_value(
+                 Req.new(base_url: "https://crm.test"),
+                 "/0/odata/Contact(1)/Photo/$value",
+                 into: File.stream!(err_path),
+                 req_options: [plug: html_json_plug]
+               )
+
+      refute File.exists?(err_path)
+    end
+
+    test "keyset pagination rejects non-map records cleanly, supports desc orderby, and rejects mismatched orderby" do
+      client = Client.new(base_url: "https://crm.test")
+
+      non_map_fun = fn _c, _t, _opts -> {:ok, ["not_a_map"]} end
+
+      assert [{:ok, "not_a_map"}, {:error, %Error{message: msg}}] =
+               Util.paginate_stream(client, "Contact", [cursor_field: "Id"], :odata4, non_map_fun)
+               |> Enum.to_list()
+
+      assert msg =~ "missing or nil"
+
+      parent = self()
+
+      desc_fun = fn _c, _t, opts ->
+        send(parent, {:desc_page, Keyword.get(opts, :orderby), Keyword.get(opts, :filter)})
+
+        if Keyword.get(opts, :filter) do
+          {:ok, []}
+        else
+          {:ok, [%{"CreatedOn" => "2026-02-01T00:00:00Z", "Id" => "id-9"}]}
+        end
+      end
+
+      assert [%{"Id" => "id-9"}] =
+               Util.paginate_stream!(
+                 client,
+                 "Contact",
+                 [cursor_field: "CreatedOn", orderby: "CreatedOn desc", page_size: 1],
+                 :odata4,
+                 desc_fun
+               )
+               |> Enum.to_list()
+
+      assert_receive {:desc_page, "CreatedOn desc, Id desc", nil}
+
+      assert_receive {:desc_page, "CreatedOn desc, Id desc",
+                      "(CreatedOn lt 2026-02-01T00:00:00Z or (CreatedOn eq 2026-02-01T00:00:00Z and Id lt 'id-9'))"}
+
+      assert_raise ArgumentError, ~r/cursor_field/, fn ->
+        Util.paginate_stream!(
+          client,
+          "Contact",
+          [cursor_field: "Id", orderby: "Name asc"],
+          :odata4,
+          desc_fun
+        )
+        |> Enum.to_list()
+      end
+    end
+
+    test "OData.update_field/6 handles map opts, raw JSON/text uploads, query params, and RFC 9110 Accept" do
+      parent = self()
+
+      plug = fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+
+        send(
+          parent,
+          {:put_field, conn.query_string, Plug.Conn.get_req_header(conn, "accept"),
+           Plug.Conn.get_req_header(conn, "content-type"), raw}
+        )
+
+        Plug.Conn.send_resp(conn, 204, "")
+      end
+
+      client = Client.new(base_url: "https://crm.test", req_options: [plug: plug])
+
+      assert :ok ==
+               OData.update_field(
+                 client,
+                 "SysFile",
+                 "1",
+                 "Data",
+                 ~s({"raw":true}),
+                 %{content_type: "application/json", params: %{"v" => "1"}}
+               )
+
+      assert_receive {:put_field, "v=1", ["application/json, text/plain, */*"],
+                      ["application/json"], ~s({"raw":true})}
+    end
+
+    test "OData and OData3 forward :req_options, avoid map return leakage, handle count list fallback, and catch OData3 get_field d.error" do
+      parent = self()
+
+      plug = fn conn ->
+        send(parent, {:hit, conn.request_path, conn.query_string})
+
+        case conn.request_path do
+          "/0/odata/Contact" when conn.method == "POST" ->
+            Plug.Conn.send_resp(conn, 204, "")
+
+          "/0/odata/Contact" ->
+            Req.Test.json(conn, [%{"Id" => "1"}])
+
+          "/0/ServiceModel/EntityDataService.svc/ContactCollection" ->
+            Req.Test.json(conn, %{"d" => [%{"Id" => "1"}]})
+
+          "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'1')/Name" ->
+            Req.Test.json(conn, %{"d" => %{"error" => %{"message" => "field fail"}}})
+        end
+      end
+
+      client = Client.new(base_url: "https://crm.test")
+
+      assert {:ok, %{records: [%{"Id" => "1"}], count: nil}} =
+               OData.list(client, "Contact", count: true, req_options: [plug: plug])
+
+      assert {:ok, %{}} =
+               OData.create(client, "Contact", %{"Name" => "A"}, %{
+                 "return" => :minimal,
+                 req_options: [plug: plug]
+               })
+
+      assert_receive {:hit, "/0/odata/Contact", qs}
+      refute qs =~ "return=minimal"
+
+      assert {:ok, %{records: [%{"Id" => "1"}], count: nil}} =
+               OData3.list(client, "Contact", count: true, req_options: [plug: plug])
+
+      assert {:error, %Error{status: 200}} =
+               OData3.get_field(client, "Contact", "1", "Name", req_options: [plug: plug])
     end
   end
 end

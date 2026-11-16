@@ -31,7 +31,7 @@ defmodule Creatio.OData do
   @spec list(
           Client.t() | Req.Request.t() | Query.t() | String.t(),
           String.t() | Query.t() | Client.t() | Req.Request.t(),
-          keyword() | map()
+          Creatio.opts()
         ) ::
           {:ok, list() | map()} | {:error, Error.t()}
   def list(client_or_req, entity_or_query, opts \\ [])
@@ -41,14 +41,14 @@ defmodule Creatio.OData do
     entity = require_entity_name!(entity, "list/3")
     client = Client.ensure_client(client_or_req)
     params = normalize_params(opts)
-    do_list(client, entity, params)
+    do_list(client, entity, params, opts)
   end
 
   def list(client_or_req, query, opts) when is_client_or_req(client_or_req) do
     entity = Query.require_entity!(query, "list/3")
     client = Client.ensure_client(client_or_req)
     params = Util.normalize_odata_params(opts, Query.to_params(query))
-    do_list(client, entity, params)
+    do_list(client, entity, params, opts)
   end
 
   def list(entity_or_query, client_or_req, opts) when is_client_or_req(client_or_req) do
@@ -59,7 +59,7 @@ defmodule Creatio.OData do
   @spec list_page(
           Client.t() | Req.Request.t() | Query.t() | String.t(),
           String.t() | Query.t() | Client.t() | Req.Request.t(),
-          keyword() | map()
+          Creatio.opts()
         ) ::
           {:ok, list() | map()} | {:error, Error.t()}
   def list_page(client_or_req, entity_or_query, opts \\ [])
@@ -69,53 +69,53 @@ defmodule Creatio.OData do
     entity = require_entity_name!(entity, "stream/3")
     client = Client.ensure_client(client_or_req)
     params = normalize_params(opts)
-    do_list(client, entity, params, true)
+    do_list(client, entity, params, opts, true)
   end
 
   def list_page(client_or_req, query, opts) when is_client_or_req(client_or_req) do
     entity = Query.require_entity!(query, "stream/3")
     client = Client.ensure_client(client_or_req)
     params = Util.normalize_odata_params(opts, Query.to_params(query))
-    do_list(client, entity, params, true)
+    do_list(client, entity, params, opts, true)
   end
 
   def list_page(entity_or_query, client_or_req, opts) when is_client_or_req(client_or_req) do
     list_page(client_or_req, entity_or_query, opts)
   end
 
-  defp do_list(%Client{} = client, entity, params, include_meta? \\ false) do
+  defp do_list(%Client{} = client, entity, params, opts, include_meta? \\ false) do
     Telemetry.span(
       :odata,
       %{protocol: :odata4, action: :list, entity: entity, base_url: client.base_url},
       fn ->
         url = "/0/odata/#{entity}"
+        {req, req_opts} = Util.prepare_req_call(client.req, opts, [url: url], params)
 
-        case Req.get(client.req, url: url, params: params) do
+        case Req.get(req, req_opts) do
           {:ok, %Req.Response{} = raw_resp} ->
-            resp = Util.normalize_json_response(raw_resp)
-
-            if resp.status == 200 and not Util.html_or_xml_response?(resp) do
-              case resp.body do
-                %{"value" => records} = body when is_list(records) ->
-                  if include_meta? or params["$count"] == "true" do
-                    {:ok,
-                     %{
-                       records: records,
-                       count: parse_odata_count(body["@odata.count"]),
-                       raw: body
-                     }}
-                  else
-                    {:ok, records}
-                  end
-
-                records when is_list(records) ->
+            case Util.decode_api_response(raw_resp) do
+              {:ok, %Req.Response{status: 200, body: %{"value" => records} = body}}
+              when is_list(records) ->
+                if include_meta? or params["$count"] == "true" do
+                  {:ok,
+                   %{
+                     records: records,
+                     count: parse_odata_count(body["@odata.count"]),
+                     raw: body
+                   }}
+                else
                   {:ok, records}
+                end
 
-                _ ->
-                  {:error, Error.from_response(resp)}
-              end
-            else
-              {:error, Error.from_response(resp)}
+              {:ok, %Req.Response{status: 200, body: records}} when is_list(records) ->
+                if include_meta? or params["$count"] == "true" do
+                  {:ok, %{records: records, count: nil, raw: records}}
+                else
+                  {:ok, records}
+                end
+
+              {_, resp} ->
+                {:error, Error.from_response(resp)}
             end
 
           {:error, exception} ->
@@ -206,7 +206,7 @@ defmodule Creatio.OData do
     * `:select` - Fields to select.
     * `:expand` - Relations to expand.
   """
-  @spec get(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) ::
+  @spec get(Client.t() | Req.Request.t(), String.t(), Creatio.record_id(), Creatio.opts()) ::
           {:ok, map()} | {:error, Error.t()}
   def get(client_or_req, entity, id, opts \\ []) do
     entity = require_entity_name!(entity, "get/4")
@@ -219,19 +219,19 @@ defmodule Creatio.OData do
       fn ->
         url = "/0/odata/#{entity}(#{clean})"
         params = normalize_params(opts)
+        {req, req_opts} = Util.prepare_req_call(client.req, opts, [url: url], params)
 
-        case Req.get(client.req, url: url, params: params) do
+        case Req.get(req, req_opts) do
           {:ok, %Req.Response{} = raw_resp} ->
-            resp = Util.normalize_json_response(raw_resp)
+            case Util.decode_api_response(raw_resp) do
+              {:ok, %Req.Response{status: 200, body: %{"error" => _}} = resp} ->
+                {:error, Error.from_response(resp)}
 
-            if resp.status == 200 and not Util.html_or_xml_response?(resp) do
-              case resp.body do
-                %{"error" => _} -> {:error, Error.from_response(resp)}
-                %{} = record -> {:ok, record}
-                _ -> {:error, Error.from_response(resp)}
-              end
-            else
-              {:error, Error.from_response(resp)}
+              {:ok, %Req.Response{status: 200, body: %{} = record}} ->
+                {:ok, record}
+
+              {_, resp} ->
+                {:error, Error.from_response(resp)}
             end
 
           {:error, exception} ->
@@ -244,7 +244,8 @@ defmodule Creatio.OData do
   @doc """
   Same as `get/4`, but raises `Creatio.Error` on failure.
   """
-  @spec get!(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) :: map()
+  @spec get!(Client.t() | Req.Request.t(), String.t(), Creatio.record_id(), Creatio.opts()) ::
+          map()
   def get!(client, entity, id, opts \\ []) do
     case get(client, entity, id, opts) do
       {:ok, record} -> record
@@ -258,9 +259,9 @@ defmodule Creatio.OData do
   @spec get_navigation(
           Client.t() | Req.Request.t(),
           String.t(),
+          Creatio.record_id(),
           String.t(),
-          String.t(),
-          keyword()
+          Creatio.opts()
         ) ::
           {:ok, any()} | {:error, Error.t()}
   def get_navigation(client_or_req, entity, id, nav_property, opts \\ []) do
@@ -281,24 +282,29 @@ defmodule Creatio.OData do
       fn ->
         url = "/0/odata/#{entity}(#{clean})/#{nav_property}"
         params = normalize_params(opts)
+        {req, req_opts} = Util.prepare_req_call(client.req, opts, [url: url], params)
 
-        case Req.get(client.req, url: url, params: params) do
+        case Req.get(req, req_opts) do
           {:ok, %Req.Response{status: 204}} ->
             {:ok, nil}
 
           {:ok, %Req.Response{} = raw_resp} ->
-            resp = Util.normalize_json_response(raw_resp)
+            case Util.decode_api_response(raw_resp) do
+              {:ok, %Req.Response{status: 200, body: %{"error" => _}} = resp} ->
+                {:error, Error.from_response(resp)}
 
-            if resp.status == 200 and not Util.html_or_xml_response?(resp) do
-              case resp.body do
-                %{"error" => _} -> {:error, Error.from_response(resp)}
-                %{"value" => records} when is_list(records) -> {:ok, records}
-                %{} = map -> {:ok, map}
-                list when is_list(list) -> {:ok, list}
-                _ -> {:error, Error.from_response(resp)}
-              end
-            else
-              {:error, Error.from_response(resp)}
+              {:ok, %Req.Response{status: 200, body: %{"value" => records}}}
+              when is_list(records) ->
+                {:ok, records}
+
+              {:ok, %Req.Response{status: 200, body: %{} = map}} ->
+                {:ok, map}
+
+              {:ok, %Req.Response{status: 200, body: list}} when is_list(list) ->
+                {:ok, list}
+
+              {_, resp} ->
+                {:error, Error.from_response(resp)}
             end
 
           {:error, exception} ->
@@ -314,9 +320,9 @@ defmodule Creatio.OData do
   @spec get_navigation!(
           Client.t() | Req.Request.t(),
           String.t(),
+          Creatio.record_id(),
           String.t(),
-          String.t(),
-          keyword()
+          Creatio.opts()
         ) :: any()
   def get_navigation!(client, entity, id, nav_property, opts \\ []) do
     case get_navigation(client, entity, id, nav_property, opts) do
@@ -328,7 +334,13 @@ defmodule Creatio.OData do
   @doc """
   Retrieves a specific field value by ID (`GET /0/odata/{Entity}({id})/{Field}`).
   """
-  @spec get_field(Client.t() | Req.Request.t(), String.t(), String.t(), String.t(), keyword()) ::
+  @spec get_field(
+          Client.t() | Req.Request.t(),
+          String.t(),
+          Creatio.record_id(),
+          String.t(),
+          Creatio.opts()
+        ) ::
           {:ok, any()} | {:error, Error.t()}
   def get_field(client_or_req, entity, id, field_name, opts \\ []) do
     entity = require_entity_name!(entity, "get_field/5")
@@ -348,23 +360,29 @@ defmodule Creatio.OData do
       fn ->
         url = "/0/odata/#{entity}(#{clean})/#{field_name}"
 
-        case Req.get(client.req, url: url, params: normalize_params(opts)) do
+        {req, req_opts} =
+          Util.prepare_req_call(client.req, opts, [url: url], normalize_params(opts))
+
+        case Req.get(req, req_opts) do
           {:ok, %Req.Response{status: 204}} ->
             {:ok, nil}
 
           {:ok, %Req.Response{} = raw_resp} ->
-            resp = Util.normalize_json_response(raw_resp)
+            case Util.decode_api_response(raw_resp) do
+              {:ok, %Req.Response{status: 200, body: %{"error" => _}} = resp} ->
+                {:error, Error.from_response(resp)}
 
-            if resp.status == 200 and not Util.html_or_xml_response?(resp) do
-              case resp.body do
-                %{"error" => _} -> {:error, Error.from_response(resp)}
-                %{"value" => val} -> {:ok, val}
-                %{} = map -> {:ok, map}
-                list when is_list(list) -> {:ok, list}
-                _other -> {:error, Error.from_response(resp)}
-              end
-            else
-              {:error, Error.from_response(resp)}
+              {:ok, %Req.Response{status: 200, body: %{"value" => val}}} ->
+                {:ok, val}
+
+              {:ok, %Req.Response{status: 200, body: %{} = map}} ->
+                {:ok, map}
+
+              {:ok, %Req.Response{status: 200, body: list}} when is_list(list) ->
+                {:ok, list}
+
+              {_, resp} ->
+                {:error, Error.from_response(resp)}
             end
 
           {:error, exception} ->
@@ -377,7 +395,13 @@ defmodule Creatio.OData do
   @doc """
   Same as `get_field/5`, but raises `Creatio.Error` on failure.
   """
-  @spec get_field!(Client.t() | Req.Request.t(), String.t(), String.t(), String.t(), keyword()) ::
+  @spec get_field!(
+          Client.t() | Req.Request.t(),
+          String.t(),
+          Creatio.record_id(),
+          String.t(),
+          Creatio.opts()
+        ) ::
           any()
   def get_field!(client, entity, id, field_name, opts \\ []) do
     case get_field(client, entity, id, field_name, opts) do
@@ -401,9 +425,9 @@ defmodule Creatio.OData do
   @spec get_field_value(
           Client.t() | Req.Request.t(),
           String.t(),
+          Creatio.record_id(),
           String.t(),
-          String.t(),
-          keyword() | map()
+          Creatio.opts()
         ) ::
           {:ok, any()} | {:error, Error.t()}
   def get_field_value(client_or_req, entity, id, field_name, opts \\ []) do
@@ -434,9 +458,9 @@ defmodule Creatio.OData do
   @spec get_field_value!(
           Client.t() | Req.Request.t(),
           String.t(),
+          Creatio.record_id(),
           String.t(),
-          String.t(),
-          keyword() | map()
+          Creatio.opts()
         ) ::
           any()
   def get_field_value!(client, entity, id, field_name, opts \\ []) do
@@ -504,19 +528,21 @@ defmodule Creatio.OData do
             params =
               opts
               |> drop_opt(:strategy)
+              |> drop_opt(:req_options)
               |> put_opt(:count, true)
               |> put_opt(:top, 0)
               |> then(&Util.normalize_odata_params(&1, base_params, {"$count", "true"}))
 
             url = "/0/odata/#{entity}"
+            {req, req_opts} = Util.prepare_req_call(client.req, opts, [url: url], params)
 
-            case Req.get(client.req, url: url, params: params) do
+            case Req.get(req, req_opts) do
               {:ok, %Req.Response{} = raw_resp} ->
-                case Util.normalize_json_response(raw_resp) do
-                  %{status: 200, body: %{"@odata.count" => count}} = resp ->
+                case Util.decode_api_response(raw_resp) do
+                  {:ok, %Req.Response{status: 200, body: %{"@odata.count" => count}} = resp} ->
                     parse_integer_count(count, resp)
 
-                  %{status: 200, body: %{"value" => _} = body} = resp ->
+                  {:ok, %Req.Response{status: 200, body: %{"value" => _} = body} = resp} ->
                     case body["@odata.count"] do
                       nil ->
                         {:error,
@@ -530,7 +556,7 @@ defmodule Creatio.OData do
                         parse_integer_count(count, resp)
                     end
 
-                  %Req.Response{} = resp ->
+                  {_, resp} ->
                     {:error, Error.from_response(resp)}
                 end
 
@@ -544,34 +570,36 @@ defmodule Creatio.OData do
             params =
               opts
               |> drop_opt(:strategy)
+              |> drop_opt(:req_options)
               |> then(&Util.normalize_odata_params(&1, base_params, {"$count", "true"}))
 
-            case Req.get(client.req, url: url, params: params) do
+            {req, req_opts} = Util.prepare_req_call(client.req, opts, [url: url], params)
+
+            case Req.get(req, req_opts) do
               {:ok, %Req.Response{} = raw_resp} ->
-                case Util.normalize_json_response(raw_resp) do
-                  %{status: 200, body: body} when is_integer(body) and body >= 0 ->
-                    {:ok, body}
-
-                  %{status: 200, body: %{"@odata.count" => count}} = resp ->
-                    parse_integer_count(count, resp)
-
-                  %{status: 200, body: %{"value" => count}} = resp ->
-                    parse_integer_count(count, resp)
-
-                  %{status: 200, body: body} = resp when is_binary(body) ->
+                case Util.decode_api_response(raw_resp) do
+                  {:html_or_xml, %{status: 200, body: body} = resp} when is_binary(body) ->
                     case parse_integer_count(body, resp) do
-                      {:ok, _} = ok ->
-                        ok
-
-                      {:error, _} = err ->
-                        if Util.html_or_xml_response?(resp) do
-                          {:error, Error.from_response(resp)}
-                        else
-                          err
-                        end
+                      {:ok, _} = ok -> ok
+                      {:error, _} -> {:error, Error.from_response(resp)}
                     end
 
-                  %Req.Response{} = resp ->
+                  {:html_or_xml, resp} ->
+                    {:error, Error.from_response(resp)}
+
+                  {:ok, %{status: 200, body: body}} when is_integer(body) and body >= 0 ->
+                    {:ok, body}
+
+                  {:ok, %{status: 200, body: %{"@odata.count" => count}} = resp} ->
+                    parse_integer_count(count, resp)
+
+                  {:ok, %{status: 200, body: %{"value" => count}} = resp} ->
+                    parse_integer_count(count, resp)
+
+                  {:ok, %{status: 200, body: body} = resp} when is_binary(body) ->
+                    parse_integer_count(body, resp)
+
+                  {:ok, %Req.Response{} = resp} ->
                     {:error, Error.from_response(resp)}
                 end
 
@@ -614,7 +642,7 @@ defmodule Creatio.OData do
     * `:return` - `:minimal` or `:representation`. Pass `return: :minimal` to send
       `Prefer: return=minimal` and avoid echoing all columns back from Creatio.
   """
-  @spec create(Client.t() | Req.Request.t(), String.t(), map(), keyword()) ::
+  @spec create(Client.t() | Req.Request.t(), String.t(), map(), Creatio.opts()) ::
           {:ok, map()} | {:error, Error.t()}
   def create(client_or_req, entity, attrs, opts \\ []) do
     entity = require_entity_name!(entity, "create/4")
@@ -635,26 +663,36 @@ defmodule Creatio.OData do
           url = "/0/odata/#{entity}"
           {return_pref, query_opts} = pop_opt(opts, :return)
 
-          req =
+          base_req =
             client.req
             |> Req.Request.put_header("content-type", @default_content_type)
             |> maybe_put_return_prefer(return_pref)
 
-          case Req.post(req, url: url, json: attrs, params: normalize_params(query_opts)) do
+          {req, req_opts} =
+            Util.prepare_req_call(
+              base_req,
+              opts,
+              [url: url, json: attrs],
+              normalize_params(query_opts),
+              [:url, :method, :json, :body]
+            )
+
+          case Req.post(req, req_opts) do
             {:ok, %Req.Response{status: 204, headers: headers}} ->
               {:ok, extract_created_entity(headers)}
 
             {:ok, %Req.Response{} = raw_resp} ->
-              resp = Util.normalize_json_response(raw_resp)
+              case Util.decode_api_response(raw_resp) do
+                {:ok, %Req.Response{status: status, body: %{"error" => _}} = resp}
+                when status in [200, 201] ->
+                  {:error, Error.from_response(resp)}
 
-              if resp.status in [200, 201] and not Util.html_or_xml_response?(resp) do
-                case resp.body do
-                  %{"error" => _} -> {:error, Error.from_response(resp)}
-                  %{} = body -> {:ok, body}
-                  _ -> {:error, Error.from_response(resp)}
-                end
-              else
-                {:error, Error.from_response(resp)}
+                {:ok, %Req.Response{status: status, body: %{} = body}}
+                when status in [200, 201] ->
+                  {:ok, body}
+
+                {_, resp} ->
+                  {:error, Error.from_response(resp)}
               end
 
             {:error, exception} ->
@@ -668,7 +706,7 @@ defmodule Creatio.OData do
   @doc """
   Same as `create/4`, but raises `Creatio.Error` on failure.
   """
-  @spec create!(Client.t() | Req.Request.t(), String.t(), map(), keyword()) :: map()
+  @spec create!(Client.t() | Req.Request.t(), String.t(), map(), Creatio.opts()) :: map()
   def create!(client, entity, attrs, opts \\ []) do
     case create(client, entity, attrs, opts) do
       {:ok, body} -> body
@@ -683,8 +721,14 @@ defmodule Creatio.OData do
 
     * `:return` - `:minimal` or `:representation` (`Prefer: return=minimal` / `return=representation`).
   """
-  @spec update(Client.t() | Req.Request.t(), String.t(), String.t(), map(), keyword()) ::
-          :ok | {:ok, map() | binary()} | {:error, Error.t()}
+  @spec update(
+          Client.t() | Req.Request.t(),
+          String.t(),
+          Creatio.record_id(),
+          map(),
+          Creatio.opts()
+        ) ::
+          :ok | {:ok, map()} | {:error, Error.t()}
   def update(client_or_req, entity, id, attrs, opts \\ []) do
     entity = require_entity_name!(entity, "update/5")
     clean = clean_id(id)
@@ -705,22 +749,31 @@ defmodule Creatio.OData do
           url = "/0/odata/#{entity}(#{clean})"
           {return_pref, query_opts} = pop_opt(opts, :return)
 
-          req =
+          base_req =
             client.req
             |> Req.Request.put_header("content-type", @default_content_type)
             |> maybe_put_return_prefer(return_pref)
 
-          case Req.patch(req, url: url, json: attrs, params: normalize_params(query_opts)) do
+          {req, req_opts} =
+            Util.prepare_req_call(
+              base_req,
+              opts,
+              [url: url, json: attrs],
+              normalize_params(query_opts),
+              [:url, :method, :json, :body]
+            )
+
+          case Req.patch(req, req_opts) do
             {:ok, %Req.Response{status: 204}} ->
               :ok
 
             {:ok, %Req.Response{} = raw_resp} ->
-              resp = Util.normalize_json_response(raw_resp)
+              case Util.decode_api_response(raw_resp) do
+                {:ok, %Req.Response{status: 200} = resp} ->
+                  handle_ok_update_body(resp)
 
-              if resp.status == 200 and not Util.html_or_xml_response?(resp) do
-                handle_ok_update_body(resp)
-              else
-                {:error, Error.from_response(resp)}
+                {_, resp} ->
+                  {:error, Error.from_response(resp)}
               end
 
             {:error, exception} ->
@@ -734,8 +787,14 @@ defmodule Creatio.OData do
   @doc """
   Same as `update/5`, but raises `Creatio.Error` on failure.
   """
-  @spec update!(Client.t() | Req.Request.t(), String.t(), String.t(), map(), keyword()) ::
-          :ok | map() | binary()
+  @spec update!(
+          Client.t() | Req.Request.t(),
+          String.t(),
+          Creatio.record_id(),
+          map(),
+          Creatio.opts()
+        ) ::
+          :ok | map()
   def update!(client, entity, id, attrs, opts \\ []) do
     case update(client, entity, id, attrs, opts) do
       :ok -> :ok
@@ -747,7 +806,7 @@ defmodule Creatio.OData do
   @doc """
   Deletes an entity record (`DELETE /0/odata/{Entity}({id})`).
   """
-  @spec delete(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) ::
+  @spec delete(Client.t() | Req.Request.t(), String.t(), Creatio.record_id(), Creatio.opts()) ::
           :ok | {:error, Error.t()}
   def delete(client_or_req, entity, id, opts \\ []) do
     entity = require_entity_name!(entity, "delete/4")
@@ -768,7 +827,10 @@ defmodule Creatio.OData do
         else
           url = "/0/odata/#{entity}(#{clean})"
 
-          case Req.delete(client.req, url: url, params: normalize_params(opts)) do
+          {req, req_opts} =
+            Util.prepare_req_call(client.req, opts, [url: url], normalize_params(opts))
+
+          case Req.delete(req, req_opts) do
             {:ok, %{status: 204}} ->
               :ok
 
@@ -789,7 +851,8 @@ defmodule Creatio.OData do
   @doc """
   Same as `delete/4`, but raises `Creatio.Error` on failure.
   """
-  @spec delete!(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) :: :ok
+  @spec delete!(Client.t() | Req.Request.t(), String.t(), Creatio.record_id(), Creatio.opts()) ::
+          :ok
   def delete!(client, entity, id, opts \\ []) do
     case delete(client, entity, id, opts) do
       :ok -> :ok
@@ -803,10 +866,10 @@ defmodule Creatio.OData do
   @spec update_field(
           Client.t() | Req.Request.t(),
           String.t(),
-          String.t(),
+          Creatio.record_id(),
           String.t(),
           any(),
-          keyword()
+          Creatio.opts()
         ) ::
           :ok | {:error, Error.t()}
   def update_field(client_or_req, entity, id, field_name, value, opts \\ []) do
@@ -836,15 +899,28 @@ defmodule Creatio.OData do
           url = "/0/odata/#{entity}(#{clean})/#{field_name}"
 
           {body_payload, default_ct} = encode_field_payload(value, opts)
+          content_type = Util.get_opt(opts, :content_type) || default_ct
 
-          content_type = Util.get_opt(opts, :content_type, default_ct)
-
-          req =
+          base_req =
             client.req
-            |> Req.Request.put_header("accept", "application/json; text/plain; */*")
+            |> Req.Request.put_header("accept", "application/json, text/plain, */*")
             |> Req.Request.put_header("content-type", content_type)
 
-          case Req.put(req, url: url, body: body_payload) do
+          query_opts =
+            opts
+            |> drop_opt(:content_type)
+            |> drop_opt(:raw)
+
+          {req, req_opts} =
+            Util.prepare_req_call(
+              base_req,
+              opts,
+              [url: url, body: body_payload],
+              normalize_params(query_opts),
+              [:url, :method, :json, :body]
+            )
+
+          case Req.put(req, req_opts) do
             {:ok, %{status: 204}} ->
               :ok
 
@@ -879,17 +955,18 @@ defmodule Creatio.OData do
   end
 
   defp encode_field_payload(value, opts) when is_binary(value) do
-    explicit_ct = Keyword.get(opts, :content_type)
+    explicit_ct = Util.get_opt(opts, :content_type)
+    raw? = Util.get_opt(opts, :raw, false) == true
 
     cond do
-      is_binary(explicit_ct) and not String.contains?(String.downcase(explicit_ct), "json") ->
+      is_binary(explicit_ct) and String.trim(explicit_ct) != "" ->
         {value, explicit_ct}
 
-      String.valid?(value) ->
-        {Jason.encode_to_iodata!(%{"value" => value}), "application/json; IEEE754Compatible=true"}
+      raw? or not String.valid?(value) ->
+        {value, "application/octet-stream; IEEE754Compatible=true"}
 
       true ->
-        {value, "application/octet-stream; IEEE754Compatible=true"}
+        {Jason.encode_to_iodata!(%{"value" => value}), "application/json; IEEE754Compatible=true"}
     end
   end
 
@@ -903,10 +980,10 @@ defmodule Creatio.OData do
   @spec update_field!(
           Client.t() | Req.Request.t(),
           String.t(),
-          String.t(),
+          Creatio.record_id(),
           String.t(),
           any(),
-          keyword()
+          Creatio.opts()
         ) :: :ok
   def update_field!(client, entity, id, field_name, value, opts \\ []) do
     case update_field(client, entity, id, field_name, value, opts) do
@@ -918,7 +995,13 @@ defmodule Creatio.OData do
   @doc """
   Deletes a specific field of an entity (`DELETE /0/odata/{Entity}({id})/{Field}`).
   """
-  @spec delete_field(Client.t() | Req.Request.t(), String.t(), String.t(), String.t(), keyword()) ::
+  @spec delete_field(
+          Client.t() | Req.Request.t(),
+          String.t(),
+          Creatio.record_id(),
+          String.t(),
+          Creatio.opts()
+        ) ::
           :ok | {:error, Error.t()}
   def delete_field(client_or_req, entity, id, field_name, opts \\ []) do
     entity = require_entity_name!(entity, "delete_field/5")
@@ -946,15 +1029,18 @@ defmodule Creatio.OData do
         else
           url = "/0/odata/#{entity}(#{clean})/#{field_name}"
 
-          req =
+          base_req =
             client.req
-            |> Req.Request.put_header("accept", "application/json; text/plain; */*")
+            |> Req.Request.put_header("accept", "application/json, text/plain, */*")
             |> Req.Request.put_header(
               "content-type",
               "application/octet-stream; IEEE754Compatible=true"
             )
 
-          case Req.delete(req, url: url, params: normalize_params(opts)) do
+          {req, req_opts} =
+            Util.prepare_req_call(base_req, opts, [url: url], normalize_params(opts))
+
+          case Req.delete(req, req_opts) do
             {:ok, %{status: 204}} ->
               :ok
 
@@ -975,7 +1061,13 @@ defmodule Creatio.OData do
   @doc """
   Same as `delete_field/5`, but raises `Creatio.Error` on failure.
   """
-  @spec delete_field!(Client.t() | Req.Request.t(), String.t(), String.t(), String.t(), keyword()) ::
+  @spec delete_field!(
+          Client.t() | Req.Request.t(),
+          String.t(),
+          Creatio.record_id(),
+          String.t(),
+          Creatio.opts()
+        ) ::
           :ok
   def delete_field!(client, entity, id, field_name, opts \\ []) do
     case delete_field(client, entity, id, field_name, opts) do
@@ -989,7 +1081,7 @@ defmodule Creatio.OData do
   """
   @spec batch(Client.t() | Req.Request.t(), Batch.payload()) ::
           {:ok, list() | any()} | {:error, Error.t()}
-  @spec batch(Client.t() | Req.Request.t(), Batch.payload(), keyword()) ::
+  @spec batch(Client.t() | Req.Request.t(), Batch.payload(), Creatio.opts()) ::
           {:ok, list() | any()} | {:error, Error.t()}
   def batch(client_or_req, batch_or_requests, opts \\ []) do
     client = Client.ensure_client(client_or_req)
@@ -1001,7 +1093,7 @@ defmodule Creatio.OData do
   """
   @spec batch!(Client.t() | Req.Request.t(), Batch.payload()) ::
           list() | any()
-  @spec batch!(Client.t() | Req.Request.t(), Batch.payload(), keyword()) ::
+  @spec batch!(Client.t() | Req.Request.t(), Batch.payload(), Creatio.opts()) ::
           list() | any()
   def batch!(client, batch_or_requests, opts \\ []) do
     case batch(client, batch_or_requests, opts) do
@@ -1106,22 +1198,9 @@ defmodule Creatio.OData do
 
   defp require_entity_name!(entity, fun_name), do: Util.require_entity_name!(entity, fun_name)
 
-  defp pop_opt(opts, key) when is_list(opts), do: Keyword.pop(opts, key)
-  defp pop_opt(opts, key) when is_map(opts), do: Map.pop(opts, key)
-
-  defp drop_opt(opts, key) when is_list(opts),
-    do: Keyword.drop(opts, [key])
-
-  defp drop_opt(opts, key) when is_map(opts),
-    do: Map.drop(opts, [key, Atom.to_string(key)])
-
-  defp put_opt(opts, key, val) when is_list(opts), do: Keyword.put(opts, key, val)
-
-  defp put_opt(opts, key, val) when is_map(opts) do
-    opts
-    |> Map.delete(Atom.to_string(key))
-    |> Map.put(key, val)
-  end
+  defp pop_opt(opts, key), do: Util.pop_opt(opts, key)
+  defp drop_opt(opts, key), do: Util.drop_opt(opts, key)
+  defp put_opt(opts, key, val), do: Util.put_opt(opts, key, val)
 
   defp maybe_put_return_prefer(req, :minimal),
     do: Req.Request.put_header(req, "prefer", "return=minimal")

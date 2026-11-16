@@ -137,15 +137,14 @@ defmodule Creatio.DataService do
   Non-`SelectQuery` actions are blocked with `{:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}}`
   when `client.read_only` is `true`.
   """
-  @spec execute_query(Client.t() | Req.Request.t(), String.t(), map(), keyword()) ::
+  @spec execute_query(Client.t() | Req.Request.t(), String.t(), map(), Creatio.opts()) ::
           {:ok, map()} | {:error, Error.t()}
   def execute_query(client_or_req, action, query_payload, opts \\ []) do
     action = validate_path_segment!(action, "action", "execute_query/4")
-
-    url =
-      validate_query_url!(Keyword.get(opts, :url, "/0/DataService/json/SyncReply/#{action}"))
-
     client = Client.ensure_client(client_or_req)
+
+    raw_url = Util.get_opt(opts, :url, "/0/DataService/json/SyncReply/#{action}")
+    url = Util.validate_crm_url!(raw_url, client.base_url, "DataService query URL")
 
     Telemetry.span(
       :data_service,
@@ -158,7 +157,7 @@ defmodule Creatio.DataService do
         if client.read_only and not allowed_read_only_query?(action, url) do
           {:error, read_only_error()}
         else
-          do_execute_query(client, url, query_payload)
+          do_execute_query(client, url, query_payload, opts)
         end
       end
     )
@@ -167,7 +166,7 @@ defmodule Creatio.DataService do
   @doc """
   Same as `execute_query/4`, but raises `Creatio.Error` on failure.
   """
-  @spec execute_query!(Client.t() | Req.Request.t(), String.t(), map(), keyword()) :: map()
+  @spec execute_query!(Client.t() | Req.Request.t(), String.t(), map(), Creatio.opts()) :: map()
   def execute_query!(client, action, query_payload, opts \\ []) do
     case execute_query(client, action, query_payload, opts) do
       {:ok, result} -> result
@@ -188,7 +187,7 @@ defmodule Creatio.DataService do
           String.t(),
           String.t(),
           any(),
-          keyword()
+          Creatio.opts()
         ) ::
           {:ok, any()} | {:error, Error.t()}
   def custom_service(client_or_req, service_name, endpoint, payload \\ %{}, opts \\ []) do
@@ -210,7 +209,7 @@ defmodule Creatio.DataService do
           String.t(),
           String.t(),
           any(),
-          keyword()
+          Creatio.opts()
         ) ::
           any()
   def custom_service!(client, service_name, endpoint, payload_or_opts \\ %{}, opts \\ []) do
@@ -224,29 +223,33 @@ defmodule Creatio.DataService do
     execute_query(client_or_req, action, query_payload, opts)
   end
 
-  defp do_execute_query(%Client{} = client, url, query_payload) do
-    req = Req.Request.put_header(client.req, "content-type", "application/json; charset=utf-8")
+  defp do_execute_query(%Client{} = client, url, query_payload, opts) do
+    base_req =
+      Req.Request.put_header(client.req, "content-type", "application/json; charset=utf-8")
 
-    case Req.post(req, url: url, json: query_payload) do
+    {req, req_opts} =
+      Util.prepare_req_call(
+        base_req,
+        opts,
+        [url: url, json: query_payload],
+        %{},
+        [:url, :method, :json, :body]
+      )
+
+    case Req.post(req, req_opts) do
       {:ok, %Req.Response{} = raw_resp} ->
-        resp = Util.normalize_json_response(raw_resp)
-
-        cond do
-          resp.status in 200..299 and Util.html_or_xml_response?(resp) ->
+        case Util.decode_api_response(raw_resp) do
+          {:html_or_xml, resp} ->
             {:error, Error.from_response(resp)}
 
-          resp.status in 200..299 and is_map(resp.body) ->
-            if resp.body["success"] in [false, "false"] or
-                 resp.body["Success"] in [false, "false"] do
+          {:ok, %Req.Response{status: status, body: %{} = body} = resp} when status in 200..299 ->
+            if body["success"] in [false, "false"] or body["Success"] in [false, "false"] do
               {:error, Error.from_response(resp)}
             else
-              {:ok, resp.body}
+              {:ok, body}
             end
 
-          resp.status in 200..299 ->
-            {:error, Error.from_response(resp)}
-
-          true ->
+          {:ok, %Req.Response{} = resp} ->
             {:error, Error.from_response(resp)}
         end
 
@@ -259,7 +262,8 @@ defmodule Creatio.DataService do
     service_name = validate_path_segment!(service_name, "service_name", "custom_service/5")
     endpoint = validate_path_segment!(endpoint, "endpoint", "custom_service/5")
     client = Client.ensure_client(client_or_req)
-    {http_method, req_opts} = Keyword.pop(opts, :method, :post)
+    opts_kw = if is_map(opts), do: Util.to_keyword_opts(opts), else: opts
+    {http_method, req_opts} = Keyword.pop(opts_kw, :method, :post)
 
     Telemetry.span(
       :data_service,
@@ -278,15 +282,22 @@ defmodule Creatio.DataService do
 
           {params, req_opts} = Keyword.pop(req_opts, :params, %{})
           {custom_headers, req_opts} = Keyword.pop(req_opts, :headers, %{})
-          {extra_req_opts, req_opts} = Keyword.pop(req_opts, :req_options, [])
-          req_opts = Keyword.merge(req_opts, extra_req_opts)
-
-          req = apply_custom_headers(client.req, custom_headers)
+          {_dropped_req_options, inline_req_opts} = Keyword.pop(req_opts, :req_options, [])
+          inline_req_opts = Keyword.drop(inline_req_opts, [:url, :method, :json, :body])
 
           {final_payload, final_params} =
             resolve_custom_payload_and_params(http_method, payload, params)
 
-          req_opts = Keyword.merge(req_opts, url: url, params: final_params, method: http_method)
+          {req_with_extra_headers, prepared_opts} =
+            Util.prepare_req_call(
+              apply_custom_headers(client.req, custom_headers),
+              opts_kw,
+              [url: url, method: http_method],
+              stringify_keys(final_params),
+              [:url, :method, :json, :body]
+            )
+
+          req_opts = Keyword.merge(inline_req_opts, prepared_opts)
 
           final_payload =
             if is_list(final_payload) and final_payload != [] and Keyword.keyword?(final_payload) do
@@ -302,14 +313,14 @@ defmodule Creatio.DataService do
               true -> Keyword.put(req_opts, :json, final_payload)
             end
 
-          case Req.request(req, req_opts) do
+          case Req.request(req_with_extra_headers, req_opts) do
             {:ok, %Req.Response{} = raw_resp} ->
-              resp = Util.normalize_json_response(raw_resp)
+              case Util.decode_api_response(raw_resp) do
+                {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
+                  {:ok, body}
 
-              if resp.status in 200..299 and not Util.html_or_xml_response?(resp) do
-                {:ok, resp.body}
-              else
-                {:error, Error.from_response(resp)}
+                {_, resp} ->
+                  {:error, Error.from_response(resp)}
               end
 
             {:error, exception} ->
@@ -368,9 +379,32 @@ defmodule Creatio.DataService do
 
   defp apply_custom_headers(req, _), do: req
 
+  @custom_service_opt_keys [
+    :method,
+    :params,
+    :headers,
+    :req_options,
+    :receive_timeout,
+    :pool_timeout,
+    :connect_options,
+    :retry,
+    :retry_delay,
+    :max_retries,
+    :plug,
+    :adapter,
+    :finch,
+    :decode_body,
+    :redirect,
+    :max_redirects,
+    :compressed,
+    :raw,
+    :http_errors,
+    :into
+  ]
+
   defp custom_service_opts?(term) do
     is_list(term) and term != [] and Keyword.keyword?(term) and
-      Enum.all?(Keyword.keys(term), &(&1 in [:method, :params, :headers, :req_options]))
+      Enum.all?(Keyword.keys(term), &(&1 in @custom_service_opt_keys))
   end
 
   defp validate_path_segment!(val, label, fun_name)
@@ -395,28 +429,18 @@ defmodule Creatio.DataService do
           "#{label} must be a non-empty safe path segment before calling #{fun_name}, got: #{inspect(other)}"
   end
 
-  defp validate_query_url!(url) when is_binary(url) do
-    trimmed = String.trim(url)
-
-    if trimmed == "" or String.contains?(trimmed, ["..", "\r", "\n"]) do
-      raise ArgumentError,
-            "invalid DataService query URL: #{inspect(url)}"
-    else
-      trimmed
-    end
-  end
-
-  defp validate_query_url!(other) do
-    raise ArgumentError, "invalid DataService query URL: #{inspect(other)}"
-  end
-
   defp allowed_read_only_query?(action, url) do
-    path = URI.parse(url).path || ""
+    raw_path = URI.parse(url).path || ""
 
-    action == "SelectQuery" and
-      not String.contains?(path, "..") and
-      not String.contains?(path, "/0/rest/") and
-      String.ends_with?(path, "/DataService/json/SyncReply/SelectQuery")
+    case Util.safe_normalized_path(raw_path) do
+      {:ok, path} ->
+        action == "SelectQuery" and
+          not String.contains?(path, "/0/rest/") and
+          String.ends_with?(path, "/DataService/json/SyncReply/SelectQuery")
+
+      {:error, :invalid_path} ->
+        false
+    end
   end
 
   defp read_only_error do

@@ -546,7 +546,7 @@ defmodule Creatio.TestDSL.ODataDSL do
       assert last_req.request_path ==
                "/0/odata/#{unquote(entity)}(#{unquote(id)})/#{unquote(field)}"
 
-      assert last_req.headers["accept"] == ["application/json; text/plain; */*"]
+      assert last_req.headers["accept"] == ["application/json, text/plain, */*"]
 
       assert last_req.headers["content-type"] == [
                "application/octet-stream; IEEE754Compatible=true"
