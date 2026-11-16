@@ -219,16 +219,16 @@ defmodule Creatio.TelemetryTest do
           {"GET", "/0/odata/Contact"} ->
             Req.Test.json(conn, %{"value" => [%{"Id" => "1"}]})
 
-          {"GET", "/0/odata/Contact(1)"} ->
+          {"GET", "/0/odata/Contact('1')"} ->
             Req.Test.json(conn, %{"Id" => "1"})
 
-          {"GET", "/0/odata/Contact(1)/Account"} ->
+          {"GET", "/0/odata/Contact('1')/Account"} ->
             Req.Test.json(conn, %{"Id" => "a-1"})
 
-          {"GET", "/0/odata/Contact(1)/Name"} ->
+          {"GET", "/0/odata/Contact('1')/Name"} ->
             Req.Test.json(conn, %{"value" => "Alice"})
 
-          {"GET", "/0/odata/Contact(1)/Name/$value"} ->
+          {"GET", "/0/odata/Contact('1')/Name/$value"} ->
             Plug.Conn.send_resp(conn, 200, "Alice")
 
           {"GET", "/0/odata/Contact/$count"} ->
@@ -239,16 +239,16 @@ defmodule Creatio.TelemetryTest do
             |> Plug.Conn.put_resp_content_type("application/json")
             |> Plug.Conn.send_resp(201, ~s({"Id":"2"}))
 
-          {"PATCH", "/0/odata/Contact(2)"} ->
+          {"PATCH", "/0/odata/Contact('2')"} ->
             Plug.Conn.send_resp(conn, 204, "")
 
-          {"PUT", "/0/odata/Contact(2)/Name"} ->
+          {"PUT", "/0/odata/Contact('2')/Name"} ->
             Plug.Conn.send_resp(conn, 204, "")
 
-          {"DELETE", "/0/odata/Contact(2)/Name"} ->
+          {"DELETE", "/0/odata/Contact('2')/Name"} ->
             Plug.Conn.send_resp(conn, 204, "")
 
-          {"DELETE", "/0/odata/Contact(2)"} ->
+          {"DELETE", "/0/odata/Contact('2')"} ->
             Plug.Conn.send_resp(conn, 204, "")
         end
       end
@@ -298,16 +298,16 @@ defmodule Creatio.TelemetryTest do
           {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection"} ->
             Req.Test.json(conn, %{"d" => %{"results" => [%{"Id" => "1"}]}})
 
-          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'1')"} ->
+          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection('1')"} ->
             Req.Test.json(conn, %{"d" => %{"Id" => "1"}})
 
-          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'1')/Account"} ->
+          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection('1')/Account"} ->
             Req.Test.json(conn, %{"d" => %{"Id" => "a-1"}})
 
-          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'1')/Name"} ->
+          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection('1')/Name"} ->
             Req.Test.json(conn, %{"d" => %{"Name" => "Alice"}})
 
-          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'1')/Name/$value"} ->
+          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection('1')/Name/$value"} ->
             Plug.Conn.send_resp(conn, 200, "Alice")
 
           {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection/$count"} ->
@@ -318,10 +318,10 @@ defmodule Creatio.TelemetryTest do
             |> Plug.Conn.put_resp_content_type("application/json")
             |> Plug.Conn.send_resp(201, Jason.encode!(%{"d" => %{"Id" => "2"}}))
 
-          {"PATCH", "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'2')"} ->
+          {"PATCH", "/0/ServiceModel/EntityDataService.svc/ContactCollection('2')"} ->
             Plug.Conn.send_resp(conn, 204, "")
 
-          {"DELETE", "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'2')"} ->
+          {"DELETE", "/0/ServiceModel/EntityDataService.svc/ContactCollection('2')"} ->
             Plug.Conn.send_resp(conn, 204, "")
         end
       end
@@ -918,6 +918,55 @@ defmodule Creatio.TelemetryTest do
       refute sanitized_edge.msg =~ "p\\\"w"
       assert sanitized_edge.err.response.body =~ "Bearer [REDACTED]"
       assert sanitized_edge.err.response.body =~ "[TRUNCATED"
+    end
+
+    test "sanitizes URI secrets, Req.Request url/private, and non-exception structs" do
+      uri =
+        URI.parse(
+          "https://user:secret@mycreatio.com/0/odata/Contact?access_token=abc#bpmcsrf=xyz"
+        )
+
+      req =
+        Req.new(url: uri, headers: %{"authorization" => "Bearer topsecret"})
+        |> Req.Request.put_private(:custom_secret, "s3cr3t")
+
+      batch_resp = %Creatio.Batch.Response{
+        id: "1",
+        status: 200,
+        headers: %{"set-cookie" => "S=1"},
+        body: %{"ok" => true}
+      }
+
+      conn = %Plug.Conn{req_headers: [{"authorization", "Bearer conn-tok"}, {"x-ok", "yes"}]}
+
+      sanitized =
+        Telemetry.sanitize_metadata(%{
+          uri: uri,
+          req: req,
+          batch_resp: batch_resp,
+          conn: conn
+        })
+
+      assert sanitized.uri.userinfo == "[REDACTED]"
+      refute to_string(sanitized.uri) =~ "access_token=abc"
+      refute to_string(sanitized.uri) =~ "bpmcsrf=xyz"
+      assert sanitized.uri.query =~ "REDACTED"
+      assert sanitized.uri.fragment =~ "REDACTED"
+
+      assert sanitized.req.private == %{redacted: true}
+      refute to_string(sanitized.req.url) =~ "secret"
+
+      assert Enum.any?(
+               sanitized.req.headers["authorization"],
+               &String.contains?(&1, "[REDACTED]")
+             )
+
+      assert sanitized.batch_resp.headers == %{"set-cookie" => "[REDACTED]"}
+
+      assert Enum.find(sanitized.conn.req_headers, &(elem(&1, 0) == "authorization")) ==
+               {"authorization", "[REDACTED]"}
+
+      assert Enum.find(sanitized.conn.req_headers, &(elem(&1, 0) == "x-ok")) == {"x-ok", "yes"}
     end
   end
 end

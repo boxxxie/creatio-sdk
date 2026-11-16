@@ -332,7 +332,7 @@ defmodule Creatio.Telemetry do
     key_down = key |> to_string() |> String.downcase()
 
     cond do
-      key_down == "headers" ->
+      key_down in ["headers", "req_headers", "resp_headers"] ->
         sanitize_headers(val)
 
       MapSet.member?(@sensitive_meta_keys, key_down) ->
@@ -346,26 +346,25 @@ defmodule Creatio.Telemetry do
   defp sanitize_meta_value(%Error{} = err), do: sanitize_error(err)
   defp sanitize_meta_value(%Req.Response{} = resp), do: sanitize_response(resp)
 
-  defp sanitize_meta_value(%Req.Request{headers: headers, options: options, body: body} = req) do
+  defp sanitize_meta_value(
+         %Req.Request{headers: headers, options: options, body: body, url: url, private: priv} =
+           req
+       ) do
     %Req.Request{
       req
       | headers: sanitize_headers(headers),
         options: sanitize_metadata(options),
+        url: sanitize_meta_value(url),
+        private: if(priv == %{}, do: %{}, else: %{redacted: true}),
         body: if(is_nil(body), do: nil, else: "[REDACTED]")
     }
   end
 
-  defp sanitize_meta_value(%URI{userinfo: userinfo} = uri) when is_binary(userinfo) do
-    %URI{uri | userinfo: "[REDACTED]"}
-  end
+  defp sanitize_meta_value(%URI{} = uri), do: sanitize_uri(uri)
 
   defp sanitize_meta_value(%{__struct__: mod} = struct)
        when mod not in [Date, DateTime, NaiveDateTime, Time, URI, Regex, MapSet] do
-    if is_exception(struct) or mod == Creatio.Client do
-      sanitize_struct(struct)
-    else
-      struct
-    end
+    sanitize_struct(struct)
   end
 
   defp sanitize_meta_value(val) when is_map(val) and not is_struct(val),
@@ -388,6 +387,41 @@ defmodule Creatio.Telemetry do
 
   defp sanitize_meta_value(val) when is_binary(val), do: redact_text_secrets(val)
   defp sanitize_meta_value(val), do: val
+
+  defp sanitize_uri(%URI{userinfo: userinfo, path: path, query: query, fragment: fragment} = uri) do
+    %URI{
+      uri
+      | userinfo: if(is_binary(userinfo), do: "[REDACTED]", else: nil),
+        path: if(is_binary(path), do: redact_text_secrets(path), else: path),
+        query: sanitize_uri_query(query),
+        fragment: sanitize_uri_query(fragment)
+    }
+  end
+
+  defp sanitize_uri_query(nil), do: nil
+
+  defp sanitize_uri_query(query) when is_binary(query) do
+    query
+    |> String.split("&")
+    |> Enum.map_join("&", &sanitize_uri_query_pair/1)
+    |> redact_text_secrets()
+  end
+
+  defp sanitize_uri_query_pair(pair) do
+    case String.split(pair, "=", parts: 2) do
+      [raw_key, _raw_val] ->
+        key_down = raw_key |> URI.decode() |> String.downcase()
+
+        if MapSet.member?(@sensitive_meta_keys, key_down) do
+          "#{raw_key}=[REDACTED]"
+        else
+          pair
+        end
+
+      _ ->
+        pair
+    end
+  end
 
   defp sanitize_struct(%{__struct__: _mod} = struct) do
     sanitized_fields =
