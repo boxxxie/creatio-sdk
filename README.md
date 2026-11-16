@@ -1,7 +1,13 @@
 # Creatio
 
-[![Hex.pm](https://img.shields.io/hexpm/v/creatio.svg)](https://hex.pm/packages/creatio)
+[![CI](https://img.shields.io/github/actions/workflow/status/boxxxie/creatio-sdk/ci.yml?branch=master&label=CI&logo=github)](https://github.com/boxxxie/creatio-sdk/actions/workflows/ci.yml)
+[![Hex.pm](https://img.shields.io/hexpm/v/creatio.svg?logo=elixir)](https://hex.pm/packages/creatio)
+[![Hex.pm Downloads](https://img.shields.io/hexpm/dt/creatio.svg)](https://hex.pm/packages/creatio)
+[![HexDocs](https://img.shields.io/badge/docs-hexdocs-4B275F.svg?logo=readthedocs&logoColor=white)](https://hexdocs.pm/creatio)
+[![Elixir](https://img.shields.io/badge/Elixir-1.19%2B-4B275F.svg?logo=elixir&logoColor=white)](https://elixir-lang.org)
+[![OTP](https://img.shields.io/badge/OTP-28%2B-A90533.svg?logo=erlang&logoColor=white)](https://www.erlang.org)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![GitHub last commit](https://img.shields.io/github/last-commit/boxxxie/creatio-sdk)](https://github.com/boxxxie/creatio-sdk/commits/master)
 
 An idiomatic, full-featured Elixir SDK for the **Creatio CRM** (formerly bpm'online) API.
 
