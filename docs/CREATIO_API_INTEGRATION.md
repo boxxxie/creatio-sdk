@@ -3,7 +3,7 @@
 ## Official API Documentation
 The primary reference for the Creatio CRM API is the comprehensive Postman documentation:
 * **Online Postman Documentation:** [Creatio API Postman Documentation](https://documenter.getpostman.com/view/10204500/SztHX5Qb?version=latest)
-* **Offline Postman Collection:** [`creatio_api_collection.json`](file:///home/pauli/projects/nvestiv/caasa/creatio-sdk/docs/creatio_api_collection.json) (included in this repository)
+* **Offline Postman Collection:** [`docs/creatio_api_collection.json`](https://github.com/boxxxie/creatio-sdk/blob/master/docs/creatio_api_collection.json) (included in the GitHub repository)
 * **Official Postman Environment:** [Creatio.postman_environment.zip](https://academy.creatio.com/sites/default/files/documents/downloads/SDK/Creatio.postman_environment.zip)
 * **Creatio Academy:** [Creatio Academy Documentation](https://academy.creatio.com/)
 
@@ -80,7 +80,7 @@ GET {{BaseURI}}/0/odata/Contact?$top=100&$skip=200
 ```
 *(Note: OData 4 in Creatio does not support the `in` operator; use multiple `or` conditions instead).*
 
-In the SDK, `Creatio.stream(client, "Contact", page_size: 100, skip: 200)` automates this with lazy Elixir streams and supports an initial `:skip` offset for resuming interrupted queries.
+In the SDK, `Creatio.stream(client, "Contact", page_size: 100, skip: 200)` (yielding `{:ok, record}` / `{:error, error}` tuples) and `Creatio.stream!(client, "Contact", page_size: 100, skip: 200)` (yielding plain `record` maps) automate this with lazy Elixir streams and support an initial `:skip` offset for resuming interrupted queries.
 
 **Batch Requests:**
 Creatio supports OData batching via `/0/odata/$batch` using multipart MIME bodies or JSON batch format.
