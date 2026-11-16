@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-11-16
+
+### Fixed
+
+- **`Req` `0.7+` Compatibility (`Creatio.Client`, `Creatio.Telemetry`)**: Guarded `:current_request_steps` access and updates via `Map.get/3`, `Map.fetch/2`, and `Map.put/3` instead of compile-time `%Req.Request{current_request_steps: ...}` struct matches/updates, restoring compilation and runtime compatibility with `req` `0.7+` while preserving support for `0.5.x`–`0.6.x`.
+
+### Changed
+
+- **Widened `:req` Constraint & Updated Dependencies**: Updated `:req` in `mix.exs` to `"~> 0.5 or ~> 0.6 or ~> 0.7"` and updated `mix.lock` dependencies (`req` `0.7.5`, `dialyxir` `1.4.9`, and transitive packages).
+
 ## [1.0.0] - 2026-11-16
 
 ### Added
