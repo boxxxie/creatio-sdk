@@ -227,9 +227,9 @@ defmodule Creatio.Features.SdkFacadeAndResilienceTest do
   defp stub_facade_endpoints(ctx) do
     ctx
     |> CreatioServerDriver.ensure_server()
-    |> CreatioServerDriver.stub_odata_list("Contact",
-      records: [%{"Id" => "1", "Name" => "Test"}]
-    )
+    |> CreatioServerDriver.stub_odata_stream("Contact", [
+      %{"Id" => "1", "Name" => "Test"}
+    ])
     |> CreatioServerDriver.stub_odata_get("Contact", "1",
       record: %{"Id" => "1", "Name" => "Test"}
     )
@@ -257,7 +257,7 @@ defmodule Creatio.Features.SdkFacadeAndResilienceTest do
       method: :get,
       body: %{"status" => "pong"}
     )
-    |> CreatioServerDriver.stub_odata3_list("Contact", records: [%{"Name" => "Legacy"}])
+    |> CreatioServerDriver.stub_odata3_stream("Contact", [%{"Name" => "Legacy"}])
     |> CreatioServerDriver.stub_odata3_get("Contact", "1", record: %{"Name" => "Legacy"})
     |> CreatioServerDriver.stub_odata3_navigation("Contact", "1", "Account",
       record: %{"Name" => "Legacy Org"}

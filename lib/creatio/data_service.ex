@@ -243,7 +243,7 @@ defmodule Creatio.DataService do
             {:error, Error.from_response(resp)}
 
           {:ok, %Req.Response{status: status, body: %{} = body} = resp} when status in 200..299 ->
-            if body["success"] in [false, "false"] or body["Success"] in [false, "false"] do
+            if Util.error_payload?(body) do
               {:error, Error.from_response(resp)}
             else
               {:ok, body}
@@ -262,8 +262,16 @@ defmodule Creatio.DataService do
     service_name = validate_path_segment!(service_name, "service_name", "custom_service/5")
     endpoint = validate_path_segment!(endpoint, "endpoint", "custom_service/5")
     client = Client.ensure_client(client_or_req)
-    opts_kw = if is_map(opts), do: Util.to_keyword_opts(opts), else: opts
-    {http_method, req_opts} = Keyword.pop(opts_kw, :method, :post)
+
+    opts_kw =
+      cond do
+        is_nil(opts) -> []
+        is_map(opts) -> Util.to_keyword_opts(opts)
+        true -> opts
+      end
+
+    {raw_method, req_opts} = Keyword.pop(opts_kw, :method, :post)
+    http_method = normalize_http_method!(raw_method)
 
     Telemetry.span(
       :data_service,
@@ -280,18 +288,27 @@ defmodule Creatio.DataService do
         else
           url = "/0/rest/#{service_name}/#{endpoint}"
 
-          {params, req_opts} = Keyword.pop(req_opts, :params, %{})
-          {custom_headers, req_opts} = Keyword.pop(req_opts, :headers, %{})
-          {_dropped_req_options, inline_req_opts} = Keyword.pop(req_opts, :req_options, [])
-          inline_req_opts = Keyword.drop(inline_req_opts, [:url, :method, :json, :body])
+          {params_list, req_opts} = Keyword.pop_values(req_opts, :params)
+          params = Enum.reduce(params_list, %{}, &Map.merge(&2, stringify_keys(&1)))
+
+          {headers_list, req_opts} = Keyword.pop_values(req_opts, :headers)
+          {_dropped_req_options, inline_req_opts} = Keyword.pop_values(req_opts, :req_options)
+
+          inline_req_opts =
+            Keyword.drop(inline_req_opts, [:url, :method, :json, :body, :params, :headers])
 
           {final_payload, final_params} =
             resolve_custom_payload_and_params(http_method, payload, params)
 
+          base_req =
+            Enum.reduce(headers_list, client.req, fn hdrs, acc_req ->
+              apply_custom_headers(acc_req, hdrs)
+            end)
+
           {req_with_extra_headers, prepared_opts} =
             Util.prepare_req_call(
-              apply_custom_headers(client.req, custom_headers),
-              opts_kw,
+              base_req,
+              [req_options: Keyword.get(opts_kw, :req_options)],
               [url: url, method: http_method],
               stringify_keys(final_params),
               [:url, :method, :json, :body]
@@ -306,18 +323,40 @@ defmodule Creatio.DataService do
               final_payload
             end
 
-          req_opts =
+          {req_with_headers, req_opts} =
             cond do
-              is_nil(final_payload) -> req_opts
-              is_binary(final_payload) -> Keyword.put(req_opts, :body, final_payload)
-              true -> Keyword.put(req_opts, :json, final_payload)
+              is_nil(final_payload) ->
+                {req_with_extra_headers, req_opts}
+
+              is_binary(final_payload) ->
+                req_with_ct =
+                  if Req.Request.get_header(req_with_extra_headers, "content-type") == [] and
+                       json_binary?(final_payload) do
+                    Req.Request.put_header(
+                      req_with_extra_headers,
+                      "content-type",
+                      "application/json; charset=utf-8"
+                    )
+                  else
+                    req_with_extra_headers
+                  end
+
+                {req_with_ct, Keyword.put(req_opts, :body, final_payload)}
+
+              true ->
+                {req_with_extra_headers, Keyword.put(req_opts, :json, final_payload)}
             end
 
-          case Req.request(req_with_extra_headers, req_opts) do
+          case Req.request(req_with_headers, req_opts) do
             {:ok, %Req.Response{} = raw_resp} ->
               case Util.decode_api_response(raw_resp) do
-                {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
-                  {:ok, body}
+                {:ok, %Req.Response{status: status, body: body} = resp}
+                when status in 200..299 ->
+                  if Util.error_payload?(body) do
+                    {:error, Error.from_response(resp)}
+                  else
+                    {:ok, body}
+                  end
 
                 {_, resp} ->
                   {:error, Error.from_response(resp)}
@@ -349,19 +388,61 @@ defmodule Creatio.DataService do
       is_list(payload) and payload != [] and Keyword.keyword?(payload) ->
         {nil, Map.merge(stringify_keys(params), stringify_keys(payload))}
 
+      payload == [] ->
+        {nil, params}
+
       true ->
         {payload, params}
     end
   end
 
-  defp resolve_custom_payload_and_params(:delete, payload, params)
-       when is_nil(payload) or payload == %{} do
+  defp resolve_custom_payload_and_params(http_method, payload, params)
+       when http_method in [:delete, :options] and
+              (is_nil(payload) or payload == %{} or payload == []) do
     {nil, params}
   end
 
   defp resolve_custom_payload_and_params(_http_method, payload, params) do
     {payload, params}
   end
+
+  @allowed_http_methods %{
+    "get" => :get,
+    "post" => :post,
+    "put" => :put,
+    "patch" => :patch,
+    "delete" => :delete,
+    "head" => :head,
+    "options" => :options
+  }
+
+  defp normalize_http_method!(method) when is_atom(method) or is_binary(method) do
+    key = method |> to_string() |> String.trim() |> String.downcase()
+
+    case Map.fetch(@allowed_http_methods, key) do
+      {:ok, atom} ->
+        atom
+
+      :error ->
+        raise ArgumentError, "invalid HTTP method for custom_service/5: #{inspect(method)}"
+    end
+  end
+
+  defp normalize_http_method!(other) do
+    raise ArgumentError, "invalid HTTP method for custom_service/5: #{inspect(other)}"
+  end
+
+  defp json_binary?(bin) when is_binary(bin) do
+    trimmed = bin |> String.trim_leading("\uFEFF") |> String.trim_leading()
+
+    if String.starts_with?(trimmed, ["{", "["]) do
+      match?({:ok, _}, Jason.decode(trimmed))
+    else
+      false
+    end
+  end
+
+  defp stringify_keys(nil), do: %{}
 
   defp stringify_keys(map) when is_map(map) do
     Map.new(map, fn {k, v} -> {to_string(k), v} end)
@@ -370,6 +451,8 @@ defmodule Creatio.DataService do
   defp stringify_keys(list) when is_list(list) do
     Map.new(list, fn {k, v} -> {to_string(k), v} end)
   end
+
+  defp apply_custom_headers(req, nil), do: req
 
   defp apply_custom_headers(req, headers) when is_map(headers) or is_list(headers) do
     Enum.reduce(headers, req, fn {k, v}, r ->
@@ -416,7 +499,7 @@ defmodule Creatio.DataService do
     trimmed = String.trim(val)
 
     if trimmed != "" and trimmed not in [".", ".."] and not String.contains?(trimmed, "..") and
-         Regex.match?(~r/^[A-Za-z0-9_.-]+$/, trimmed) do
+         Regex.match?(~r/\A[A-Za-z0-9_.-]+\z/, trimmed) do
       trimmed
     else
       raise ArgumentError,
@@ -434,8 +517,11 @@ defmodule Creatio.DataService do
 
     case Util.safe_normalized_path(raw_path) do
       {:ok, path} ->
+        path_down = String.downcase(path)
+
         action == "SelectQuery" and
-          not String.contains?(path, "/0/rest/") and
+          not String.contains?(path_down, "/0/rest/") and
+          not String.starts_with?(String.trim_leading(path_down, "/"), "0/rest/") and
           String.ends_with?(path, "/DataService/json/SyncReply/SelectQuery")
 
       {:error, :invalid_path} ->

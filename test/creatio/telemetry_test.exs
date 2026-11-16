@@ -219,16 +219,16 @@ defmodule Creatio.TelemetryTest do
           {"GET", "/0/odata/Contact"} ->
             Req.Test.json(conn, %{"value" => [%{"Id" => "1"}]})
 
-          {"GET", "/0/odata/Contact(1)"} ->
+          {"GET", "/0/odata/Contact('1')"} ->
             Req.Test.json(conn, %{"Id" => "1"})
 
-          {"GET", "/0/odata/Contact(1)/Account"} ->
+          {"GET", "/0/odata/Contact('1')/Account"} ->
             Req.Test.json(conn, %{"Id" => "a-1"})
 
-          {"GET", "/0/odata/Contact(1)/Name"} ->
+          {"GET", "/0/odata/Contact('1')/Name"} ->
             Req.Test.json(conn, %{"value" => "Alice"})
 
-          {"GET", "/0/odata/Contact(1)/Name/$value"} ->
+          {"GET", "/0/odata/Contact('1')/Name/$value"} ->
             Plug.Conn.send_resp(conn, 200, "Alice")
 
           {"GET", "/0/odata/Contact/$count"} ->
@@ -239,16 +239,16 @@ defmodule Creatio.TelemetryTest do
             |> Plug.Conn.put_resp_content_type("application/json")
             |> Plug.Conn.send_resp(201, ~s({"Id":"2"}))
 
-          {"PATCH", "/0/odata/Contact(2)"} ->
+          {"PATCH", "/0/odata/Contact('2')"} ->
             Plug.Conn.send_resp(conn, 204, "")
 
-          {"PUT", "/0/odata/Contact(2)/Name"} ->
+          {"PUT", "/0/odata/Contact('2')/Name"} ->
             Plug.Conn.send_resp(conn, 204, "")
 
-          {"DELETE", "/0/odata/Contact(2)/Name"} ->
+          {"DELETE", "/0/odata/Contact('2')/Name"} ->
             Plug.Conn.send_resp(conn, 204, "")
 
-          {"DELETE", "/0/odata/Contact(2)"} ->
+          {"DELETE", "/0/odata/Contact('2')"} ->
             Plug.Conn.send_resp(conn, 204, "")
         end
       end
@@ -298,16 +298,16 @@ defmodule Creatio.TelemetryTest do
           {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection"} ->
             Req.Test.json(conn, %{"d" => %{"results" => [%{"Id" => "1"}]}})
 
-          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'1')"} ->
+          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection('1')"} ->
             Req.Test.json(conn, %{"d" => %{"Id" => "1"}})
 
-          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'1')/Account"} ->
+          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection('1')/Account"} ->
             Req.Test.json(conn, %{"d" => %{"Id" => "a-1"}})
 
-          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'1')/Name"} ->
+          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection('1')/Name"} ->
             Req.Test.json(conn, %{"d" => %{"Name" => "Alice"}})
 
-          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'1')/Name/$value"} ->
+          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection('1')/Name/$value"} ->
             Plug.Conn.send_resp(conn, 200, "Alice")
 
           {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection/$count"} ->
@@ -318,10 +318,10 @@ defmodule Creatio.TelemetryTest do
             |> Plug.Conn.put_resp_content_type("application/json")
             |> Plug.Conn.send_resp(201, Jason.encode!(%{"d" => %{"Id" => "2"}}))
 
-          {"PATCH", "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'2')"} ->
+          {"PATCH", "/0/ServiceModel/EntityDataService.svc/ContactCollection('2')"} ->
             Plug.Conn.send_resp(conn, 204, "")
 
-          {"DELETE", "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'2')"} ->
+          {"DELETE", "/0/ServiceModel/EntityDataService.svc/ContactCollection('2')"} ->
             Plug.Conn.send_resp(conn, 204, "")
         end
       end
@@ -918,6 +918,157 @@ defmodule Creatio.TelemetryTest do
       refute sanitized_edge.msg =~ "p\\\"w"
       assert sanitized_edge.err.response.body =~ "Bearer [REDACTED]"
       assert sanitized_edge.err.response.body =~ "[TRUNCATED"
+    end
+
+    test "sanitizes URI secrets, Req.Request url/private, and non-exception structs" do
+      uri =
+        URI.parse(
+          "https://user:secret@mycreatio.com/0/odata/Contact?access_token=abc#bpmcsrf=xyz"
+        )
+
+      req =
+        Req.new(url: uri, headers: %{"authorization" => "Bearer topsecret"})
+        |> Req.Request.put_private(:custom_secret, "s3cr3t")
+
+      batch_resp = %Creatio.Batch.Response{
+        id: "1",
+        status: 200,
+        headers: %{"set-cookie" => "S=1"},
+        body: %{"ok" => true}
+      }
+
+      conn = %Plug.Conn{req_headers: [{"authorization", "Bearer conn-tok"}, {"x-ok", "yes"}]}
+
+      sanitized =
+        Telemetry.sanitize_metadata(%{
+          uri: uri,
+          req: req,
+          batch_resp: batch_resp,
+          conn: conn
+        })
+
+      assert sanitized.uri.userinfo == "[REDACTED]"
+      refute to_string(sanitized.uri) =~ "access_token=abc"
+      refute to_string(sanitized.uri) =~ "bpmcsrf=xyz"
+      assert sanitized.uri.query =~ "REDACTED"
+      assert sanitized.uri.fragment =~ "REDACTED"
+
+      assert sanitized.req.private == %{redacted: true}
+      refute to_string(sanitized.req.url) =~ "secret"
+
+      assert Enum.any?(
+               sanitized.req.headers["authorization"],
+               &String.contains?(&1, "[REDACTED]")
+             )
+
+      assert sanitized.batch_resp.headers == %{"set-cookie" => "[REDACTED]"}
+
+      assert Enum.find(sanitized.conn.req_headers, &(elem(&1, 0) == "authorization")) ==
+               {"authorization", "[REDACTED]"}
+
+      assert Enum.find(sanitized.conn.req_headers, &(elem(&1, 0) == "x-ok")) == {"x-ok", "yes"}
+    end
+
+    test "redacts .ASPXAUTH cookies, string-keyed tuple lists, and handles improper lists safely" do
+      err = %Error{
+        status: 401,
+        message: "\".ASPXAUTH=secret-aspx-cookie; BPMLOADER=secret-loader\"",
+        details: [
+          {"client_secret", "tuple-secret"},
+          {"bpmcsrf", "tuple-csrf"},
+          [:improper_head | :improper_tail]
+        ],
+        response: %Req.Response{
+          status: 401,
+          body: [1 | :improper_resp_tail]
+        }
+      }
+
+      sanitized = Telemetry.sanitize_metadata(%{error: err})
+
+      refute sanitized.error.message =~ "secret-aspx-cookie"
+      refute sanitized.error.message =~ "secret-loader"
+      assert sanitized.error.message =~ ".ASPXAUTH=[REDACTED]"
+      assert sanitized.error.message =~ "BPMLOADER=[REDACTED]"
+
+      assert [
+               {"client_secret", "[REDACTED]"},
+               {"bpmcsrf", "[REDACTED]"},
+               [:improper_head | :improper_tail]
+             ] = sanitized.error.details
+
+      assert sanitized.error.response.body == [1 | :improper_resp_tail]
+
+      assert_raise RuntimeError, "boom", fn ->
+        Telemetry.span(:odata, %{action: :test}, fn ->
+          raise RuntimeError, "boom"
+        end)
+      end
+
+      assert_receive {:telemetry_event, [:creatio, :odata, :exception], _, _}
+    end
+
+    test "request telemetry runs after encode_body and put_base_url (no orphaned :start on EncodeError, virtual dir path matches)" do
+      plug = fn conn -> Req.Test.json(conn, %{"value" => []}) end
+
+      client =
+        Client.new(
+          base_url: "https://crm.test/creatio",
+          req_options: [plug: plug]
+        )
+
+      drain_events()
+
+      assert {:ok, []} = OData.list(client, "Contact")
+
+      assert_receive {:telemetry_event, [:creatio, :request, :start], _, start_meta}
+      assert_receive {:telemetry_event, [:creatio, :request, :stop], _, stop_meta}
+      assert start_meta.path == "/creatio/0/odata/Contact"
+      assert stop_meta.path == "/creatio/0/odata/Contact"
+
+      drain_events()
+
+      assert_raise Jason.EncodeError, fn ->
+        Req.post(client.req, url: "/0/odata/Contact", json: %{bad: <<0xFF>>})
+      end
+
+      events = drain_events()
+      refute Enum.any?(events, fn {ev, _, _} -> ev == [:creatio, :request, :start] end)
+    end
+
+    test "redacts secrets crossing 4096-byte truncation, handles non-String.Chars map keys, and survives malformed URI percent-encoding" do
+      prefix = String.duplicate("x", 4_080)
+      crossing_body = ~s(#{prefix}"access_token":"secret_token_crossing_boundary_12345")
+
+      sanitized_crossing = Telemetry.sanitize_metadata(%{body: crossing_body})
+      refute sanitized_crossing.body =~ "secret_token_crossing_boundary"
+      assert sanitized_crossing.body =~ ~s("access_token":"[REDACTED]")
+      assert sanitized_crossing.body =~ "[TRUNCATED"
+
+      weird_meta = %{
+        {:tuple, :key} => "ok",
+        non_str_map: %{{:nested, :tuple} => "val", "client_secret" => "sec-1"},
+        resp: %Req.Response{
+          status: 500,
+          headers: %{{:weird_hdr} => ["v"], "authorization" => ["Bearer tok"]},
+          body: %{{:body_key} => "val", "password" => "pw-1"}
+        },
+        bad_uri: URI.parse("https://crm.test/?100%=1&access_token=tok123#bad%zz=2&bpmcsrf=csrf9")
+      }
+
+      sanitized = Telemetry.sanitize_metadata(weird_meta)
+      assert sanitized[{:tuple, :key}] == "ok"
+      assert sanitized.non_str_map[{:nested, :tuple}] == "val"
+      assert sanitized.non_str_map["client_secret"] == "[REDACTED]"
+      assert sanitized.resp.headers["authorization"] == ["[REDACTED]"]
+      assert sanitized.resp.body[{:body_key}] == "val"
+      assert sanitized.resp.body["password"] == "[REDACTED]"
+      refute sanitized.bad_uri.query =~ "tok123"
+      assert sanitized.bad_uri.query =~ "100%=1"
+      assert sanitized.bad_uri.query =~ "access_token=[REDACTED]"
+      refute sanitized.bad_uri.fragment =~ "csrf9"
+      assert sanitized.bad_uri.fragment =~ "bad%zz=2"
+      assert sanitized.bad_uri.fragment =~ "bpmcsrf=[REDACTED]"
     end
   end
 end

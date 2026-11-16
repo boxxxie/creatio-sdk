@@ -55,7 +55,10 @@ defmodule Creatio.Features.ReadOnlySafetyTest do
     {"POST OData collection creation", :post, :odata_collection},
     {"POST DataService InsertQuery", :post, :insert_query},
     {"POST custom REST mutation", :post, :custom_rest},
-    {"GET OData dot-segment path traversal to custom REST", :get, :path_traversal_custom_rest}
+    {"GET OData dot-segment path traversal to custom REST", :get, :path_traversal_custom_rest},
+    {"POST empty OData $batch endpoint", :post, :empty_batch_endpoint},
+    {"POST mutating JSON OData $batch", :post, :mutating_json_batch},
+    {"POST mutating multipart OData $batch", :post, :mutating_multipart_batch}
   ]
 
   describe "Read-Only Client Configuration & Local SDK Guards" do

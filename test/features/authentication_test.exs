@@ -94,7 +94,7 @@ defmodule Creatio.Features.AuthenticationTest do
              )
       @upon logging_in_with_forms("Supervisor", "pw")
       @then client_is_authenticated_via_forms(
-              csrf_token: "abc+123+==",
+              csrf_token: "abc+123%2B==",
               cookies_include: [".ASPXAUTH=ticket1"],
               single_cookie_name: "bpmcsrf"
             )
@@ -359,7 +359,7 @@ defmodule Creatio.Features.AuthenticationTest do
 
       @given creatio_oauth_health_status("{broken", content_type: "application/json")
       @upon checking_oauth_health()
-      @then authentication_fails_with(status: nil)
+      @then authentication_fails_with(status: 200)
     end
   end
 end

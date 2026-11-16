@@ -413,9 +413,13 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
 
     content_type = Keyword.get(opts, :content_type, "application/json")
 
+    key_literal = Creatio.Validation.format_record_key(id, :odata4)
+
     add_route(
       ctx,
-      fn req -> req.method == "GET" and req.request_path == "/0/odata/#{entity}(#{id})" end,
+      fn req ->
+        req.method == "GET" and req.request_path == "/0/odata/#{entity}(#{key_literal})"
+      end,
       fn conn, _req ->
         raw_body = if is_binary(body), do: body, else: Jason.encode!(body)
 
@@ -443,10 +447,12 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
         true -> %{"value" => []}
       end
 
+    key_literal = Creatio.Validation.format_record_key(id, :odata4)
+
     add_route(
       ctx,
       fn req ->
-        req.method == "GET" and req.request_path == "/0/odata/#{entity}(#{id})/#{nav}"
+        req.method == "GET" and req.request_path == "/0/odata/#{entity}(#{key_literal})/#{nav}"
       end,
       fn conn, _req ->
         send_stub_response(conn, status, body, content_type: content_type)
@@ -463,7 +469,8 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
     headers = Keyword.get(opts, :headers, [])
     chunked_body = Keyword.get(opts, :chunked_body)
     suffix = if raw?, do: "/$value", else: ""
-    path = "/0/odata/#{entity}(#{id})/#{field}#{suffix}"
+    key_literal = Creatio.Validation.format_record_key(id, :odata4)
+    path = "/0/odata/#{entity}(#{key_literal})/#{field}#{suffix}"
 
     default_ct = if raw?, do: "text/plain", else: "application/json"
     content_type = Keyword.get(opts, :content_type, default_ct)
@@ -576,10 +583,13 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
   def stub_odata_update(ctx, entity, id, opts \\ []) do
     status = Keyword.get(opts, :status, 204)
     content_type = Keyword.get(opts, :content_type, "application/json")
+    key_literal = Creatio.Validation.format_record_key(id, :odata4)
 
     add_route(
       ctx,
-      fn req -> req.method == "PATCH" and req.request_path == "/0/odata/#{entity}(#{id})" end,
+      fn req ->
+        req.method == "PATCH" and req.request_path == "/0/odata/#{entity}(#{key_literal})"
+      end,
       fn conn, _req ->
         cond do
           Keyword.has_key?(opts, :raw_body) ->
@@ -612,10 +622,13 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
     status = Keyword.get(opts, :status, 204)
     content_type = Keyword.get(opts, :content_type, "application/json")
     body = Keyword.get(opts, :raw_body, Keyword.get(opts, :body, ""))
+    key_literal = Creatio.Validation.format_record_key(id, :odata4)
 
     add_route(
       ctx,
-      fn req -> req.method == "DELETE" and req.request_path == "/0/odata/#{entity}(#{id})" end,
+      fn req ->
+        req.method == "DELETE" and req.request_path == "/0/odata/#{entity}(#{key_literal})"
+      end,
       fn conn, _req ->
         send_stub_response(conn, status, body, content_type: content_type)
       end
@@ -629,11 +642,12 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
     status = Keyword.get(opts, :status, 204)
     content_type = Keyword.get(opts, :content_type, "application/json")
     body = Keyword.get(opts, :raw_body, Keyword.get(opts, :body, ""))
+    key_literal = Creatio.Validation.format_record_key(id, :odata4)
 
     add_route(
       ctx,
       fn req ->
-        req.method == "PUT" and req.request_path == "/0/odata/#{entity}(#{id})/#{field}"
+        req.method == "PUT" and req.request_path == "/0/odata/#{entity}(#{key_literal})/#{field}"
       end,
       fn conn, _req ->
         send_stub_response(conn, status, body, content_type: content_type)
@@ -648,11 +662,13 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
     status = Keyword.get(opts, :status, 204)
     content_type = Keyword.get(opts, :content_type, "application/json")
     body = Keyword.get(opts, :raw_body, Keyword.get(opts, :body, ""))
+    key_literal = Creatio.Validation.format_record_key(id, :odata4)
 
     add_route(
       ctx,
       fn req ->
-        req.method == "DELETE" and req.request_path == "/0/odata/#{entity}(#{id})/#{field}"
+        req.method == "DELETE" and
+          req.request_path == "/0/odata/#{entity}(#{key_literal})/#{field}"
       end,
       fn conn, _req ->
         send_stub_response(conn, status, body, content_type: content_type)
@@ -776,11 +792,13 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
         true -> %{"d" => Keyword.get(opts, :record, %{"Id" => id})}
       end
 
+    key_literal = Creatio.Validation.format_record_key(id, :odata3)
+
     add_route(
       ctx,
       fn req ->
         req.method == "GET" and
-          req.request_path == "#{@odata3_base_path}/#{collection}(guid'#{id}')"
+          req.request_path == "#{@odata3_base_path}/#{collection}(#{key_literal})"
       end,
       fn conn, _req ->
         send_stub_response(conn, status, body, content_type: content_type)
@@ -817,11 +835,13 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
           %{"d" => %{}}
       end
 
+    key_literal = Creatio.Validation.format_record_key(id, :odata3)
+
     add_route(
       ctx,
       fn req ->
         req.method == "GET" and
-          req.request_path == "#{@odata3_base_path}/#{collection}(guid'#{id}')/#{nav}"
+          req.request_path == "#{@odata3_base_path}/#{collection}(#{key_literal})/#{nav}"
       end,
       fn conn, _req ->
         send_stub_response(conn, status, body, content_type: content_type)
@@ -839,7 +859,8 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
     chunked_body = Keyword.get(opts, :chunked_body)
     collection = collection_name(entity)
     suffix = if raw?, do: "/$value", else: ""
-    path = "#{@odata3_base_path}/#{collection}(guid'#{id}')/#{field}#{suffix}"
+    key_literal = Creatio.Validation.format_record_key(id, :odata3)
+    path = "#{@odata3_base_path}/#{collection}(#{key_literal})/#{field}#{suffix}"
 
     default_ct = if raw?, do: "text/plain", else: "application/json"
     content_type = Keyword.get(opts, :content_type, default_ct)
@@ -948,12 +969,13 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
     status = Keyword.get(opts, :status, 204)
     content_type = Keyword.get(opts, :content_type, "application/json")
     collection = collection_name(entity)
+    key_literal = Creatio.Validation.format_record_key(id, :odata3)
 
     add_route(
       ctx,
       fn req ->
         req.method == "PATCH" and
-          req.request_path == "#{@odata3_base_path}/#{collection}(guid'#{id}')"
+          req.request_path == "#{@odata3_base_path}/#{collection}(#{key_literal})"
       end,
       fn conn, _req ->
         cond do
@@ -988,12 +1010,13 @@ defmodule Creatio.TestDrivers.CreatioServerDriver do
     content_type = Keyword.get(opts, :content_type, "application/json")
     body = Keyword.get(opts, :raw_body, Keyword.get(opts, :body, ""))
     collection = collection_name(entity)
+    key_literal = Creatio.Validation.format_record_key(id, :odata3)
 
     add_route(
       ctx,
       fn req ->
         req.method == "DELETE" and
-          req.request_path == "#{@odata3_base_path}/#{collection}(guid'#{id}')"
+          req.request_path == "#{@odata3_base_path}/#{collection}(#{key_literal})"
       end,
       fn conn, _req ->
         send_stub_response(conn, status, body, content_type: content_type)

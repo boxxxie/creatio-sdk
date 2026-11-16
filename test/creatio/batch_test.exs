@@ -28,17 +28,17 @@ defmodule Creatio.BatchTest do
       assert req1["body"] == %{"Name" => "Alice"}
 
       assert req2["method"] == "PATCH"
-      assert req2["url"] == "Contact(id-1)"
+      assert req2["url"] == "Contact('id-1')"
       assert req2["id"] == "u1"
       assert req2["atomicityGroup"] == "group1"
 
       assert req3["method"] == "DELETE"
-      assert req3["url"] == "Contact(id-2)"
+      assert req3["url"] == "Contact('id-2')"
       assert req3["id"] == "d1"
       assert req3["atomicityGroup"] == "group1"
 
       assert req4["method"] == "GET"
-      assert req4["url"] == "Contact(id-3)"
+      assert req4["url"] == "Contact('id-3')"
       assert req4["id"] == "g1"
       refute Map.has_key?(req4, "body")
 
@@ -65,7 +65,7 @@ defmodule Creatio.BatchTest do
       assert multipart_body =~ "--batch_test_123\r\n"
       assert multipart_body =~ "--batch_test_123--\r\n"
       assert multipart_body =~ "Content-ID: get_1"
-      assert multipart_body =~ "GET Contact(1) HTTP/1.1"
+      assert multipart_body =~ "GET Contact('1') HTTP/1.1"
       assert multipart_body =~ "multipart/mixed; boundary=changeset_g1_"
       assert multipart_body =~ "Content-ID: create_1"
       assert multipart_body =~ "Content-ID: update_1"
@@ -162,7 +162,7 @@ defmodule Creatio.BatchTest do
 
       assert Enum.at(parts, 0) =~ "Content-ID: w1"
       assert Enum.at(parts, 0) =~ "multipart/mixed; boundary=changeset_"
-      assert Enum.at(parts, 1) =~ "GET Contact(1) HTTP/1.1"
+      assert Enum.at(parts, 1) =~ "GET Contact('1') HTTP/1.1"
       refute Enum.at(parts, 1) =~ "changeset_"
       assert Enum.at(parts, 2) =~ "Content-ID: w2"
       assert Enum.at(parts, 2) =~ "multipart/mixed; boundary=changeset_"
@@ -488,6 +488,244 @@ defmodule Creatio.BatchTest do
                Batch.execute(client, Batch.new() |> Batch.add_get("Contact"),
                  req_options: [plug: override_plug]
                )
+    end
+  end
+
+  describe "batch wire-format, boundary, and atomicity regressions" do
+    test "parse_multipart_response avoids boundary prefix collisions and strips UTF-8 BOM in JSON parts" do
+      body =
+        [
+          "--batch_1",
+          "Content-Type: application/http",
+          "Content-Transfer-Encoding: binary",
+          "Content-ID: 1",
+          "",
+          "HTTP/1.1 200 OK",
+          "Content-Type: application/json",
+          "",
+          "\uFEFF{\"note\":\"contains --batch_10 inline\"}",
+          "--batch_1--",
+          "--batch_10 epilogue should be ignored"
+        ]
+        |> Enum.join("\r\n")
+
+      assert {:ok, [%Creatio.Batch.Response{id: "1", status: 200, body: decoded}]} =
+               Batch.parse_multipart_response(body, "batch_1")
+
+      assert decoded == %{"note" => "contains --batch_10 inline"}
+    end
+
+    test "rejects whitespace or CRLF in batch URLs and rejects interleaved atomicity_group in builder and raw modes" do
+      assert_raise ArgumentError, fn ->
+        Batch.new() |> Batch.add_get("Contact?$filter=Name eq 'Jane'")
+      end
+
+      assert_raise ArgumentError, fn ->
+        Batch.new()
+        |> Batch.add_create("Contact", %{"Name" => "A"}, atomicity_group: "g1")
+        |> Batch.add_create("Contact", %{"Name" => "B"}, atomicity_group: "g2")
+        |> Batch.add_create("Contact", %{"Name" => "C"}, atomicity_group: "g1")
+        |> Batch.to_payload()
+      end
+
+      raw_interleaved = [
+        %{method: "POST", url: "Contact", body: %{"Name" => "A"}, atomicity_group: "g1"},
+        %{method: "GET", url: "Contact"},
+        %{method: "POST", url: "Contact", body: %{"Name" => "B"}, atomicity_group: "g1"}
+      ]
+
+      client = Creatio.Client.new(base_url: "https://mycreatio.com")
+
+      assert_raise ArgumentError, fn ->
+        Batch.execute(client, raw_interleaved, format: :multipart)
+      end
+
+      assert_raise ArgumentError, fn ->
+        Batch.execute(client, raw_interleaved, format: :json)
+      end
+    end
+
+    test "ignores atomicity_group on GET requests in JSON mode and preserves $1 Content-ID refs" do
+      payload =
+        Batch.new()
+        |> Batch.add(:get, "Contact", id: "r1", atomicity_group: "g1")
+        |> Batch.add_create("Account", %{"Name" => "Acme"}, id: "1", atomicity_group: "g1")
+        |> Batch.add_update("$1", %{"Name" => "Acme2"}, atomicity_group: "g1")
+        |> Batch.add_delete("$1", atomicity_group: "g1")
+        |> Batch.add_get("$1/Contact_Account")
+        |> Batch.to_payload()
+
+      [get_req, create_req, upd_ref, del_ref, get_ref] = payload["requests"]
+      refute Map.has_key?(get_req, "atomicityGroup")
+      assert create_req["atomicityGroup"] == "g1"
+      assert upd_ref["url"] == "$1"
+      assert del_ref["url"] == "$1"
+      assert get_ref["url"] == "$1/Contact_Account"
+    end
+
+    test "execute/3 with pre-encoded binary honors :format, :continue_on_error, and :return" do
+      parent = self()
+
+      plug = fn conn ->
+        send(
+          parent,
+          {:raw_batch, Plug.Conn.get_req_header(conn, "content-type"),
+           Plug.Conn.get_req_header(conn, "prefer")}
+        )
+
+        Req.Test.json(conn, %{"responses" => [%{"id" => "1", "status" => 200, "body" => %{}}]})
+      end
+
+      client = Creatio.Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      raw_json =
+        Jason.encode!(%{"requests" => [%{"id" => "1", "method" => "GET", "url" => "Contact"}]})
+
+      assert {:ok, [%Creatio.Batch.Response{id: "1", status: 200}]} =
+               Batch.execute(client, raw_json,
+                 format: :json,
+                 continue_on_error: true,
+                 return: :minimal
+               )
+
+      assert_receive {:raw_batch,
+                      ["application/json; odata.metadata=minimal; IEEE754Compatible=true"],
+                      [prefer]}
+
+      assert prefer =~ "continue-on-error"
+      assert prefer =~ "return=minimal"
+    end
+
+    test "rejects trailing newlines and populates raw list defaults with continue_on_error override" do
+      assert_raise ArgumentError, ~r/invalid boundary/, fn ->
+        Batch.to_multipart(Batch.new() |> Batch.add_get("Contact"), boundary: "batch_1\n")
+      end
+
+      assert_raise ArgumentError, ~r/invalid atomicity_group/, fn ->
+        Batch.new() |> Batch.add_create("Contact", %{"Name" => "A"}, atomicity_group: "grp\n")
+      end
+
+      assert_raise ArgumentError, ~r/invalid batch header name/, fn ->
+        Batch.new() |> Batch.add("GET", "Contact", headers: %{"X-Test\n" => "v"})
+      end
+
+      parent = self()
+
+      raw_plug = fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+
+        send(
+          parent,
+          {:batch_payload, Jason.decode!(raw), Plug.Conn.get_req_header(conn, "prefer")}
+        )
+
+        Req.Test.json(conn, %{"responses" => [%{"id" => "req_1", "status" => 200, "body" => %{}}]})
+      end
+
+      raw_client =
+        Creatio.Client.new(base_url: "https://mycreatio.com", req_options: [plug: raw_plug])
+
+      assert {:ok, _} =
+               Batch.execute(raw_client, [
+                 %{url: "Contact"},
+                 %{method: :post, url: "Contact", body: %{"Name" => "Alice"}}
+               ])
+
+      assert_receive {:batch_payload, %{"requests" => [r1, r2]}, _}
+      assert r1["id"] == "req_1"
+      assert r1["method"] == "GET"
+      assert r1["headers"]["Accept"] == "application/json; odata.metadata=minimal"
+      assert r2["id"] == "req_2"
+      assert r2["method"] == "POST"
+      assert r2["headers"]["Content-Type"] =~ "application/json"
+
+      # continue_on_error: false overrides Batch.new(continue_on_error: true)
+      batch_coe =
+        Batch.new(continue_on_error: true)
+        |> Batch.add_get("Contact", "1", continue_on_error: false)
+
+      [op_no_coe] = Batch.requests(batch_coe)
+      refute Map.has_key?(op_no_coe["headers"], "Prefer")
+
+      assert {:ok, _} = Batch.execute(raw_client, batch_coe, continue_on_error: false)
+      assert_receive {:batch_payload, _, []}
+    end
+
+    test "normalizes Response.to_error/1 headers/status and rejects truncated, HTML, or -- multipart" do
+      # Response.to_error/1 normalizes headers to list values and non-integer status to nil
+      resp_item = %Response{
+        id: "1",
+        status: "not_a_code",
+        headers: %{"Content-Type" => "application/json", "x-req" => "abc"},
+        body: %{"error" => %{"message" => "Bad"}}
+      }
+
+      err = Response.to_error(resp_item)
+      assert err.status == nil
+      assert Req.Response.get_header(err.response, "content-type") == ["application/json"]
+      assert Req.Response.get_header(err.response, "x-req") == ["abc"]
+
+      # Truncated / HTML multipart responses return {:error, %Error{}}
+      assert {:error, %Error{}} =
+               Batch.parse_multipart_response(
+                 "--batch_1\r\nContent-Type: application/http\r\n\r\nHTTP/1.1 200 OK\r\n",
+                 "batch_1"
+               )
+
+      assert {:error, %Error{}} =
+               Batch.parse_multipart_response("<html><body>WAF</body></html>", "batch_1")
+
+      assert {:error, %Error{}} = Batch.parse_multipart_response("-- not a valid multipart")
+
+      # BOM-only empty 200 batch response returns {:ok, []}
+      bom_empty_client =
+        Creatio.Client.new(
+          base_url: "https://mycreatio.com",
+          req_options: [plug: fn conn -> Plug.Conn.send_resp(conn, 200, "\uFEFF   ") end]
+        )
+
+      assert {:ok, []} = Batch.execute(bom_empty_client, Batch.new() |> Batch.add_get("Contact"))
+    end
+
+    test "preserves mixed-case multipart boundaries, classifies string 2xx statuses, and rejects malformed JSON responses" do
+      mixed_body =
+        "--batchresponse_AbCd123\r\n" <>
+          "Content-Type: application/http\r\n" <>
+          "Content-ID: 1\r\n\r\n" <>
+          "HTTP/1.1 200 OK\r\n" <>
+          "Content-Type: application/json\r\n\r\n" <>
+          ~s({"Id":"1"}) <>
+          "\r\n--batchresponse_AbCd123--\r\n"
+
+      mixed_plug = fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header(
+          "content-type",
+          "multipart/mixed; boundary=batchresponse_AbCd123"
+        )
+        |> Plug.Conn.send_resp(200, mixed_body)
+      end
+
+      client =
+        Creatio.Client.new(base_url: "https://mycreatio.com", req_options: [plug: mixed_plug])
+
+      assert {:ok, [%Response{id: "1", status: 200, body: %{"Id" => "1"}}]} =
+               Batch.execute(client, Batch.new() |> Batch.add_get("Contact"))
+
+      assert Response.success?(%Response{status: "200"}) == true
+      assert Response.error?(%Response{status: "200"}) == false
+      assert Response.success?(%Response{status: "204"}) == true
+      assert Response.error?(%Response{status: "404"}) == true
+
+      for malformed_body <- [%{"responses" => nil}, %{"responses" => ["not_a_map"]}] do
+        bad_plug = fn conn -> Req.Test.json(conn, malformed_body) end
+
+        bad_client =
+          Creatio.Client.new(base_url: "https://mycreatio.com", req_options: [plug: bad_plug])
+
+        assert {:error, %Error{status: 200}} =
+                 Batch.execute(bad_client, Batch.new() |> Batch.add_get("Contact"))
+      end
     end
   end
 end

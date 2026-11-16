@@ -37,6 +37,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Strict Validation & Response Hardening**: Enforced strict identifier/GUID/URL validation, path-traversal guards in `read_only: true`, and HTML/WAF/IIS `text/html` JSON response guards across OData 4, OData 3, Auth, Batch, and DataService.
 - **Tightened Dependency Upper Bound**: Updated `:req` dependency constraint from `>= 0.5.0` to `~> 0.5`.
 
+### Fixed
+
+- **Client, `Req` Pipeline & Read-Only Guard (`Creatio.Client`, `Creatio.Auth`)**:
+  - Removed `:read_only_guard` from both `request_steps` and `current_request_steps` when disabling `read_only` (preventing `KeyError`), enforced `POST`-only method and case-insensitive `/0/rest/` and `/odata/$batch` checks in `read_only_guard/1`, trimmed env/option credentials and `put_bearer_token/2`, and stripped UTF-8 BOMs in `:creatio_strip_json_bom` before `Req` JSON decoding.
+  - Preserved `Accept: application/json` and non-blank fallback messages in `Auth.login_forms/4`, respected `Set-Cookie` `; Path` / `Max-Age` attributes when filtering expired cookies, and checked OIDC/health responses via `decode_body: false` and error-envelope detection.
+- **Telemetry & Redaction (`Creatio.Telemetry`)**:
+  - Fixed `.ASPXAUTH=` regex boundary matching, sanitized string-keyed metadata tuple lists and improper Erlang/Mint lists without crashing `span/3`, and ordered `:creatio_telemetry` after `:encode_body` and `:put_base_url` so encoding failures do not orphan `:start` spans.
+- **Pagination, Query Validation, OData, Batch & Error Parsing (`Creatio.OData`, `Creatio.OData3`, `Creatio.Batch`, `Creatio.DataService`, `Creatio.Error`, and internal utilities)**:
+  - Fixed premature keyset cursor errors on final pages, enforced `(cursor_field, Id)` tie-breaking on intermediate pages, raised `ArgumentError` on invalid `:filter`, `:skip`, and `:page_size` inputs, and replaced PCRE `$` anchors with `\z` in boundary, query, and ISO cursor validation.
+  - Preserved ComplexType `"value"` payloads in `get_field/5`, delegated `nil` updates to `delete_field/5`, fixed struct/binary encoding in `update_field/6`, detected `200 OK` error payloads and OData 3 `"d"` error envelopes, capped streamed error bodies at 64 KB, and normalized raw `Batch.execute/3` requests and `Batch.Response.to_error/1` headers.
+  - Resolved Dialyzer contract mismatches in `Creatio.Batch.add_update/3` and `Creatio.Batch.add_delete/2`.
+
 ### Upgrading from 0.4.x to 1.0.0
 
 1. **`stream/3` and `odata3_stream/3` now emit `{:ok, record}` tuples:**
