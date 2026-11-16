@@ -70,6 +70,9 @@ defmodule Creatio do
   alias Creatio.{Auth, Batch, Client, DataService, Error, OData, OData3}
   alias Creatio.OData.Query
 
+  @type record_id :: String.t() | integer() | atom()
+  @type opts :: keyword() | map()
+
   @doc """
   Builds a new `Creatio.Client`.
 
@@ -97,7 +100,7 @@ defmodule Creatio do
   @doc """
   Authenticates via Forms authentication using username and password.
   """
-  @spec login(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) ::
+  @spec login(Client.t() | Req.Request.t(), String.t(), String.t(), opts()) ::
           {:ok, Client.t()} | {:error, Error.t()}
   defdelegate login(client_or_req, username, password, opts \\ []), to: Auth, as: :login_forms
 
@@ -110,14 +113,14 @@ defmodule Creatio do
   @doc """
   Checks OAuth health endpoint (`/0/api/OAuthHealthCheck`).
   """
-  @spec oauth_health_check(Client.t(), keyword()) ::
+  @spec oauth_health_check(Client.t(), opts()) ::
           {:ok, map() | String.t()} | {:error, Error.t()}
   defdelegate oauth_health_check(client, opts \\ []), to: Auth
 
   @doc """
   Retrieves OpenID configuration (`/.well-known/openid-configuration`).
   """
-  @spec openid_configuration(Client.t() | String.t(), keyword()) ::
+  @spec openid_configuration(Client.t() | String.t(), opts()) ::
           {:ok, map()} | {:error, Error.t()}
   defdelegate openid_configuration(url_or_client, opts \\ []), to: Auth
 
@@ -130,19 +133,52 @@ defmodule Creatio do
   @doc """
   Initializes a new `Creatio.Batch` request.
   """
-  @spec batch_new(keyword()) :: Batch.t()
+  @spec batch_new(opts()) :: Batch.t()
   def batch_new(opts \\ []), do: Batch.new(opts)
+
+  @doc """
+  Adds a generic sub-request to a `Creatio.Batch`.
+  """
+  @spec batch_add(Batch.t(), String.t() | atom(), String.t(), opts()) :: Batch.t()
+  defdelegate batch_add(batch, method, url, opts \\ []), to: Batch, as: :add
+
+  @doc """
+  Adds an OData `GET` operation to a `Creatio.Batch`.
+  """
+  @spec batch_get(Batch.t(), String.t()) :: Batch.t()
+  @spec batch_get(Batch.t(), String.t(), opts() | record_id()) :: Batch.t()
+  @spec batch_get(Batch.t(), String.t(), record_id(), opts()) :: Batch.t()
+  defdelegate batch_get(batch, entity_or_path, opts_or_id \\ []), to: Batch, as: :add_get
+  defdelegate batch_get(batch, entity, id, opts), to: Batch, as: :add_get
+
+  @doc """
+  Adds an OData `POST` creation operation to a `Creatio.Batch`.
+  """
+  @spec batch_create(Batch.t(), String.t(), map(), opts()) :: Batch.t()
+  defdelegate batch_create(batch, entity, attrs, opts \\ []), to: Batch, as: :add_create
+
+  @doc """
+  Adds an OData `PATCH` update operation to a `Creatio.Batch`.
+  """
+  @spec batch_update(Batch.t(), String.t(), record_id(), map(), opts()) :: Batch.t()
+  defdelegate batch_update(batch, entity, id, attrs, opts \\ []), to: Batch, as: :add_update
+
+  @doc """
+  Adds an OData `DELETE` operation to a `Creatio.Batch`.
+  """
+  @spec batch_delete(Batch.t(), String.t(), record_id(), opts()) :: Batch.t()
+  defdelegate batch_delete(batch, entity, id, opts \\ []), to: Batch, as: :add_delete
 
   @doc """
   Serializes a batch to `{boundary, iodata}` without intermediate binary copying.
   """
-  @spec batch_to_multipart_iodata(Batch.t(), keyword()) :: {String.t(), iodata()}
+  @spec batch_to_multipart_iodata(Batch.t(), opts()) :: {String.t(), iodata()}
   defdelegate batch_to_multipart_iodata(batch, opts \\ []), to: Batch, as: :to_multipart_iodata
 
   @doc """
   Serializes a batch to a multipart/mixed MIME body string. Returns `{boundary, body}`.
   """
-  @spec batch_to_multipart(Batch.t(), keyword()) :: {String.t(), String.t()}
+  @spec batch_to_multipart(Batch.t(), opts()) :: {String.t(), String.t()}
   defdelegate batch_to_multipart(batch, opts \\ []), to: Batch, as: :to_multipart
 
   @doc """
@@ -207,14 +243,14 @@ defmodule Creatio do
   @doc """
   Retrieves a single entity by its primary ID (`GET /0/odata/{Entity}({id})`).
   """
-  @spec get(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) ::
+  @spec get(Client.t() | Req.Request.t(), String.t(), record_id(), opts()) ::
           {:ok, map()} | {:error, Error.t()}
   defdelegate get(client, entity, id, opts \\ []), to: OData
 
   @doc """
   Same as `get/4`, raising `Creatio.Error` on failure.
   """
-  @spec get!(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) :: map()
+  @spec get!(Client.t() | Req.Request.t(), String.t(), record_id(), opts()) :: map()
   defdelegate get!(client, entity, id, opts \\ []), to: OData
 
   @doc """
@@ -223,9 +259,9 @@ defmodule Creatio do
   @spec get_navigation(
           Client.t() | Req.Request.t(),
           String.t(),
+          record_id(),
           String.t(),
-          String.t(),
-          keyword()
+          opts()
         ) ::
           {:ok, any()} | {:error, Error.t()}
   defdelegate get_navigation(client, entity, id, nav_property, opts \\ []), to: OData
@@ -236,23 +272,23 @@ defmodule Creatio do
   @spec get_navigation!(
           Client.t() | Req.Request.t(),
           String.t(),
+          record_id(),
           String.t(),
-          String.t(),
-          keyword()
+          opts()
         ) :: any()
   defdelegate get_navigation!(client, entity, id, nav_property, opts \\ []), to: OData
 
   @doc """
   Retrieves a specific field value by ID (`GET /0/odata/{Entity}({id})/{Field}`).
   """
-  @spec get_field(Client.t() | Req.Request.t(), String.t(), String.t(), String.t(), keyword()) ::
+  @spec get_field(Client.t() | Req.Request.t(), String.t(), record_id(), String.t(), opts()) ::
           {:ok, any()} | {:error, Error.t()}
   defdelegate get_field(client, entity, id, field_name, opts \\ []), to: OData
 
   @doc """
   Same as `get_field/5`, raising `Creatio.Error` on failure.
   """
-  @spec get_field!(Client.t() | Req.Request.t(), String.t(), String.t(), String.t(), keyword()) ::
+  @spec get_field!(Client.t() | Req.Request.t(), String.t(), record_id(), String.t(), opts()) ::
           any()
   defdelegate get_field!(client, entity, id, field_name, opts \\ []), to: OData
 
@@ -265,9 +301,9 @@ defmodule Creatio do
   @spec get_field_value(
           Client.t() | Req.Request.t(),
           String.t(),
+          record_id(),
           String.t(),
-          String.t(),
-          keyword() | map()
+          opts()
         ) :: {:ok, any()} | {:error, Error.t()}
   defdelegate get_field_value(client, entity, id, field_name, opts \\ []), to: OData
 
@@ -277,9 +313,9 @@ defmodule Creatio do
   @spec get_field_value!(
           Client.t() | Req.Request.t(),
           String.t(),
+          record_id(),
           String.t(),
-          String.t(),
-          keyword() | map()
+          opts()
         ) :: any()
   defdelegate get_field_value!(client, entity, id, field_name, opts \\ []), to: OData
 
@@ -308,14 +344,14 @@ defmodule Creatio do
 
   Pass `return: :minimal` to send `Prefer: return=minimal` and avoid echoing all columns back.
   """
-  @spec create(Client.t() | Req.Request.t(), String.t(), map(), keyword()) ::
+  @spec create(Client.t() | Req.Request.t(), String.t(), map(), opts()) ::
           {:ok, map()} | {:error, Error.t()}
   defdelegate create(client, entity, attrs, opts \\ []), to: OData
 
   @doc """
   Same as `create/4`, raising `Creatio.Error` on failure.
   """
-  @spec create!(Client.t() | Req.Request.t(), String.t(), map(), keyword()) :: map()
+  @spec create!(Client.t() | Req.Request.t(), String.t(), map(), opts()) :: map()
   defdelegate create!(client, entity, attrs, opts \\ []), to: OData
 
   @doc """
@@ -323,28 +359,28 @@ defmodule Creatio do
 
   Pass `return: :minimal` or `return: :representation` to control the `Prefer` header.
   """
-  @spec update(Client.t() | Req.Request.t(), String.t(), String.t(), map(), keyword()) ::
-          :ok | {:ok, map() | binary()} | {:error, Error.t()}
+  @spec update(Client.t() | Req.Request.t(), String.t(), record_id(), map(), opts()) ::
+          :ok | {:ok, map()} | {:error, Error.t()}
   defdelegate update(client, entity, id, attrs, opts \\ []), to: OData
 
   @doc """
   Same as `update/5`, raising `Creatio.Error` on failure.
   """
-  @spec update!(Client.t() | Req.Request.t(), String.t(), String.t(), map(), keyword()) ::
-          :ok | map() | binary()
+  @spec update!(Client.t() | Req.Request.t(), String.t(), record_id(), map(), opts()) ::
+          :ok | map()
   defdelegate update!(client, entity, id, attrs, opts \\ []), to: OData
 
   @doc """
   Deletes an entity record (`DELETE /0/odata/{Entity}({id})`).
   """
-  @spec delete(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) ::
+  @spec delete(Client.t() | Req.Request.t(), String.t(), record_id(), opts()) ::
           :ok | {:error, Error.t()}
   defdelegate delete(client, entity, id, opts \\ []), to: OData
 
   @doc """
   Same as `delete/4`, raising `Creatio.Error` on failure.
   """
-  @spec delete!(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) :: :ok
+  @spec delete!(Client.t() | Req.Request.t(), String.t(), record_id(), opts()) :: :ok
   defdelegate delete!(client, entity, id, opts \\ []), to: OData
 
   @doc """
@@ -353,10 +389,10 @@ defmodule Creatio do
   @spec update_field(
           Client.t() | Req.Request.t(),
           String.t(),
-          String.t(),
+          record_id(),
           String.t(),
           any(),
-          keyword()
+          opts()
         ) :: :ok | {:error, Error.t()}
   defdelegate update_field(client, entity, id, field_name, value, opts \\ []), to: OData
 
@@ -366,24 +402,24 @@ defmodule Creatio do
   @spec update_field!(
           Client.t() | Req.Request.t(),
           String.t(),
-          String.t(),
+          record_id(),
           String.t(),
           any(),
-          keyword()
+          opts()
         ) :: :ok
   defdelegate update_field!(client, entity, id, field_name, value, opts \\ []), to: OData
 
   @doc """
   Deletes a specific field value (`DELETE /0/odata/{Entity}({id})/{Field}`).
   """
-  @spec delete_field(Client.t() | Req.Request.t(), String.t(), String.t(), String.t(), keyword()) ::
+  @spec delete_field(Client.t() | Req.Request.t(), String.t(), record_id(), String.t(), opts()) ::
           :ok | {:error, Error.t()}
   defdelegate delete_field(client, entity, id, field_name, opts \\ []), to: OData
 
   @doc """
   Same as `delete_field/5`, raising `Creatio.Error` on failure.
   """
-  @spec delete_field!(Client.t() | Req.Request.t(), String.t(), String.t(), String.t(), keyword()) ::
+  @spec delete_field!(Client.t() | Req.Request.t(), String.t(), record_id(), String.t(), opts()) ::
           :ok
   defdelegate delete_field!(client, entity, id, field_name, opts \\ []), to: OData
 
@@ -392,7 +428,7 @@ defmodule Creatio do
   """
   @spec batch(Client.t() | Req.Request.t(), Batch.payload()) ::
           {:ok, list() | any()} | {:error, Error.t()}
-  @spec batch(Client.t() | Req.Request.t(), Batch.payload(), keyword()) ::
+  @spec batch(Client.t() | Req.Request.t(), Batch.payload(), opts()) ::
           {:ok, list() | any()} | {:error, Error.t()}
   defdelegate batch(client, batch_or_requests, opts \\ []), to: OData
 
@@ -401,7 +437,7 @@ defmodule Creatio do
   """
   @spec batch!(Client.t() | Req.Request.t(), Batch.payload()) ::
           list() | any()
-  @spec batch!(Client.t() | Req.Request.t(), Batch.payload(), keyword()) ::
+  @spec batch!(Client.t() | Req.Request.t(), Batch.payload(), opts()) ::
           list() | any()
   defdelegate batch!(client, batch_or_requests, opts \\ []), to: OData
 
@@ -589,14 +625,14 @@ defmodule Creatio do
   @doc """
   Retrieves an entity by ID via legacy OData 3.
   """
-  @spec odata3_get(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) ::
+  @spec odata3_get(Client.t() | Req.Request.t(), String.t(), record_id(), opts()) ::
           {:ok, map()} | {:error, Error.t()}
   defdelegate odata3_get(client, entity, id, opts \\ []), to: OData3, as: :get
 
   @doc """
   Same as `odata3_get/4`, raising `Creatio.Error` on failure.
   """
-  @spec odata3_get!(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) :: map()
+  @spec odata3_get!(Client.t() | Req.Request.t(), String.t(), record_id(), opts()) :: map()
   defdelegate odata3_get!(client, entity, id, opts \\ []), to: OData3, as: :get!
 
   @doc """
@@ -605,9 +641,9 @@ defmodule Creatio do
   @spec odata3_get_navigation(
           Client.t() | Req.Request.t(),
           String.t(),
+          record_id(),
           String.t(),
-          String.t(),
-          keyword()
+          opts()
         ) :: {:ok, any()} | {:error, Error.t()}
   defdelegate odata3_get_navigation(client, entity, id, nav_property, opts \\ []),
     to: OData3,
@@ -619,9 +655,9 @@ defmodule Creatio do
   @spec odata3_get_navigation!(
           Client.t() | Req.Request.t(),
           String.t(),
+          record_id(),
           String.t(),
-          String.t(),
-          keyword()
+          opts()
         ) :: any()
   defdelegate odata3_get_navigation!(client, entity, id, nav_property, opts \\ []),
     to: OData3,
@@ -633,9 +669,9 @@ defmodule Creatio do
   @spec odata3_get_field(
           Client.t() | Req.Request.t(),
           String.t(),
+          record_id(),
           String.t(),
-          String.t(),
-          keyword()
+          opts()
         ) :: {:ok, any()} | {:error, Error.t()}
   defdelegate odata3_get_field(client, entity, id, field_name, opts \\ []),
     to: OData3,
@@ -647,9 +683,9 @@ defmodule Creatio do
   @spec odata3_get_field!(
           Client.t() | Req.Request.t(),
           String.t(),
+          record_id(),
           String.t(),
-          String.t(),
-          keyword()
+          opts()
         ) :: any()
   defdelegate odata3_get_field!(client, entity, id, field_name, opts \\ []),
     to: OData3,
@@ -664,9 +700,9 @@ defmodule Creatio do
   @spec odata3_get_field_value(
           Client.t() | Req.Request.t(),
           String.t(),
+          record_id(),
           String.t(),
-          String.t(),
-          keyword() | map()
+          opts()
         ) :: {:ok, any()} | {:error, Error.t()}
   defdelegate odata3_get_field_value(client, entity, id, field_name, opts \\ []),
     to: OData3,
@@ -678,9 +714,9 @@ defmodule Creatio do
   @spec odata3_get_field_value!(
           Client.t() | Req.Request.t(),
           String.t(),
+          record_id(),
           String.t(),
-          String.t(),
-          keyword() | map()
+          opts()
         ) :: any()
   defdelegate odata3_get_field_value!(client, entity, id, field_name, opts \\ []),
     to: OData3,
@@ -692,7 +728,7 @@ defmodule Creatio do
   @spec odata3_count(
           Client.t() | Req.Request.t() | Query.t() | String.t(),
           String.t() | Query.t() | Client.t() | Req.Request.t(),
-          keyword() | map()
+          opts()
         ) :: {:ok, integer()} | {:error, Error.t()}
   defdelegate odata3_count(client_or_query, entity_or_client, opts \\ []),
     to: OData3,
@@ -704,7 +740,7 @@ defmodule Creatio do
   @spec odata3_count!(
           Client.t() | Req.Request.t() | Query.t() | String.t(),
           String.t() | Query.t() | Client.t() | Req.Request.t(),
-          keyword() | map()
+          opts()
         ) :: integer()
   defdelegate odata3_count!(client_or_query, entity_or_client, opts \\ []),
     to: OData3,
@@ -713,41 +749,41 @@ defmodule Creatio do
   @doc """
   Creates an entity via legacy OData 3.
   """
-  @spec odata3_create(Client.t() | Req.Request.t(), String.t(), map(), keyword()) ::
+  @spec odata3_create(Client.t() | Req.Request.t(), String.t(), map(), opts()) ::
           {:ok, map()} | {:error, Error.t()}
   defdelegate odata3_create(client, entity, attrs, opts \\ []), to: OData3, as: :create
 
   @doc """
   Same as `odata3_create/4`, raising `Creatio.Error` on failure.
   """
-  @spec odata3_create!(Client.t() | Req.Request.t(), String.t(), map(), keyword()) :: map()
+  @spec odata3_create!(Client.t() | Req.Request.t(), String.t(), map(), opts()) :: map()
   defdelegate odata3_create!(client, entity, attrs, opts \\ []), to: OData3, as: :create!
 
   @doc """
   Updates an entity via legacy OData 3.
   """
-  @spec odata3_update(Client.t() | Req.Request.t(), String.t(), String.t(), map(), keyword()) ::
-          :ok | {:ok, map() | binary()} | {:error, Error.t()}
+  @spec odata3_update(Client.t() | Req.Request.t(), String.t(), record_id(), map(), opts()) ::
+          :ok | {:ok, map()} | {:error, Error.t()}
   defdelegate odata3_update(client, entity, id, attrs, opts \\ []), to: OData3, as: :update
 
   @doc """
   Same as `odata3_update/5`, raising `Creatio.Error` on failure.
   """
-  @spec odata3_update!(Client.t() | Req.Request.t(), String.t(), String.t(), map(), keyword()) ::
-          :ok | map() | binary()
+  @spec odata3_update!(Client.t() | Req.Request.t(), String.t(), record_id(), map(), opts()) ::
+          :ok | map()
   defdelegate odata3_update!(client, entity, id, attrs, opts \\ []), to: OData3, as: :update!
 
   @doc """
   Deletes an entity via legacy OData 3.
   """
-  @spec odata3_delete(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) ::
+  @spec odata3_delete(Client.t() | Req.Request.t(), String.t(), record_id(), opts()) ::
           :ok | {:error, Error.t()}
   defdelegate odata3_delete(client, entity, id, opts \\ []), to: OData3, as: :delete
 
   @doc """
   Same as `odata3_delete/4`, raising `Creatio.Error` on failure.
   """
-  @spec odata3_delete!(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) :: :ok
+  @spec odata3_delete!(Client.t() | Req.Request.t(), String.t(), record_id(), opts()) :: :ok
   defdelegate odata3_delete!(client, entity, id, opts \\ []), to: OData3, as: :delete!
 
   @doc """

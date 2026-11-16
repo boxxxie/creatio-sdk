@@ -207,29 +207,78 @@ defmodule Creatio.Util do
   """
   @spec ok_void_response(Req.Response.t()) :: :ok | {:error, Error.t()}
   def ok_void_response(%Req.Response{} = raw_resp) do
-    resp = normalize_json_response(raw_resp)
+    case decode_api_response(raw_resp) do
+      {:html_or_xml, resp} ->
+        {:error, Error.from_response(resp)}
 
-    if html_or_xml_response?(resp) do
-      {:error, Error.from_response(resp)}
-    else
-      case resp.body do
-        nil ->
-          :ok
+      {:ok, resp} ->
+        case resp.body do
+          nil ->
+            :ok
 
-        bin when is_binary(bin) ->
-          if String.trim(bin) == "", do: :ok, else: {:error, Error.from_response(resp)}
+          bin when is_binary(bin) ->
+            if String.trim(bin) == "", do: :ok, else: {:error, Error.from_response(resp)}
 
-        %{"error" => _} ->
-          {:error, Error.from_response(resp)}
+          %{"error" => _} ->
+            {:error, Error.from_response(resp)}
 
-        %{} ->
-          :ok
+          %{} ->
+            :ok
 
-        _other ->
-          {:error, Error.from_response(resp)}
-      end
+          _other ->
+            {:error, Error.from_response(resp)}
+        end
     end
   end
+
+  @doc """
+  Normalizes a JSON response once and checks whether the response is HTML/XML or a WAF
+  interstitial without running `Jason.decode/1` a second time on invalid JSON payloads.
+  """
+  @spec decode_api_response(Req.Response.t()) ::
+          {:ok, Req.Response.t()} | {:html_or_xml, Req.Response.t()}
+  def decode_api_response(%Req.Response{body: body} = resp) when is_map(body) or is_list(body) do
+    {:ok, resp}
+  end
+
+  def decode_api_response(%Req.Response{body: body} = resp) when is_binary(body) do
+    size = byte_size(body)
+    start = skip_leading_ws_and_bom(body, 0, size)
+
+    cond do
+      start >= size ->
+        {:ok, resp}
+
+      :binary.at(body, start) in [?{, ?[] ->
+        case decode_json_slice(body, start, size) do
+          {:ok, decoded} when is_map(decoded) or is_list(decoded) ->
+            {:ok, %Req.Response{resp | body: decoded}}
+
+          {:ok, decoded} ->
+            normalized = %Req.Response{resp | body: decoded}
+
+            if html_or_xml_content_type?(resp.headers),
+              do: {:html_or_xml, normalized},
+              else: {:ok, normalized}
+
+          :error ->
+            if html_or_xml_markup_or_ct?(resp, body, start, size) do
+              {:html_or_xml, resp}
+            else
+              {:ok, resp}
+            end
+        end
+
+      true ->
+        if html_or_xml_markup_or_ct?(resp, body, start, size) do
+          {:html_or_xml, resp}
+        else
+          {:ok, resp}
+        end
+    end
+  end
+
+  def decode_api_response(%Req.Response{} = resp), do: {:ok, resp}
 
   @doc """
   Decodes JSON object or array responses even when Creatio/IIS returns a non-JSON
@@ -241,14 +290,9 @@ defmodule Creatio.Util do
     start = skip_leading_ws_and_bom(body, 0, size)
 
     if start < size and :binary.at(body, start) in [?{, ?[] do
-      trimmed =
-        body
-        |> binary_part(start, size - start)
-        |> String.trim_trailing()
-
-      case Jason.decode(trimmed) do
+      case decode_json_slice(body, start, size) do
         {:ok, decoded} -> %Req.Response{resp | body: decoded}
-        _ -> resp
+        :error -> resp
       end
     else
       resp
@@ -297,7 +341,7 @@ defmodule Creatio.Util do
   def html_or_xml_response?(%Req.Response{body: body}) when is_map(body) or is_list(body),
     do: false
 
-  def html_or_xml_response?(%Req.Response{body: body, headers: headers}) when is_binary(body) do
+  def html_or_xml_response?(%Req.Response{body: body} = resp) when is_binary(body) do
     size = byte_size(body)
     start = skip_leading_ws_and_bom(body, 0, size)
 
@@ -307,42 +351,40 @@ defmodule Creatio.Util do
       if :binary.at(body, start) in [?{, ?[] and json_object_or_array?(body, start, size) do
         false
       else
-        prefix_down =
-          body
-          |> binary_part(start, min(size - start, 512))
-          |> String.downcase()
-
-        content_type =
-          headers
-          |> response_header("content-type")
-          |> then(&((&1 && String.downcase(&1)) || ""))
-
-        html_ct? =
-          String.contains?(content_type, [
-            "text/html",
-            "application/xhtml",
-            "text/xml",
-            "application/xml"
-          ])
-
-        String.starts_with?(prefix_down, @html_xml_prefixes) or
-          has_waf_marker?(body) or
-          html_ct?
+        html_or_xml_markup_or_ct?(resp, body, start, size)
       end
     end
   end
 
   def html_or_xml_response?(_), do: false
 
+  defp html_or_xml_markup_or_ct?(%Req.Response{headers: headers}, body, start, size) do
+    prefix_down =
+      body
+      |> binary_part(start, min(size - start, 512))
+      |> String.downcase()
+
+    String.starts_with?(prefix_down, @html_xml_prefixes) or
+      has_waf_marker?(body) or
+      html_or_xml_content_type?(headers)
+  end
+
   defp json_object_or_array?(body, start, size) do
+    case decode_json_slice(body, start, size) do
+      {:ok, decoded} when is_map(decoded) or is_list(decoded) -> true
+      _ -> false
+    end
+  end
+
+  defp decode_json_slice(body, start, size) do
     trimmed =
       body
       |> binary_part(start, size - start)
       |> String.trim_trailing()
 
     case Jason.decode(trimmed) do
-      {:ok, decoded} when is_map(decoded) or is_list(decoded) -> true
-      _ -> false
+      {:ok, decoded} -> {:ok, decoded}
+      _ -> :error
     end
   end
 
@@ -436,6 +478,9 @@ defmodule Creatio.Util do
         {:params, list} when is_list(list) ->
           Enum.reduce(list, acc, fn {k, v}, a -> Map.put(a, to_string(k), to_string(v)) end)
 
+        {:ignore, _} ->
+          acc
+
         {key, list} when is_binary(key) and is_list(list) ->
           Map.put(acc, key, Enum.map_join(list, ",", &to_string/1))
 
@@ -464,6 +509,11 @@ defmodule Creatio.Util do
   defp normalize_odata_opt_key("count"), do: :count
   defp normalize_odata_opt_key("inlinecount"), do: :inlinecount
   defp normalize_odata_opt_key("params"), do: :params
+  defp normalize_odata_opt_key("req_options"), do: :ignore
+  defp normalize_odata_opt_key("return"), do: :ignore
+  defp normalize_odata_opt_key("strategy"), do: :ignore
+  defp normalize_odata_opt_key("content_type"), do: :ignore
+  defp normalize_odata_opt_key("raw"), do: :ignore
   defp normalize_odata_opt_key(other), do: other
 
   defp format_orderby_opt(val) when is_list(val) do
@@ -753,35 +803,82 @@ defmodule Creatio.Util do
     query_params = if is_binary(base_target), do: %{}, else: Query.to_params(base_target)
     base_filter = Keyword.get(base_opts, :filter) || query_params["$filter"]
 
+    requested_orderby = Keyword.get(base_opts, :orderby) || query_params["$orderby"]
+    {orderby, cursor_op} = resolve_cursor_orderby!(cursor_field, requested_orderby)
+
     combined_filter =
       case {base_filter, state.cursor} do
         {f, nil} ->
           f
 
         {nil, cur} ->
-          cursor_predicate(cursor_field, cur, protocol)
+          cursor_predicate(cursor_field, cur, protocol, cursor_op)
 
         {"", cur} ->
-          cursor_predicate(cursor_field, cur, protocol)
+          cursor_predicate(cursor_field, cur, protocol, cursor_op)
 
         {f, cur} ->
-          "(#{f}) and (#{cursor_predicate(cursor_field, cur, protocol)})"
+          "(#{f}) and (#{cursor_predicate(cursor_field, cur, protocol, cursor_op)})"
       end
-
-    default_orderby =
-      if cursor_field == "Id" do
-        "Id asc"
-      else
-        "#{cursor_field} asc, Id asc"
-      end
-
-    orderby = Keyword.get(base_opts, :orderby) || query_params["$orderby"] || default_orderby
 
     base_opts
     |> Keyword.put(:top, fetch_size)
     |> Keyword.put(:orderby, orderby)
     |> maybe_put_kw(:filter, combined_filter)
   end
+
+  defp resolve_cursor_orderby!(cursor_field, nil),
+    do: {default_cursor_orderby(cursor_field, :asc), "gt"}
+
+  defp resolve_cursor_orderby!(cursor_field, requested) do
+    formatted = format_orderby_opt(requested)
+
+    if is_nil(formatted) or String.trim(formatted) == "" do
+      {default_cursor_orderby(cursor_field, :asc), "gt"}
+    else
+      clauses =
+        formatted
+        |> String.split(",", trim: true)
+        |> Enum.map(&parse_orderby_clause/1)
+
+      case clauses do
+        [{^cursor_field, dir}] ->
+          {default_cursor_orderby(cursor_field, dir), dir_to_cursor_op(dir)}
+
+        [{^cursor_field, dir}, {"Id", dir}] when cursor_field != "Id" ->
+          {default_cursor_orderby(cursor_field, dir), dir_to_cursor_op(dir)}
+
+        _ ->
+          raise ArgumentError,
+                "keyset pagination with cursor_field #{inspect(cursor_field)} requires :orderby to start with #{cursor_field} (and optional Id tie-breaker in the same direction), got: #{inspect(requested)}"
+      end
+    end
+  end
+
+  defp parse_orderby_clause(clause) do
+    case String.split(String.trim(clause), ~r/\s+/, trim: true) do
+      [field] ->
+        {field, :asc}
+
+      [field, dir] ->
+        case String.downcase(dir) do
+          "asc" -> {field, :asc}
+          "desc" -> {field, :desc}
+          _ -> {field, :invalid}
+        end
+
+      _ ->
+        {"", :invalid}
+    end
+  end
+
+  defp default_cursor_orderby("Id", :asc), do: "Id asc"
+  defp default_cursor_orderby("Id", :desc), do: "Id desc"
+  defp default_cursor_orderby(cursor_field, :asc), do: "#{cursor_field} asc, Id asc"
+  defp default_cursor_orderby(cursor_field, :desc), do: "#{cursor_field} desc, Id desc"
+
+  defp dir_to_cursor_op(:asc), do: "gt"
+  defp dir_to_cursor_op(:desc), do: "lt"
 
   defp ensure_cursor_select_in_opts(opts, nil), do: opts
 
@@ -827,23 +924,23 @@ defmodule Creatio.Util do
     Enum.join(parts ++ missing, ",")
   end
 
-  defp cursor_predicate(cursor_field, {:composite_cursor, cur_val, cur_id}, protocol) do
-    build_composite_cursor_predicate(cursor_field, cur_val, cur_id, protocol)
+  defp cursor_predicate(cursor_field, {:composite_cursor, cur_val, cur_id}, protocol, cursor_op) do
+    build_composite_cursor_predicate(cursor_field, cur_val, cur_id, protocol, cursor_op)
   end
 
-  defp cursor_predicate(cursor_field, {cur_val, cur_id}, protocol) do
-    build_composite_cursor_predicate(cursor_field, cur_val, cur_id, protocol)
+  defp cursor_predicate(cursor_field, {cur_val, cur_id}, protocol, cursor_op) do
+    build_composite_cursor_predicate(cursor_field, cur_val, cur_id, protocol, cursor_op)
   end
 
-  defp cursor_predicate(cursor_field, cur_val, protocol) do
-    "#{cursor_field} gt #{format_cursor(cur_val, protocol)}"
+  defp cursor_predicate(cursor_field, cur_val, protocol, cursor_op) do
+    "#{cursor_field} #{cursor_op} #{format_cursor(cur_val, protocol)}"
   end
 
-  defp build_composite_cursor_predicate(cursor_field, cur_val, cur_id, protocol) do
+  defp build_composite_cursor_predicate(cursor_field, cur_val, cur_id, protocol, cursor_op) do
     formatted_val = format_cursor(cur_val, protocol)
     formatted_id = format_cursor(cur_id, protocol)
 
-    "(#{cursor_field} gt #{formatted_val} or (#{cursor_field} eq #{formatted_val} and Id gt #{formatted_id}))"
+    "(#{cursor_field} #{cursor_op} #{formatted_val} or (#{cursor_field} eq #{formatted_val} and Id #{cursor_op} #{formatted_id}))"
   end
 
   defp strip_query_filter_if_overridden(entity, _cursor_field) when is_binary(entity), do: entity
@@ -873,7 +970,12 @@ defmodule Creatio.Util do
       {:halt, nil}
     else
       last_record = List.last(emitted)
-      cursor_val = cursor_field && is_map(last_record) && Map.get(last_record, cursor_field)
+
+      cursor_val =
+        case {cursor_field, last_record} do
+          {field, %{} = rec} when is_binary(field) -> Map.get(rec, field)
+          _ -> nil
+        end
 
       if cursor_field != nil and is_nil(cursor_val) do
         err =
@@ -1074,7 +1176,8 @@ defmodule Creatio.Util do
         {:ok, nil}
 
       {:ok, %{status: status, body: body} = resp} when status in [200, 206] ->
-        if html_or_xml_response?(resp) do
+        if Map.get(resp.private, :creatio_stream_rejected) == true or
+             html_or_xml_response?(resp) or json_error_envelope?(resp) do
           {:error, Error.from_response(resp)}
         else
           {:ok, body || ""}
@@ -1087,6 +1190,28 @@ defmodule Creatio.Util do
         Error.wrap_error(exception)
     end
   end
+
+  defp json_error_envelope?(%Req.Response{body: body, headers: headers})
+       when is_binary(body) do
+    if html_or_xml_content_type?(headers) and starts_with_json_delimiter?(body) do
+      size = byte_size(body)
+      start = skip_leading_ws_and_bom(body, 0, size)
+
+      case decode_json_slice(body, start, size) do
+        {:ok, %{"error" => _}} -> true
+        {:ok, %{"errorInfo" => %{} = info}} when map_size(info) > 0 -> true
+        {:ok, %{"ErrorInfo" => %{} = info}} when map_size(info) > 0 -> true
+        {:ok, %{"Exception" => %{} = ex}} when map_size(ex) > 0 -> true
+        {:ok, %{"success" => val}} when val in [false, "false"] -> true
+        {:ok, %{"Success" => val}} when val in [false, "false"] -> true
+        _ -> false
+      end
+    else
+      false
+    end
+  end
+
+  defp json_error_envelope?(_), do: false
 
   defp execute_field_value_get(req, req_opts, sink)
        when not is_nil(sink) and not is_function(sink, 2) and
@@ -1102,12 +1227,14 @@ defmodule Creatio.Util do
     state_ref = make_ref()
 
     into_fun = fn {:data, chunk}, {req_acc, %Req.Response{status: status} = resp_acc} ->
+      {attempt_ref, %Req.Response{} = resp_acc} = ensure_stream_attempt(state_ref, resp_acc)
+
       cond do
         status == 204 ->
           {:cont, {req_acc, resp_acc}}
 
         status in [200, 206] ->
-          handle_collectable_chunk(state_ref, collectable, chunk, req_acc, resp_acc)
+          handle_collectable_chunk(state_ref, attempt_ref, collectable, chunk, req_acc, resp_acc)
 
         true ->
           current_body = if is_binary(resp_acc.body), do: resp_acc.body, else: ""
@@ -1127,24 +1254,48 @@ defmodule Creatio.Util do
           other
       end
     after
-      case Process.delete(state_ref) do
-        {:opened, acc, collector} -> collector.(acc, :halt)
-        _ -> :ok
-      end
+      halt_and_delete_collector(state_ref)
+    end
+  end
+
+  defp ensure_stream_attempt(state_ref, %Req.Response{private: private} = resp_acc) do
+    case Map.get(private, :creatio_stream_attempt) do
+      nil ->
+        attempt_ref = make_ref()
+        halt_and_delete_collector(state_ref)
+        Process.put(state_ref, {attempt_ref, nil})
+        {attempt_ref, Req.Response.put_private(resp_acc, :creatio_stream_attempt, attempt_ref)}
+
+      attempt_ref ->
+        {attempt_ref, resp_acc}
+    end
+  end
+
+  defp halt_and_delete_collector(state_ref) do
+    case Process.delete(state_ref) do
+      {_attempt_ref, {:opened, acc, collector}} -> collector.(acc, :halt)
+      _ -> :ok
     end
   end
 
   defp handle_collectable_chunk(
          state_ref,
+         attempt_ref,
          collectable,
          chunk,
          req_acc,
          %Req.Response{} = resp_acc
        ) do
-    case Process.get(state_ref) do
+    current_state =
+      case Process.get(state_ref) do
+        {^attempt_ref, state} -> state
+        _ -> nil
+      end
+
+    case current_state do
       {:opened, acc, collector} ->
         next_acc = collector.(acc, {:cont, chunk})
-        Process.put(state_ref, {:opened, next_acc, collector})
+        Process.put(state_ref, {attempt_ref, {:opened, next_acc, collector}})
         {:cont, {req_acc, resp_acc}}
 
       :rejected ->
@@ -1163,38 +1314,58 @@ defmodule Creatio.Util do
         probe_resp = %Req.Response{resp_acc | body: combined}
 
         cond do
-          waf_or_html_stream_prefix?(probe_resp, combined) ->
-            Process.put(state_ref, :rejected)
-            {:cont, {req_acc, %Req.Response{resp_acc | body: combined}}}
+          waf_or_html_stream_prefix?(probe_resp) ->
+            Process.put(state_ref, {attempt_ref, :rejected})
+
+            rejected_resp =
+              %Req.Response{resp_acc | body: combined}
+              |> Req.Response.put_private(:creatio_stream_rejected, true)
+
+            {:cont, {req_acc, rejected_resp}}
 
           byte_size(combined) >= 1024 ->
             {acc, collector} = Collectable.into(collectable)
-            Process.put(state_ref, {:opened, acc, collector})
+            Process.put(state_ref, {attempt_ref, {:opened, acc, collector}})
             next_acc = collector.(acc, {:cont, combined})
-            Process.put(state_ref, {:opened, next_acc, collector})
+            Process.put(state_ref, {attempt_ref, {:opened, next_acc, collector}})
             {:cont, {req_acc, resp_acc}}
 
           true ->
-            Process.put(state_ref, {:pending, combined})
+            Process.put(state_ref, {attempt_ref, {:pending, combined}})
             {:cont, {req_acc, resp_acc}}
         end
     end
   end
 
   defp finalize_gated_collectable(state_ref, collectable, %Req.Response{} = resp) do
-    case Process.delete(state_ref) do
+    resp_attempt = Map.get(resp.private, :creatio_stream_attempt)
+
+    entry =
+      case Process.delete(state_ref) do
+        {^resp_attempt, state} when not is_nil(resp_attempt) ->
+          state
+
+        {_other_attempt, {:opened, old_acc, old_collector}} ->
+          old_collector.(old_acc, :halt)
+          nil
+
+        _ ->
+          nil
+      end
+
+    case entry do
       {:opened, acc, collector} ->
         final_body = collector.(acc, :done)
         {:ok, %Req.Response{resp | body: final_body}}
 
       :rejected ->
-        {:ok, resp}
+        {:ok, Req.Response.put_private(resp, :creatio_stream_rejected, true)}
 
       {:pending, buf} ->
         probe_resp = %Req.Response{resp | body: buf}
 
-        if html_or_xml_response?(probe_resp) do
-          {:ok, probe_resp}
+        if html_or_xml_response?(probe_resp) or json_error_envelope?(probe_resp) do
+          {:ok, Req.Response.put_private(probe_resp, :creatio_stream_rejected, true)}
         else
           {acc, collector} = Collectable.into(collectable)
 
@@ -1218,9 +1389,8 @@ defmodule Creatio.Util do
     end
   end
 
-  defp waf_or_html_stream_prefix?(%Req.Response{headers: headers} = resp, combined) do
-    html_or_xml_markup?(resp) or
-      (html_or_xml_content_type?(headers) and not starts_with_json_delimiter?(combined))
+  defp waf_or_html_stream_prefix?(%Req.Response{headers: headers} = resp) do
+    html_or_xml_markup?(resp) or html_or_xml_content_type?(headers)
   end
 
   defp html_or_xml_content_type?(headers) do
@@ -1297,7 +1467,155 @@ defmodule Creatio.Util do
     |> Keyword.drop(drop_keys)
   end
 
-  defp to_keyword_opts(list) when is_list(list) do
+  @doc false
+  @spec prepare_req_call(Req.Request.t(), keyword() | map(), keyword(), map(), [atom()]) ::
+          {Req.Request.t(), keyword()}
+  def prepare_req_call(
+        %Req.Request{} = req,
+        opts,
+        call_opts,
+        params \\ %{},
+        drop_keys \\ [:url, :method]
+      ) do
+    raw_req_opts = extract_req_options(opts, drop_keys)
+    {req_headers_list, extra_req_opts} = Keyword.pop_values(raw_req_opts, :headers)
+    {req_params_list, extra_req_opts} = Keyword.pop_values(extra_req_opts, :params)
+
+    req_with_headers = Enum.reduce(req_headers_list, req, &maybe_merge_headers(&2, &1))
+    merged_params = merge_query_params_list(req_params_list, params)
+
+    merged_call_opts =
+      if merged_params == %{} or merged_params == [] do
+        Keyword.merge(extra_req_opts, call_opts)
+      else
+        Keyword.merge(extra_req_opts, Keyword.put(call_opts, :params, merged_params))
+      end
+
+    {req_with_headers, merged_call_opts}
+  end
+
+  @doc false
+  @spec pop_opt(keyword() | map(), atom()) :: {any(), keyword() | map()}
+  def pop_opt(opts, key) when is_list(opts), do: Keyword.pop(opts, key)
+
+  def pop_opt(opts, key) when is_map(opts) do
+    str_key = Atom.to_string(key)
+
+    case Map.pop(opts, key) do
+      {nil, map_after} ->
+        if Map.has_key?(opts, key) do
+          {nil, Map.delete(map_after, str_key)}
+        else
+          Map.pop(map_after, str_key)
+        end
+
+      {val, map_after} ->
+        {val, Map.delete(map_after, str_key)}
+    end
+  end
+
+  @doc false
+  @spec drop_opt(keyword() | map(), atom()) :: keyword() | map()
+  def drop_opt(opts, key) when is_list(opts), do: Keyword.drop(opts, [key, Atom.to_string(key)])
+  def drop_opt(opts, key) when is_map(opts), do: Map.drop(opts, [key, Atom.to_string(key)])
+
+  @doc false
+  @spec put_opt(keyword() | map(), atom(), any()) :: keyword() | map()
+  def put_opt(opts, key, val) when is_list(opts), do: Keyword.put(opts, key, val)
+
+  def put_opt(opts, key, val) when is_map(opts) do
+    opts
+    |> Map.delete(Atom.to_string(key))
+    |> Map.put(key, val)
+  end
+
+  @doc false
+  @spec safe_normalized_path(String.t() | nil) :: {:ok, String.t()} | {:error, :invalid_path}
+  def safe_normalized_path(nil), do: {:ok, ""}
+
+  def safe_normalized_path(path) when is_binary(path) do
+    if String.contains?(path, ["\\", "\r", "\n", <<0>>]) do
+      {:error, :invalid_path}
+    else
+      decoded = URI.decode(path)
+
+      if String.contains?(decoded, ["\\", "%", "..", "\r", "\n", <<0>>]) do
+        {:error, :invalid_path}
+      else
+        segments = String.split(decoded, "/")
+
+        if Enum.any?(segments, &(&1 in [".", ".."])) do
+          {:error, :invalid_path}
+        else
+          {:ok, Regex.replace(~r{/+}, decoded, "/")}
+        end
+      end
+    end
+  end
+
+  def safe_normalized_path(_), do: {:error, :invalid_path}
+
+  @doc false
+  @spec validate_crm_url(any(), String.t() | nil, String.t()) ::
+          {:ok, String.t()} | {:error, Error.t()}
+  def validate_crm_url(url, base_url, label \\ "CRM request URL")
+
+  def validate_crm_url(url, base_url, label) when is_binary(url) do
+    trimmed = String.trim(url)
+
+    if trimmed == "" or String.contains?(trimmed, ["\r", "\n", <<0>>]) do
+      {:error, Error.new(message: "Invalid #{label}: #{inspect(url)}")}
+    else
+      authority_and_path = trimmed |> String.split(["?", "#"], parts: 2) |> hd()
+
+      if String.starts_with?(trimmed, ["//", "\\"]) or
+           String.contains?(authority_and_path, "\\") do
+        {:error, Error.new(message: "Invalid #{label}: #{inspect(url)}")}
+      else
+        uri = URI.parse(trimmed)
+
+        has_origin? =
+          not is_nil(uri.scheme) or not is_nil(uri.host) or String.contains?(trimmed, "://")
+
+        cond do
+          has_origin? and
+              not (uri.scheme in ["http", "https"] and is_binary(uri.host) and uri.host != "" and
+                     is_nil(uri.userinfo) and is_binary(base_url) and base_url != "" and
+                       same_origin?(base_url, uri.scheme, uri.host, uri.port)) ->
+            {:error,
+             Error.new(
+               message: "Invalid #{label}: external or mismatched origin #{inspect(url)} rejected"
+             )}
+
+          true ->
+            case safe_normalized_path(uri.path || "") do
+              {:ok, _norm_path} ->
+                {:ok, trimmed}
+
+              {:error, :invalid_path} ->
+                {:error, Error.new(message: "Invalid #{label}: #{inspect(url)}")}
+            end
+        end
+      end
+    end
+  end
+
+  def validate_crm_url(other, _base_url, label) do
+    {:error, Error.new(message: "Invalid #{label}: #{inspect(other)}")}
+  end
+
+  @doc false
+  @spec validate_crm_url!(any(), String.t() | nil, String.t()) :: String.t()
+  def validate_crm_url!(url, base_url, label \\ "CRM request URL") do
+    case validate_crm_url(url, base_url, label) do
+      {:ok, valid_url} -> valid_url
+      {:error, %Error{message: msg}} -> raise ArgumentError, msg
+    end
+  end
+
+  @doc false
+  @spec to_keyword_opts(any()) :: keyword()
+  def to_keyword_opts(list) when is_list(list) do
     if Keyword.keyword?(list) do
       list
     else
@@ -1306,7 +1624,7 @@ defmodule Creatio.Util do
     end
   end
 
-  defp to_keyword_opts(map) when is_map(map) and not is_struct(map) do
+  def to_keyword_opts(map) when is_map(map) and not is_struct(map) do
     Enum.map(map, fn
       {k, v} when is_atom(k) ->
         {k, v}
@@ -1330,7 +1648,7 @@ defmodule Creatio.Util do
     end)
   end
 
-  defp to_keyword_opts(other) do
+  def to_keyword_opts(other) do
     raise ArgumentError,
           "expected :req_options to be a keyword list or plain map, got: #{inspect(other)}"
   end

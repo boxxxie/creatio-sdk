@@ -6,7 +6,7 @@ defmodule Creatio.Client do
   read-only safety guards, and content negotiation required by Creatio.
   """
 
-  alias Creatio.Telemetry
+  alias Creatio.{Telemetry, Util}
 
   @sensitive_option_keys [
     :auth_token,
@@ -97,15 +97,9 @@ defmodule Creatio.Client do
          "")
       |> String.trim_trailing("/")
 
-    auth_token =
-      Keyword.get(opts_list, :auth_token) ||
-        Keyword.get(opts_list, :bearer_token) ||
-        Application.get_env(:creatio, :auth_token) ||
-        System.get_env("CREATIO_AUTH_TOKEN") ||
-        System.get_env("CREATIO_BEARER_TOKEN")
-
     cookie = Keyword.get(opts_list, :cookie)
     bpmcsrf = Keyword.get(opts_list, :bpmcsrf)
+    auth_token = resolve_auth_token(opts_list, cookie, bpmcsrf)
 
     identity_service_url =
       (Keyword.get(opts_list, :identity_service_url) ||
@@ -126,9 +120,8 @@ defmodule Creatio.Client do
 
     req_options =
       case Keyword.get(opts_list, :req_options, []) do
-        map when is_map(map) -> Map.to_list(map)
-        list when is_list(list) -> list
-        _ -> []
+        nil -> []
+        val -> Util.to_keyword_opts(val)
       end
 
     read_only = resolve_read_only(opts_list)
@@ -146,8 +139,8 @@ defmodule Creatio.Client do
       base_opts
       |> Keyword.merge(req_options)
       |> Req.new()
-      |> Req.Request.put_header("accept", "application/json; odata.metadata=minimal")
-      |> Req.Request.put_header("forceusesession", "true")
+      |> put_header_if_absent("accept", "application/json; odata.metadata=minimal")
+      |> put_header_if_absent("forceusesession", "true")
 
     client = %__MODULE__{
       base_url: base_url,
@@ -282,6 +275,28 @@ defmodule Creatio.Client do
   @spec to_req(t()) :: Req.Request.t()
   def to_req(%__MODULE__{req: req}), do: req
 
+  defp resolve_auth_token(opts_list, cookie, bpmcsrf) do
+    case Keyword.fetch(opts_list, :auth_token) do
+      {:ok, val} ->
+        val
+
+      :error ->
+        case Keyword.fetch(opts_list, :bearer_token) do
+          {:ok, val} ->
+            val
+
+          :error ->
+            if cookie || bpmcsrf do
+              nil
+            else
+              Application.get_env(:creatio, :auth_token) ||
+                System.get_env("CREATIO_AUTH_TOKEN") ||
+                System.get_env("CREATIO_BEARER_TOKEN")
+            end
+        end
+    end
+  end
+
   defp resolve_read_only(opts) do
     raw =
       case Keyword.fetch(opts, :read_only) do
@@ -351,43 +366,44 @@ defmodule Creatio.Client do
   end
 
   defp read_only_guard(req) do
-    path =
+    raw_path =
       case req.url do
         %URI{path: p} -> p || ""
         other -> URI.parse(to_string(other)).path || ""
       end
 
-    cond do
-      String.contains?(path, "..") ->
+    case Util.safe_normalized_path(raw_path) do
+      {:error, :invalid_path} ->
         {req,
          Creatio.Error.new(
            status: 403,
            code: "ReadOnlyMode",
-           message: "Client is in read-only mode. Path traversal request to #{path} blocked."
+           message: "Client is in read-only mode. Path traversal request to #{raw_path} blocked."
          )}
 
-      req.method in [:get, :head, :options] ->
-        req
-
-      true ->
-        allowed_suffixes = [
-          "/DataService/json/SyncReply/SelectQuery",
-          "/ServiceModel/AuthService.svc/Login",
-          "/AuthService.svc/Login",
-          "/connect/token",
-          "/odata/$batch"
-        ]
-
-        if not String.contains?(path, "/0/rest/") and
-             Enum.any?(allowed_suffixes, &String.ends_with?(path, &1)) do
+      {:ok, path} ->
+        if req.method in [:get, :head, :options] do
           req
         else
-          {req,
-           Creatio.Error.new(
-             status: 403,
-             code: "ReadOnlyMode",
-             message: "Client is in read-only mode. Mutation request to #{path} blocked."
-           )}
+          allowed_suffixes = [
+            "/DataService/json/SyncReply/SelectQuery",
+            "/ServiceModel/AuthService.svc/Login",
+            "/AuthService.svc/Login",
+            "/connect/token",
+            "/odata/$batch"
+          ]
+
+          if not String.contains?(path, "/0/rest/") and
+               Enum.any?(allowed_suffixes, &String.ends_with?(path, &1)) do
+            req
+          else
+            {req,
+             Creatio.Error.new(
+               status: 403,
+               code: "ReadOnlyMode",
+               message: "Client is in read-only mode. Mutation request to #{path} blocked."
+             )}
+          end
         end
     end
   end

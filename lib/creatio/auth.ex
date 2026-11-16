@@ -20,35 +20,46 @@ defmodule Creatio.Auth do
       client = Creatio.new(base_url: "https://mycreatio.com")
       {:ok, client} = Creatio.Auth.login_forms(client, "User01", "SecretPass")
   """
-  @spec login_forms(Client.t() | Req.Request.t(), String.t(), String.t(), keyword()) ::
+  @spec login_forms(Client.t() | Req.Request.t(), String.t(), String.t(), Creatio.opts()) ::
           {:ok, Client.t()} | {:error, Error.t()}
   def login_forms(client_or_req, username, password, opts \\ [])
 
   def login_forms(%Client{} = client, username, password, opts) do
     Telemetry.span(:auth, %{auth_mode: :forms, base_url: client.base_url}, fn ->
-      url = Keyword.get(opts, :url, "/ServiceModel/AuthService.svc/Login")
-      body = %{"UserName" => username, "UserPassword" => password}
-      req_opts = Util.extract_req_options(opts, [:url, :json, :method])
+      raw_url = Util.get_opt(opts, :url, "/ServiceModel/AuthService.svc/Login")
 
-      req =
-        client.req
-        |> Req.Request.delete_header("authorization")
-        |> Req.Request.delete_header("cookie")
-        |> Req.Request.delete_header("bpmcsrf")
-        |> Req.Request.put_header("content-type", "application/json; charset=utf-8")
+      with {:ok, url} <- Util.validate_crm_url(raw_url, client.base_url, "Forms login URL") do
+        body = %{"UserName" => username, "UserPassword" => password}
 
-      case Req.post(req, [url: url, json: body] ++ req_opts) do
-        {:ok, %Req.Response{} = resp} ->
-          handle_forms_login_result(resp, client)
+        base_req =
+          client.req
+          |> Req.Request.delete_header("authorization")
+          |> Req.Request.delete_header("cookie")
+          |> Req.Request.delete_header("bpmcsrf")
+          |> Req.Request.put_header("content-type", "application/json; charset=utf-8")
 
-        {:error, exception} ->
-          Error.wrap_error(exception)
+        {req, req_opts} =
+          Util.prepare_req_call(
+            base_req,
+            opts,
+            [url: url, json: body],
+            %{},
+            [:url, :json, :method]
+          )
+
+        case Req.post(req, req_opts) do
+          {:ok, %Req.Response{} = resp} ->
+            handle_forms_login_result(resp, client)
+
+          {:error, exception} ->
+            Error.wrap_error(exception)
+        end
       end
     end)
   end
 
   def login_forms(%Req.Request{} = req, username, password, opts) do
-    client_opts = Keyword.drop(opts, [:url, :req_options])
+    client_opts = opts |> Util.drop_opt(:url) |> Util.drop_opt(:req_options)
     client = Client.from_req(req, client_opts)
     login_forms(client, username, password, opts)
   end
@@ -70,11 +81,23 @@ defmodule Creatio.Auth do
     cond do
       code in [0, "0"] ->
         cookies = extract_cookies(resp.headers)
-        bpmcsrf = extract_bpmcsrf(cookies, resp.headers)
-        cookie_header = Enum.join(cookies, "; ")
 
-        updated_client = Client.put_forms_auth(client, cookie_header, bpmcsrf)
-        {:ok, updated_client}
+        if cookies == [] do
+          {:error,
+           Error.new(
+             status: 200,
+             code: "FormsMissingCookies",
+             message:
+               "Forms login succeeded (Code: 0) but response contained no Set-Cookie headers.",
+             response: resp
+           )}
+        else
+          bpmcsrf = extract_bpmcsrf(cookies, resp.headers)
+          cookie_header = Enum.join(cookies, "; ")
+
+          updated_client = Client.put_forms_auth(client, cookie_header, bpmcsrf)
+          {:ok, updated_client}
+        end
 
       code != nil ->
         msg = body["Message"] || body["message"] || "Invalid credentials"
@@ -218,25 +241,29 @@ defmodule Creatio.Auth do
 
   Sends a `GET` request to `/0/api/OAuthHealthCheck`.
   """
-  @spec oauth_health_check(Client.t(), keyword()) ::
+  @spec oauth_health_check(Client.t(), Creatio.opts()) ::
           {:ok, map() | String.t()} | {:error, Error.t()}
   def oauth_health_check(%Client{} = client, opts \\ []) do
     Telemetry.span(:auth, %{auth_mode: :health_check, base_url: client.base_url}, fn ->
-      url = Keyword.get(opts, :url, "/0/api/OAuthHealthCheck")
-      req_opts = Util.extract_req_options(opts, [:url, :method])
+      raw_url = Util.get_opt(opts, :url, "/0/api/OAuthHealthCheck")
 
-      case Req.get(client.req, [url: url] ++ req_opts) do
-        {:ok, %Req.Response{} = raw_resp} ->
-          resp = Util.normalize_json_response(raw_resp)
+      with {:ok, url} <- Util.validate_crm_url(raw_url, client.base_url, "OAuth health check URL") do
+        {req, req_opts} =
+          Util.prepare_req_call(client.req, opts, [url: url], %{}, [:url, :method])
 
-          if resp.status == 200 and valid_health_response?(resp) do
-            {:ok, resp.body}
-          else
-            {:error, Error.from_response(resp)}
-          end
+        case Req.get(req, req_opts) do
+          {:ok, %Req.Response{} = raw_resp} ->
+            resp = Util.normalize_json_response(raw_resp)
 
-        {:error, exception} ->
-          Error.wrap_error(exception)
+            if resp.status == 200 and valid_health_response?(resp) do
+              {:ok, resp.body}
+            else
+              {:error, Error.from_response(resp)}
+            end
+
+          {:error, exception} ->
+            Error.wrap_error(exception)
+        end
       end
     end)
   end
@@ -258,7 +285,7 @@ defmodule Creatio.Auth do
   @doc """
   Retrieves the OpenID configuration from the Identity Service (`/.well-known/openid-configuration`).
   """
-  @spec openid_configuration(Client.t() | String.t(), keyword()) ::
+  @spec openid_configuration(Client.t() | String.t(), Creatio.opts()) ::
           {:ok, map()} | {:error, Error.t()}
   def openid_configuration(client_or_url, opts \\ [])
 
@@ -267,10 +294,10 @@ defmodule Creatio.Auth do
       base = client.identity_service_url || (client.base_url || "") <> "/identity"
 
       url =
-        Keyword.get(opts, :url) ||
+        Util.get_opt(opts, :url) ||
           "#{String.trim_trailing(base, "/")}/.well-known/openid-configuration"
 
-      extra_req_opts = Keyword.get(opts, :req_options, [])
+      extra_req_opts = Util.extract_req_options(opts, [:url, :method])
 
       effective_url =
         resolve_request_url(url, Keyword.get(extra_req_opts, :base_url))
@@ -291,7 +318,7 @@ defmodule Creatio.Auth do
       :auth,
       %{auth_mode: :openid_configuration, base_url: origin_from_url(url)},
       fn ->
-        req_opts = Keyword.get(opts, :req_options, [])
+        req_opts = Util.extract_req_options(opts, [:url, :method])
         effective_url = resolve_request_url(url, Keyword.get(req_opts, :base_url))
 
         with :ok <- validate_absolute_url(effective_url, "OpenID configuration") do

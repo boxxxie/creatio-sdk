@@ -215,6 +215,38 @@ defmodule Creatio.ClientTest do
       assert from_req_client.read_only == false
       refute Keyword.has_key?(from_req_client.req.request_steps, :read_only_guard)
     end
+
+    test "new/1 handles map :req_options, preserves caller headers, and blocks IIS path bypasses in read_only_guard" do
+      client =
+        Client.new(
+          base_url: "https://mycreatio.com",
+          req_options: %{
+            "retry" => false,
+            headers: [{"accept", "application/xml"}, {"forceusesession", "false"}]
+          }
+        )
+
+      assert client.req.options.retry == false
+      assert Req.Request.get_header(client.req, "accept") == ["application/xml"]
+      assert Req.Request.get_header(client.req, "forceusesession") == ["false"]
+
+      ro =
+        Client.new(
+          base_url: "https://mycreatio.com",
+          read_only: true,
+          req_options: [plug: fn conn -> Req.Test.json(conn, %{"ok" => true}) end]
+        )
+
+      for path <- [
+            "/0/DataService/json/SyncReply/DeleteQuery/..%5cSelectQuery",
+            "/0/DataService/json/SyncReply/DeleteQuery/.%2e/SelectQuery",
+            "/0/DataService/json/SyncReply/DeleteQuery/%252e%252e/SelectQuery",
+            "/0/rest%2fCustomSvc/SelectQuery"
+          ] do
+        assert {:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}} =
+                 Req.post(ro.req, url: path, json: %{})
+      end
+    end
   end
 end
 
@@ -280,5 +312,37 @@ defmodule Creatio.ClientEnvTest do
     client = Client.from_req(req)
     assert client.read_only == false
     refute Keyword.has_key?(client.req.request_steps, :read_only_guard)
+  end
+
+  test "explicit forms auth and explicit auth_token: nil are not overridden by ambient env tokens" do
+    prev_env = System.get_env("CREATIO_AUTH_TOKEN")
+    prev_app = Application.get_env(:creatio, :auth_token)
+
+    on_exit(fn ->
+      if prev_env,
+        do: System.put_env("CREATIO_AUTH_TOKEN", prev_env),
+        else: System.delete_env("CREATIO_AUTH_TOKEN")
+
+      if prev_app != nil,
+        do: Application.put_env(:creatio, :auth_token, prev_app),
+        else: Application.delete_env(:creatio, :auth_token)
+    end)
+
+    System.put_env("CREATIO_AUTH_TOKEN", "ambient-env-token")
+    Application.put_env(:creatio, :auth_token, "ambient-app-token")
+
+    forms_client =
+      Client.new(base_url: "https://crm.test", cookie: ".ASPXAUTH=c1", bpmcsrf: "csrf1")
+
+    assert forms_client.auth_mode == :forms
+    assert forms_client.auth_token == nil
+    assert Req.Request.get_header(forms_client.req, "cookie") == [".ASPXAUTH=c1"]
+    assert Req.Request.get_header(forms_client.req, "bpmcsrf") == ["csrf1"]
+    assert Req.Request.get_header(forms_client.req, "authorization") == []
+
+    none_client = Client.new(base_url: "https://crm.test", auth_token: nil)
+    assert none_client.auth_mode == :none
+    assert none_client.auth_token == nil
+    assert Req.Request.get_header(none_client.req, "authorization") == []
   end
 end
