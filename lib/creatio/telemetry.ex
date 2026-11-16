@@ -18,6 +18,7 @@ defmodule Creatio.Telemetry do
     * `[:creatio, :request, :exception]`
       * Measurements: `%{duration: integer(), monotonic_time: integer()}`
       * Metadata: `%{method: atom(), path: String.t(), base_url: String.t(), auth_mode: atom() | nil, headers: map(), status: integer() | nil, kind: :error, reason: any(), error: any(), stacktrace: list(), result: :error}`
+      * Note: emitted for handled `{:error, exception}` transport or `read_only_guard` failures returned by `Req` (with `stacktrace: []`), whereas domain spans below emit `:stop` (`result: :error`) for `{:error, _}` return values and reserve `:exception` for raised/thrown exceptions.
 
   ### OData 4 Operations (`Creatio.OData`)
     * `[:creatio, :odata, :start | :stop | :exception]`
@@ -54,17 +55,12 @@ defmodule Creatio.Telemetry do
 
   alias Creatio.Error
 
+  @max_redacted_body_bytes 4_096
+  @max_sanitized_depth 4
+  @max_sanitized_items 32
+
   @domains [:request, :odata, :odata3, :data_service, :auth, :batch]
   @stages [:start, :stop, :exception]
-
-  @sensitive_headers MapSet.new([
-                       "authorization",
-                       "cookie",
-                       "set-cookie",
-                       "bpmcsrf",
-                       "x-api-key",
-                       "proxy-authorization"
-                     ])
 
   @sensitive_meta_keys MapSet.new([
                          "auth_token",
@@ -105,64 +101,83 @@ defmodule Creatio.Telemetry do
 
   def span(event_prefix, start_metadata, fun)
       when is_list(event_prefix) and is_map(start_metadata) and is_function(fun, 0) do
-    sanitized_start = sanitize_metadata(start_metadata)
-    span_ctx = make_ref()
-    start_monotonic = System.monotonic_time()
+    start_event = event_prefix ++ [:start]
+    stop_event = event_prefix ++ [:stop]
+    exc_event = event_prefix ++ [:exception]
 
-    :telemetry.execute(
-      event_prefix ++ [:start],
-      %{monotonic_time: start_monotonic, system_time: System.system_time()},
-      Map.put(sanitized_start, :telemetry_span_context, span_ctx)
-    )
+    has_start? = :telemetry.list_handlers(start_event) != []
+    has_stop? = :telemetry.list_handlers(stop_event) != []
+    has_exc? = :telemetry.list_handlers(exc_event) != []
 
-    try do
-      res = fun.()
-      stop_monotonic = System.monotonic_time()
-      outcome = outcome_metadata(res)
+    if not has_start? and not has_stop? and not has_exc? do
+      fun.()
+    else
+      sanitized_start = sanitize_metadata(start_metadata)
+      span_ctx = make_ref()
+      start_monotonic = System.monotonic_time()
 
-      outcome =
-        if event_prefix == [:creatio, :batch] and match?({:ok, _}, res) do
-          Map.put_new(outcome, :error_count, 0)
-        else
-          outcome
+      if has_start? do
+        :telemetry.execute(
+          start_event,
+          %{monotonic_time: start_monotonic, system_time: System.system_time()},
+          Map.put(sanitized_start, :telemetry_span_context, span_ctx)
+        )
+      end
+
+      try do
+        res = fun.()
+
+        if has_stop? do
+          stop_monotonic = System.monotonic_time()
+          outcome = outcome_metadata(res)
+
+          outcome =
+            if event_prefix == [:creatio, :batch] and match?({:ok, _}, res) do
+              Map.put_new(outcome, :error_count, 0)
+            else
+              outcome
+            end
+
+          stop_metadata =
+            sanitized_start
+            |> Map.merge(outcome)
+            |> Map.put(:telemetry_span_context, span_ctx)
+
+          :telemetry.execute(
+            stop_event,
+            %{duration: stop_monotonic - start_monotonic, monotonic_time: stop_monotonic},
+            stop_metadata
+          )
         end
 
-      stop_metadata =
-        sanitized_start
-        |> Map.merge(outcome)
-        |> Map.put(:telemetry_span_context, span_ctx)
+        res
+      catch
+        kind, reason ->
+          if has_exc? do
+            stop_monotonic = System.monotonic_time()
+            sanitized_reason = sanitize_error(reason)
 
-      :telemetry.execute(
-        event_prefix ++ [:stop],
-        %{duration: stop_monotonic - start_monotonic, monotonic_time: stop_monotonic},
-        stop_metadata
-      )
+            exception_metadata =
+              sanitized_start
+              |> Map.merge(%{
+                result: :error,
+                status: :error,
+                error: sanitized_reason,
+                kind: kind,
+                reason: sanitized_reason,
+                stacktrace: sanitize_stacktrace(__STACKTRACE__),
+                telemetry_span_context: span_ctx
+              })
 
-      res
-    catch
-      kind, reason ->
-        stop_monotonic = System.monotonic_time()
-        sanitized_reason = sanitize_error(reason)
+            :telemetry.execute(
+              exc_event,
+              %{duration: stop_monotonic - start_monotonic, monotonic_time: stop_monotonic},
+              exception_metadata
+            )
+          end
 
-        exception_metadata =
-          sanitized_start
-          |> Map.merge(%{
-            result: :error,
-            status: :error,
-            error: sanitized_reason,
-            kind: kind,
-            reason: sanitized_reason,
-            stacktrace: sanitize_stacktrace(__STACKTRACE__),
-            telemetry_span_context: span_ctx
-          })
-
-        :telemetry.execute(
-          event_prefix ++ [:exception],
-          %{duration: stop_monotonic - start_monotonic, monotonic_time: stop_monotonic},
-          exception_metadata
-        )
-
-        :erlang.raise(kind, reason, __STACKTRACE__)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
     end
   end
 
@@ -180,16 +195,26 @@ defmodule Creatio.Telemetry do
   @doc false
   @spec handle_req_start(Req.Request.t()) :: Req.Request.t()
   def handle_req_start(%Req.Request{} = req) do
-    start_time = System.monotonic_time()
-    req = Req.Request.put_private(req, :creatio_telemetry_start, start_time)
+    has_start? = :telemetry.list_handlers([:creatio, :request, :start]) != []
+    has_stop? = :telemetry.list_handlers([:creatio, :request, :stop]) != []
+    has_exc? = :telemetry.list_handlers([:creatio, :request, :exception]) != []
 
-    :telemetry.execute(
-      [:creatio, :request, :start],
-      %{system_time: System.system_time(), monotonic_time: start_time},
-      build_req_metadata(req)
-    )
+    if has_start? or has_stop? or has_exc? do
+      start_time = System.monotonic_time()
+      req = Req.Request.put_private(req, :creatio_telemetry_start, start_time)
 
-    req
+      if has_start? do
+        :telemetry.execute(
+          [:creatio, :request, :start],
+          %{system_time: System.system_time(), monotonic_time: start_time},
+          build_req_metadata(req)
+        )
+      end
+
+      req
+    else
+      req
+    end
   end
 
   @doc false
@@ -198,23 +223,25 @@ defmodule Creatio.Telemetry do
   def handle_req_stop({%Req.Request{} = req, %Req.Response{} = resp}) do
     case Req.Request.get_private(req, :creatio_telemetry_start) do
       start_time when is_integer(start_time) ->
-        stop_time = System.monotonic_time()
-        duration = max(stop_time - start_time, 0)
+        if :telemetry.list_handlers([:creatio, :request, :stop]) != [] do
+          stop_time = System.monotonic_time()
+          duration = max(stop_time - start_time, 0)
 
-        meta =
-          req
-          |> build_req_metadata()
-          |> Map.merge(%{
-            status: resp.status,
-            result: if(resp.status in 200..299, do: :ok, else: :error),
-            error: nil
-          })
+          meta =
+            req
+            |> build_req_metadata()
+            |> Map.merge(%{
+              status: resp.status,
+              result: if(resp.status in 200..299, do: :ok, else: :error),
+              error: nil
+            })
 
-        :telemetry.execute(
-          [:creatio, :request, :stop],
-          %{duration: duration, monotonic_time: stop_time},
-          meta
-        )
+          :telemetry.execute(
+            [:creatio, :request, :stop],
+            %{duration: duration, monotonic_time: stop_time},
+            meta
+          )
+        end
 
         {rearm_request_step(req), resp}
 
@@ -228,33 +255,35 @@ defmodule Creatio.Telemetry do
   def handle_req_error({%Req.Request{} = req, exception}) do
     case Req.Request.get_private(req, :creatio_telemetry_start) do
       start_time when is_integer(start_time) ->
-        stop_time = System.monotonic_time()
-        duration = max(stop_time - start_time, 0)
-        sanitized_exception = sanitize_error(exception)
+        if :telemetry.list_handlers([:creatio, :request, :exception]) != [] do
+          stop_time = System.monotonic_time()
+          duration = max(stop_time - start_time, 0)
+          sanitized_exception = sanitize_error(exception)
 
-        status =
-          case exception do
-            %{status: s} when is_integer(s) -> s
-            _ -> nil
-          end
+          status =
+            case exception do
+              %{status: s} when is_integer(s) -> s
+              _ -> nil
+            end
 
-        meta =
-          req
-          |> build_req_metadata()
-          |> Map.merge(%{
-            status: status,
-            kind: :error,
-            reason: sanitized_exception,
-            error: sanitized_exception,
-            stacktrace: [],
-            result: :error
-          })
+          meta =
+            req
+            |> build_req_metadata()
+            |> Map.merge(%{
+              status: status,
+              kind: :error,
+              reason: sanitized_exception,
+              error: sanitized_exception,
+              stacktrace: [],
+              result: :error
+            })
 
-        :telemetry.execute(
-          [:creatio, :request, :exception],
-          %{duration: duration, monotonic_time: stop_time},
-          meta
-        )
+          :telemetry.execute(
+            [:creatio, :request, :exception],
+            %{duration: duration, monotonic_time: stop_time},
+            meta
+          )
+        end
 
         {rearm_request_step(req), exception}
 
@@ -284,23 +313,7 @@ defmodule Creatio.Telemetry do
   """
   @spec sanitize_headers(map() | [{String.t() | atom(), any()}]) ::
           map() | [{String.t() | atom(), any()}]
-  def sanitize_headers(headers) when is_map(headers) do
-    Map.new(headers, fn {k, v} ->
-      if sensitive_header?(k), do: {k, redact_header_value(v)}, else: {k, v}
-    end)
-  end
-
-  def sanitize_headers(headers) when is_list(headers) do
-    Enum.map(headers, fn
-      {k, v} ->
-        if sensitive_header?(k), do: {k, redact_header_value(v)}, else: {k, v}
-
-      other ->
-        other
-    end)
-  end
-
-  def sanitize_headers(other), do: other
+  def sanitize_headers(headers), do: Error.sanitize_headers(headers)
 
   @doc """
   Recursively sanitizes telemetry metadata maps, redacting sensitive credential keys,
@@ -408,6 +421,17 @@ defmodule Creatio.Telemetry do
   end
 
   defp redact_text_secrets(str) when is_binary(str) do
+    if byte_size(str) > @max_redacted_body_bytes do
+      prefix = truncate_utf8_prefix(str, @max_redacted_body_bytes)
+      run_secret_redactions(prefix) <> "... [TRUNCATED #{byte_size(str)} bytes]"
+    else
+      run_secret_redactions(str)
+    end
+  end
+
+  defp redact_text_secrets(other), do: other
+
+  defp run_secret_redactions(str) do
     str
     |> String.replace(~r/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+=*/i, "\\1 [REDACTED]")
     |> String.replace(
@@ -415,29 +439,84 @@ defmodule Creatio.Telemetry do
       "\\1=[REDACTED]"
     )
     |> String.replace(
-      ~r/("?(?:auth_token|bearer_token|access_token|refresh_token|client_secret|bpmcsrf|password|user_password|userpassword)"?\s*:\s*)"[^"]*"/i,
+      ~r/("?(?:auth_token|bearer_token|access_token|refresh_token|client_secret|cookie|bpmcsrf|password|user_password|userpassword)"?\s*(?::|=>)\s*)"(?:\\.|[^"\\])*"/i,
       "\\1\"[REDACTED]\""
     )
     |> String.replace(
-      ~r/\b(auth_token|bearer_token|access_token|refresh_token|client_secret|password|user_password|userpassword)=[^\s,&;]+/i,
+      ~r/\b(auth_token|bearer_token|access_token|refresh_token|client_secret|bpmcsrf|password|user_password|userpassword)=[^\s,&;]+/i,
       "\\1=[REDACTED]"
     )
   end
 
-  defp redact_text_secrets(other), do: other
+  defp truncate_utf8_prefix(bin, max_bytes) do
+    slice = binary_part(bin, 0, max_bytes)
+
+    if String.valid?(slice) do
+      slice
+    else
+      slice
+      |> String.chunk(:valid)
+      |> Enum.take_while(&String.valid?/1)
+      |> IO.iodata_to_binary()
+    end
+  end
 
   defp sanitize_response(%Req.Response{headers: headers, body: body} = resp) do
-    %Req.Response{resp | headers: sanitize_headers(headers), body: sanitize_meta_value(body)}
+    %Req.Response{
+      resp
+      | headers: sanitize_headers(headers),
+        body: sanitize_response_body(body, 0)
+    }
   end
 
-  defp sensitive_header?(key) do
-    key_down = key |> to_string() |> String.downcase()
-    MapSet.member?(@sensitive_headers, key_down)
+  defp sanitize_response_body(_val, depth) when depth >= @max_sanitized_depth, do: "[TRUNCATED]"
+
+  defp sanitize_response_body(val, _depth) when is_binary(val), do: redact_text_secrets(val)
+
+  defp sanitize_response_body(val, depth) when is_map(val) and not is_struct(val) do
+    entries = Enum.take(val, @max_sanitized_items)
+    sanitized = Map.new(entries, &sanitize_response_entry(&1, depth))
+
+    if map_size(val) > @max_sanitized_items do
+      Map.put(sanitized, "__truncated__", map_size(val) - @max_sanitized_items)
+    else
+      sanitized
+    end
   end
 
-  defp redact_header_value(vals) when is_list(vals), do: Enum.map(vals, fn _ -> "[REDACTED]" end)
-  defp redact_header_value(nil), do: nil
-  defp redact_header_value(_val), do: "[REDACTED]"
+  defp sanitize_response_body(val, depth) when is_list(val) do
+    {head, tail} = Enum.split(val, @max_sanitized_items)
+
+    mapped =
+      if Keyword.keyword?(val) do
+        Enum.map(head, &sanitize_response_entry(&1, depth))
+      else
+        Enum.map(head, &sanitize_response_body(&1, depth + 1))
+      end
+
+    if tail == [] do
+      mapped
+    else
+      mapped ++ ["[TRUNCATED #{length(tail)} items]"]
+    end
+  end
+
+  defp sanitize_response_body(val, _depth), do: sanitize_meta_value(val)
+
+  defp sanitize_response_entry({k, v}, depth) do
+    key_down = k |> to_string() |> String.downcase()
+
+    cond do
+      key_down == "headers" ->
+        {k, sanitize_headers(v)}
+
+      MapSet.member?(@sensitive_meta_keys, key_down) ->
+        {k, if(is_nil(v), do: nil, else: "[REDACTED]")}
+
+      true ->
+        {k, sanitize_response_body(v, depth + 1)}
+    end
+  end
 
   defp outcome_metadata(:ok), do: %{result: :ok, status: :ok, error: nil}
 

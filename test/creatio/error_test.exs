@@ -133,4 +133,31 @@ defmodule Creatio.ErrorTest do
 
     assert Exception.message(Error.new([])) == "Creatio error"
   end
+
+  test "ignores empty responseStatus/errorInfo, strips BOM, sanitizes response headers, and caps raw HTML messages" do
+    empty_envelope = %Req.Response{
+      status: 200,
+      headers: %{"set-cookie" => ["BPMCSRF=secret-csrf; Path=/"]},
+      body: %{
+        "responseStatus" => %{},
+        "success" => false,
+        "Message" => "Real DataService error"
+      }
+    }
+
+    err = Error.from_response(empty_envelope)
+    assert err.message == "Real DataService error"
+    assert err.response.headers["set-cookie"] == ["[REDACTED]"]
+    refute inspect(err) =~ "secret-csrf"
+
+    bom_json = "\uFEFF" <> Jason.encode!(%{"errorInfo" => %{}, "Message" => "BOM error"})
+
+    assert %Error{message: "BOM error"} =
+             Error.from_response(%Req.Response{status: 500, body: bom_json})
+
+    huge_html = "<html>" <> String.duplicate("x", 2_000) <> "</html>"
+    html_err = Error.from_response(%Req.Response{status: 502, body: huge_html})
+    assert byte_size(html_err.message) < 600
+    assert html_err.message =~ "[truncated"
+  end
 end

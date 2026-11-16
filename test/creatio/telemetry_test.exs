@@ -897,6 +897,27 @@ defmodule Creatio.TelemetryTest do
                         error_count: 1,
                         error: %Error{status: 500}
                       }}
+
+      # Redacts Elixir inspect => syntax, escaped quotes inside JSON strings, and caps huge response bodies
+      inspect_str =
+        ~s(%{"client_secret" => "sec\\"123", "cookie" => "c=1", "password" => "p\\"w"})
+
+      huge_body =
+        "Bearer tok-123 " <> String.duplicate("A", 10_000) <> "password=should_be_truncated"
+
+      sanitized_edge =
+        Telemetry.sanitize_metadata(%{
+          msg: inspect_str,
+          err: Error.from_response(%Req.Response{status: 500, body: huge_body})
+        })
+
+      assert sanitized_edge.msg =~ ~s("client_secret" => "[REDACTED]")
+      assert sanitized_edge.msg =~ ~s("cookie" => "[REDACTED]")
+      assert sanitized_edge.msg =~ ~s("password" => "[REDACTED]")
+      refute sanitized_edge.msg =~ "123"
+      refute sanitized_edge.msg =~ "p\\\"w"
+      assert sanitized_edge.err.response.body =~ "Bearer [REDACTED]"
+      assert sanitized_edge.err.response.body =~ "[TRUNCATED"
     end
   end
 end
