@@ -129,12 +129,14 @@ defmodule Creatio.Features.ODataEntitiesTest do
 
   describe "OData 4 Single Entity, Navigation & Field Access" do
     scenario "fetches a single entity by GUID and normalizes braces" do
-      @given odata_entity("Contact", "abc-123", record: %{"Id" => "abc-123", "Name" => "John"})
-      @upon getting_entity("Contact", "{abc-123}")
-      @then entity_returned(%{"Id" => "abc-123", "Name" => "John"})
-      @then requested_odata_entity_id("Contact", "abc-123")
-      @upon getting_entity("Contact", "abc-123", bang: true)
-      @then entity_returned(%{"Id" => "abc-123", "Name" => "John"})
+      @given odata_entity("Contact", @sample_guid,
+               record: %{"Id" => @sample_guid, "Name" => "John"}
+             )
+      @upon getting_entity("Contact", "{#{@sample_guid}}")
+      @then entity_returned(%{"Id" => @sample_guid, "Name" => "John"})
+      @then requested_odata_entity_id("Contact", @sample_guid)
+      @upon getting_entity("Contact", @sample_guid, bang: true)
+      @then entity_returned(%{"Id" => @sample_guid, "Name" => "John"})
     end
 
     scenario "returns structured error when entity does not exist" do
@@ -446,7 +448,7 @@ defmodule Creatio.Features.ODataEntitiesTest do
               {:ok, %{"Id" => "2", "Name" => "Page1-B"}},
               {:ok, %{"Id" => "3", "Name" => "Page2-A"}}
             ])
-      @then query_parameters_mapped(skip: 2, top: 2)
+      @then query_parameters_mapped(skip: 3, top: 2)
 
       @upon streaming_entities("Contact", page_size: 2, bang: true)
       @then streamed_entities_match([
@@ -491,7 +493,7 @@ defmodule Creatio.Features.ODataEntitiesTest do
               page_size: 2
             )
       @then streamed_entities_match([{:ok, %{"Id" => "3"}}])
-      @then query_parameters_mapped(skip: 2, top: 2)
+      @then query_parameters_mapped(skip: 3, top: 2)
     end
 
     scenario "honors opts[:skip], opts[:top], and string-key maps in stream and stream!" do
@@ -541,10 +543,15 @@ defmodule Creatio.Features.ODataEntitiesTest do
                filter = req.query_params["$filter"] || ""
 
                records =
-                 if String.contains?(filter, "Id gt #{@cursor_id2}") do
-                   [%{"Id" => @cursor_id3}]
-                 else
-                   [%{"Id" => @cursor_id1}, %{"Id" => @cursor_id2}]
+                 cond do
+                   String.contains?(filter, "Id gt #{@cursor_id3}") ->
+                     []
+
+                   String.contains?(filter, "Id gt #{@cursor_id2}") ->
+                     [%{"Id" => @cursor_id3}]
+
+                   true ->
+                     [%{"Id" => @cursor_id1}, %{"Id" => @cursor_id2}]
                  end
 
                {200, %{"value" => records}}
@@ -561,7 +568,7 @@ defmodule Creatio.Features.ODataEntitiesTest do
       @then last_request_omitted_query_param("$skip")
       @then query_parameters_mapped(
               orderby: "Id asc",
-              filter: "(Active eq true) and (Id gt #{@cursor_id2})"
+              filter: "(Active eq true) and (Id gt #{@cursor_id3})"
             )
 
       @upon streaming_entities(Query.new("Contact") |> Query.filter_eq("Active", true),
@@ -579,13 +586,18 @@ defmodule Creatio.Features.ODataEntitiesTest do
                filter = req.query_params["$filter"] || ""
 
                records =
-                 if String.contains?(filter, "Id gt") do
-                   [%{"Id" => "id-3", "Name" => "C", "ModifiedOn" => @cursor_ts}]
-                 else
-                   [
-                     %{"Id" => "id-1", "Name" => "A", "ModifiedOn" => @cursor_ts},
-                     %{"Id" => "id-2", "Name" => "B", "ModifiedOn" => @cursor_ts}
-                   ]
+                 cond do
+                   String.contains?(filter, "'id-3'") ->
+                     []
+
+                   String.contains?(filter, "'id-2'") ->
+                     [%{"Id" => "id-3", "Name" => "C", "ModifiedOn" => @cursor_ts}]
+
+                   true ->
+                     [
+                       %{"Id" => "id-1", "Name" => "A", "ModifiedOn" => @cursor_ts},
+                       %{"Id" => "id-2", "Name" => "B", "ModifiedOn" => @cursor_ts}
+                     ]
                  end
 
                {200, %{"value" => records}}
@@ -640,10 +652,10 @@ defmodule Creatio.Features.ODataEntitiesTest do
       @upon streaming_entities("Contact", page_size: 25_000)
       @then streamed_entities_match([{:ok, %{"Id" => 1}}, {:ok, %{"Id" => 2}}])
 
-      @given odata_collection("Account", records: [%{"Id" => "only-1"}, %{"Id" => "only-2"}])
+      @given odata_paginated_collection("Account", [%{"Id" => "only-1"}, %{"Id" => "only-2"}])
       @upon streaming_entities("Account", page_size: 25_000, bang: true)
       @then streamed_entities_match([%{"Id" => "only-1"}, %{"Id" => "only-2"}])
-      @then server_request_count_was(3)
+      @then server_request_count_was(4)
     end
   end
 

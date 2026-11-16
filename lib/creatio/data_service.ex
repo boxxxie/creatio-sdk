@@ -262,8 +262,16 @@ defmodule Creatio.DataService do
     service_name = validate_path_segment!(service_name, "service_name", "custom_service/5")
     endpoint = validate_path_segment!(endpoint, "endpoint", "custom_service/5")
     client = Client.ensure_client(client_or_req)
-    opts_kw = if is_map(opts), do: Util.to_keyword_opts(opts), else: opts
-    {http_method, req_opts} = Keyword.pop(opts_kw, :method, :post)
+
+    opts_kw =
+      cond do
+        is_nil(opts) -> []
+        is_map(opts) -> Util.to_keyword_opts(opts)
+        true -> opts
+      end
+
+    {raw_method, req_opts} = Keyword.pop(opts_kw, :method, :post)
+    http_method = normalize_http_method!(raw_method)
 
     Telemetry.span(
       :data_service,
@@ -316,8 +324,13 @@ defmodule Creatio.DataService do
           case Req.request(req_with_extra_headers, req_opts) do
             {:ok, %Req.Response{} = raw_resp} ->
               case Util.decode_api_response(raw_resp) do
-                {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
-                  {:ok, body}
+                {:ok, %Req.Response{status: status, body: body} = resp}
+                when status in 200..299 ->
+                  if wcf_error_payload?(body) do
+                    {:error, Error.from_response(resp)}
+                  else
+                    {:ok, body}
+                  end
 
                 {_, resp} ->
                   {:error, Error.from_response(resp)}
@@ -349,19 +362,60 @@ defmodule Creatio.DataService do
       is_list(payload) and payload != [] and Keyword.keyword?(payload) ->
         {nil, Map.merge(stringify_keys(params), stringify_keys(payload))}
 
+      payload == [] ->
+        {nil, params}
+
       true ->
         {payload, params}
     end
   end
 
   defp resolve_custom_payload_and_params(:delete, payload, params)
-       when is_nil(payload) or payload == %{} do
+       when is_nil(payload) or payload == %{} or payload == [] do
     {nil, params}
   end
 
   defp resolve_custom_payload_and_params(_http_method, payload, params) do
     {payload, params}
   end
+
+  @allowed_http_methods %{
+    "get" => :get,
+    "post" => :post,
+    "put" => :put,
+    "patch" => :patch,
+    "delete" => :delete,
+    "head" => :head,
+    "options" => :options
+  }
+
+  defp normalize_http_method!(method) when is_atom(method) or is_binary(method) do
+    key = method |> to_string() |> String.trim() |> String.downcase()
+
+    case Map.fetch(@allowed_http_methods, key) do
+      {:ok, atom} ->
+        atom
+
+      :error ->
+        raise ArgumentError, "invalid HTTP method for custom_service/5: #{inspect(method)}"
+    end
+  end
+
+  defp normalize_http_method!(other) do
+    raise ArgumentError, "invalid HTTP method for custom_service/5: #{inspect(other)}"
+  end
+
+  defp wcf_error_payload?(%{"error" => _}), do: true
+  defp wcf_error_payload?(%{"errorInfo" => %{} = info}) when map_size(info) > 0, do: true
+  defp wcf_error_payload?(%{"ErrorInfo" => %{} = info}) when map_size(info) > 0, do: true
+  defp wcf_error_payload?(%{"responseStatus" => %{} = rs}) when map_size(rs) > 0, do: true
+  defp wcf_error_payload?(%{"ResponseStatus" => %{} = rs}) when map_size(rs) > 0, do: true
+  defp wcf_error_payload?(%{"Exception" => %{} = ex}) when map_size(ex) > 0, do: true
+  defp wcf_error_payload?(%{"success" => val}) when val in [false, "false"], do: true
+  defp wcf_error_payload?(%{"Success" => val}) when val in [false, "false"], do: true
+  defp wcf_error_payload?(_), do: false
+
+  defp stringify_keys(nil), do: %{}
 
   defp stringify_keys(map) when is_map(map) do
     Map.new(map, fn {k, v} -> {to_string(k), v} end)

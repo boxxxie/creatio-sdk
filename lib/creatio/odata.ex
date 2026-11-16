@@ -293,6 +293,9 @@ defmodule Creatio.OData do
               {:ok, %Req.Response{status: 200, body: %{"error" => _}} = resp} ->
                 {:error, Error.from_response(resp)}
 
+              {:ok, %Req.Response{status: 200, body: %{"@odata.null" => true}}} ->
+                {:ok, nil}
+
               {:ok, %Req.Response{status: 200, body: %{"value" => records}}}
               when is_list(records) ->
                 {:ok, records}
@@ -371,6 +374,9 @@ defmodule Creatio.OData do
             case Util.decode_api_response(raw_resp) do
               {:ok, %Req.Response{status: 200, body: %{"error" => _}} = resp} ->
                 {:error, Error.from_response(resp)}
+
+              {:ok, %Req.Response{status: 200, body: %{"@odata.null" => true}}} ->
+                {:ok, nil}
 
               {:ok, %Req.Response{status: 200, body: %{"value" => val}}} ->
                 {:ok, val}
@@ -494,6 +500,16 @@ defmodule Creatio.OData do
     do_count(client, entity, %{}, opts)
   end
 
+  @count_disallowed_params [
+    "$top",
+    "$skip",
+    "$select",
+    "$orderby",
+    "$expand",
+    "$count",
+    "$inlinecount"
+  ]
+
   def count(client_or_req, query, opts) when is_client_or_req(client_or_req) do
     entity = Query.require_entity!(query, "count/3")
     client = Client.ensure_client(client_or_req)
@@ -501,7 +517,7 @@ defmodule Creatio.OData do
     base_params =
       query
       |> Query.to_params()
-      |> Map.drop(["$top", "$skip", "$select", "$orderby", "$expand", "$count", "$inlinecount"])
+      |> Map.drop(@count_disallowed_params)
 
     do_count(client, entity, base_params, opts)
   end
@@ -529,9 +545,9 @@ defmodule Creatio.OData do
               opts
               |> drop_opt(:strategy)
               |> drop_opt(:req_options)
-              |> put_opt(:count, true)
-              |> put_opt(:top, 0)
-              |> then(&Util.normalize_odata_params(&1, base_params, {"$count", "true"}))
+              |> Util.normalize_odata_params(base_params, {"$count", "true"})
+              |> Map.drop(@count_disallowed_params)
+              |> Map.merge(%{"$count" => "true", "$top" => "0"})
 
             url = "/0/odata/#{entity}"
             {req, req_opts} = Util.prepare_req_call(client.req, opts, [url: url], params)
@@ -571,9 +587,17 @@ defmodule Creatio.OData do
               opts
               |> drop_opt(:strategy)
               |> drop_opt(:req_options)
-              |> then(&Util.normalize_odata_params(&1, base_params, {"$count", "true"}))
+              |> Util.normalize_odata_params(base_params, {"$count", "true"})
+              |> Map.drop(@count_disallowed_params)
 
-            {req, req_opts} = Util.prepare_req_call(client.req, opts, [url: url], params)
+            base_req =
+              Req.Request.put_header(
+                client.req,
+                "accept",
+                "text/plain, application/json; odata.metadata=minimal, */*"
+              )
+
+            {req, req_opts} = Util.prepare_req_call(base_req, opts, [url: url], params)
 
             case Req.get(req, req_opts) do
               {:ok, %Req.Response{} = raw_resp} ->
@@ -690,6 +714,14 @@ defmodule Creatio.OData do
                 {:ok, %Req.Response{status: status, body: %{} = body}}
                 when status in [200, 201] ->
                   {:ok, body}
+
+                {:ok, %Req.Response{status: 201, body: body, headers: headers}}
+                when is_nil(body) or is_binary(body) ->
+                  if empty_body?(body) do
+                    {:ok, Util.extract_created_entity(headers)}
+                  else
+                    {:error, Error.from_response(raw_resp)}
+                  end
 
                 {_, resp} ->
                   {:error, Error.from_response(resp)}
@@ -1198,9 +1230,15 @@ defmodule Creatio.OData do
 
   defp require_entity_name!(entity, fun_name), do: Util.require_entity_name!(entity, fun_name)
 
+  defp empty_body?(nil), do: true
+
+  defp empty_body?(bin) when is_binary(bin),
+    do: bin |> String.trim_leading("\uFEFF") |> String.trim() == ""
+
+  defp empty_body?(_), do: false
+
   defp pop_opt(opts, key), do: Util.pop_opt(opts, key)
   defp drop_opt(opts, key), do: Util.drop_opt(opts, key)
-  defp put_opt(opts, key, val), do: Util.put_opt(opts, key, val)
 
   defp maybe_put_return_prefer(req, :minimal),
     do: Req.Request.put_header(req, "prefer", "return=minimal")
@@ -1215,32 +1253,8 @@ defmodule Creatio.OData do
   end
 
   defp clean_id(id) do
-    Util.clean_guid(id)
+    Util.format_record_key(id, :odata4)
   end
 
-  defp extract_created_entity(headers) do
-    entity_id =
-      Util.response_header(headers, "odata-entityid") ||
-        Util.response_header(headers, "location")
-
-    case entity_id do
-      nil ->
-        %{}
-
-      uri ->
-        case Regex.run(~r/\(([^()]+)\)\s*$/, uri) do
-          [_, raw_id] ->
-            cleaned = Util.strip_guid_syntax(raw_id)
-
-            if cleaned != "" and not String.contains?(raw_id, ["=", ","]) do
-              %{"@odata.id" => uri, "Id" => cleaned}
-            else
-              %{"@odata.id" => uri}
-            end
-
-          _ ->
-            %{"@odata.id" => uri}
-        end
-    end
-  end
+  defp extract_created_entity(headers), do: Util.extract_created_entity(headers)
 end

@@ -172,6 +172,7 @@ defmodule Creatio.UtilTest do
         case Keyword.get(opts, :skip) do
           0 -> {:ok, [%{"Id" => "1"}, %{"Id" => "2"}]}
           2 -> {:ok, [%{"Id" => "3"}]}
+          3 -> {:ok, []}
         end
       end
 
@@ -819,7 +820,7 @@ defmodule Creatio.UtilTest do
           "/0/ServiceModel/EntityDataService.svc/ContactCollection" ->
             Req.Test.json(conn, %{"d" => [%{"Id" => "1"}]})
 
-          "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'1')/Name" ->
+          "/0/ServiceModel/EntityDataService.svc/ContactCollection('1')/Name" ->
             Req.Test.json(conn, %{"d" => %{"error" => %{"message" => "field fail"}}})
         end
       end
@@ -843,6 +844,375 @@ defmodule Creatio.UtilTest do
 
       assert {:error, %Error{status: 200}} =
                OData3.get_field(client, "Contact", "1", "Name", req_options: [plug: plug])
+    end
+  end
+
+  describe "protocol, security, and pagination regressions" do
+    test "quotes lookalike non-hex 36-char UUIDs in cursors and rejects invalid cursor_field" do
+      alias Creatio.OData
+
+      parent = self()
+      malicious = "00000000-0000-0000-0000-0 eq 0 or 1 "
+
+      plug = fn conn ->
+        send(parent, {:req_qs, conn.query_string})
+        Req.Test.json(conn, %{"value" => []})
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      assert [] =
+               OData.stream(client, "Contact",
+                 cursor_field: "Notes",
+                 after_cursor: malicious
+               )
+               |> Enum.to_list()
+
+      assert_receive {:req_qs, qs}
+      params = URI.decode_query(qs)
+      assert params["$filter"] == "Notes gt '00000000-0000-0000-0000-0 eq 0 or 1 '"
+
+      for bad_cursor <- [false, true, "", "Id eq 1"] do
+        assert_raise ArgumentError, fn ->
+          Util.paginate_stream(client, "Contact", [cursor_field: bad_cursor], fn _, _, _ ->
+            {:ok, []}
+          end)
+          |> Enum.to_list()
+        end
+      end
+    end
+
+    test "formats OData 3 DateTime cursors across MS AJAX, DateTime, NaiveDateTime, and ISO strings" do
+      alias Creatio.OData3
+
+      parent = self()
+
+      plug = fn conn ->
+        query = URI.decode_query(conn.query_string)
+        send(parent, {:o3_filter, query["$filter"]})
+        Req.Test.json(conn, %{"d" => %{"results" => []}})
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      for {after_cursor, expected_fragment} <- [
+            {"/Date(1704067200000)/", "CreatedOn gt datetime'2024-01-01T00:00:00'"},
+            {"/Date(-86400000)/", "CreatedOn gt datetime'1969-12-31T00:00:00'"},
+            {"/Date(1704067200000+0200)/",
+             "CreatedOn gt datetimeoffset'2024-01-01T02:00:00+02:00'"},
+            {~U[2024-05-01 14:30:00Z], "CreatedOn gt datetimeoffset'2024-05-01T14:30:00Z'"},
+            {~N[2024-05-01 14:30:00], "CreatedOn gt datetime'2024-05-01T14:30:00'"},
+            {"2024-05-01T14:30:00Z", "CreatedOn gt datetimeoffset'2024-05-01T14:30:00Z'"},
+            {"2024-05-01T14:30:00", "CreatedOn gt datetime'2024-05-01T14:30:00'"}
+          ] do
+        assert [] =
+                 OData3.stream(client, "Contact",
+                   cursor_field: "CreatedOn",
+                   after_cursor: after_cursor
+                 )
+                 |> Enum.to_list()
+
+        assert_receive {:o3_filter, ^expected_fragment}
+      end
+    end
+
+    test "strip_guid_syntax/1 and format_record_key/2 handle braced guids, integers, and string keys" do
+      uuid = "12345678-1234-1234-1234-123456789abc"
+      assert Util.strip_guid_syntax("{guid'#{uuid}'}") == uuid
+      assert Util.format_record_key(uuid, :odata4) == uuid
+      assert Util.format_record_key(uuid, :odata3) == "guid'#{uuid}'"
+      assert Util.format_record_key(123, :odata4) == "123"
+      assert Util.format_record_key(123, :odata3) == "123"
+      assert Util.format_record_key("CODE", :odata4) == "'CODE'"
+      assert Util.format_record_key("CODE", :odata3) == "'CODE'"
+    end
+
+    test "stream pagination resists :params overrides, follows TLS-downgraded nextLink, and handles low server caps" do
+      parent = self()
+      {:ok, agent} = Agent.start_link(fn -> 0 end)
+
+      plug = fn conn ->
+        query = URI.decode_query(conn.query_string)
+        page_idx = Agent.get_and_update(agent, fn n -> {n, n + 1} end)
+        send(parent, {:stream_req, page_idx, query})
+
+        case page_idx do
+          0 ->
+            Req.Test.json(conn, %{
+              "value" => [%{"Id" => "1"}, %{"Id" => "2"}],
+              "@odata.nextLink" => "http://mycreatio.com/0/odata/Contact?$skiptoken=tok1&$top=2"
+            })
+
+          1 ->
+            Req.Test.json(conn, %{
+              "value" => [%{"Id" => "3"}]
+            })
+        end
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+
+      items =
+        Util.paginate_stream(
+          client,
+          "Contact",
+          [page_size: 2, params: %{"$skip" => 999, "$top" => 1, "custom" => "ok"}],
+          fn _c, _t, opts ->
+            params = Util.normalize_odata_params(opts, %{}, {"$count", "true"})
+            send(parent, {:page_params, params})
+
+            case params["$skiptoken"] do
+              nil ->
+                {:ok,
+                 %{
+                   records: [%{"Id" => "1"}, %{"Id" => "2"}],
+                   count: nil,
+                   raw: %{
+                     "@odata.nextLink" =>
+                       "http://mycreatio.com/0/odata/Contact?$skiptoken=tok1&$top=2"
+                   }
+                 }}
+
+              "tok1" ->
+                {:ok, %{records: [%{"Id" => "3"}], count: nil, raw: %{}}}
+            end
+          end
+        )
+        |> Enum.to_list()
+
+      assert items == [{:ok, %{"Id" => "1"}}, {:ok, %{"Id" => "2"}}, {:ok, %{"Id" => "3"}}]
+      assert_receive {:page_params, %{"$top" => "2", "$skip" => "0", "custom" => "ok"}}
+      assert_receive {:page_params, %{"$top" => "2", "$skiptoken" => "tok1", "custom" => "ok"}}
+
+      # Low server MaxEntityRowCount without @odata.nextLink continues until []
+      {:ok, cap_agent} = Agent.start_link(fn -> 0 end)
+
+      cap_results =
+        Util.paginate_stream!(client, "Contact", [page_size: 5_000], fn _c, _t, opts ->
+          idx = Agent.get_and_update(cap_agent, fn n -> {n, n + 1} end)
+          params = Util.normalize_odata_params(opts, %{}, {"$count", "true"})
+          send(parent, {:cap_page, idx, params["$skip"], params["$top"]})
+
+          case idx do
+            0 -> {:ok, [%{"Id" => "a"}, %{"Id" => "b"}]}
+            1 -> {:ok, [%{"Id" => "c"}]}
+            _ -> {:ok, []}
+          end
+        end)
+        |> Enum.to_list()
+
+      assert cap_results == [%{"Id" => "a"}, %{"Id" => "b"}, %{"Id" => "c"}]
+      assert_receive {:cap_page, 0, "0", "5000"}
+      assert_receive {:cap_page, 1, "2", "5000"}
+      assert_receive {:cap_page, 2, "3", "5000"}
+    end
+
+    test "normalize_odata_params/3 and ensure_cursor_select_in_opts drop nil/boolean/blank select, expand, filter and normalize params lists" do
+      params =
+        Util.normalize_odata_params(
+          [
+            select: nil,
+            select: false,
+            select: [],
+            expand: nil,
+            expand: false,
+            filter: nil,
+            params: [:bad_entry, foo: ["a", "b"], ignored: nil]
+          ],
+          %{},
+          {"$count", "true"}
+        )
+
+      refute Map.has_key?(params, "$select")
+      refute Map.has_key?(params, "$expand")
+      refute Map.has_key?(params, "$filter")
+      assert params["foo"] == "a,b"
+      refute Map.has_key?(params, "ignored")
+
+      map_params =
+        Util.normalize_odata_params(
+          %{"$filter" => nil, "$select" => [], "$expand" => ""},
+          %{},
+          {"$count", "true"}
+        )
+
+      assert map_params == %{}
+
+      # Blank select + cursor_field should NOT restrict $select to only ["Id"]
+      parent = self()
+
+      Util.paginate_stream(
+        Client.new(base_url: "https://mycreatio.com"),
+        "Contact",
+        [cursor_field: "Id", select: nil, params: %{"$select" => ["Name"]}],
+        fn _c, _t, opts ->
+          p = Util.normalize_odata_params(opts, %{}, {"$count", "true"})
+          send(parent, {:cursor_select, p["$select"]})
+          {:ok, []}
+        end
+      )
+      |> Enum.to_list()
+
+      assert_receive {:cursor_select, "Name,Id"}
+    end
+
+    test "OData and OData3 count, delete, create, and @odata.null handle Accept headers, query stripping, and responses" do
+      alias Creatio.{OData, OData3}
+
+      parent = self()
+
+      plug = fn conn ->
+        send(
+          parent,
+          {:req, conn.method, conn.request_path, URI.decode_query(conn.query_string),
+           Plug.Conn.get_req_header(conn, "accept")}
+        )
+
+        case {conn.method, conn.request_path} do
+          {"GET", "/0/odata/Contact/$count"} ->
+            conn |> Plug.Conn.put_resp_content_type("text/plain") |> Plug.Conn.send_resp(200, "7")
+
+          {"GET", "/0/odata/Contact"} ->
+            Req.Test.json(conn, %{"@odata.count" => 7, "value" => []})
+
+          {"POST", "/0/odata/Contact"} ->
+            conn
+            |> Plug.Conn.put_resp_header(
+              "odata-entityid",
+              "https://mycreatio.com/0/odata/Contact(12345678-1234-1234-1234-123456789abc)"
+            )
+            |> Plug.Conn.send_resp(201, "")
+
+          {"GET", "/0/odata/Contact(12345678-1234-1234-1234-123456789abc)/Account"} ->
+            Req.Test.json(conn, %{"@odata.context" => "ctx", "@odata.null" => true})
+
+          {"GET", "/0/odata/Contact(12345678-1234-1234-1234-123456789abc)/MiddleName"} ->
+            Req.Test.json(conn, %{"@odata.context" => "ctx", "@odata.null" => true})
+
+          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection/$count"} ->
+            conn |> Plug.Conn.put_resp_content_type("text/plain") |> Plug.Conn.send_resp(200, "9")
+
+          {"POST", "/0/ServiceModel/EntityDataService.svc/ContactCollection"} ->
+            conn
+            |> Plug.Conn.put_resp_header(
+              "location",
+              "https://mycreatio.com/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'12345678-1234-1234-1234-123456789abc')"
+            )
+            |> Plug.Conn.send_resp(201, "")
+
+          {"DELETE",
+           "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'12345678-1234-1234-1234-123456789abc')"} ->
+            Plug.Conn.send_resp(conn, 204, "")
+        end
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+      uuid = "12345678-1234-1234-1234-123456789abc"
+
+      assert {:ok, 7} = OData.count(client, "Contact", top: 50, select: "Id", filter: "Active")
+      assert_receive {:req, "GET", "/0/odata/Contact/$count", q1, [accept1]}
+      assert q1 == %{"$filter" => "Active"}
+      assert accept1 =~ "text/plain"
+
+      assert {:ok, 7} =
+               OData.count(client, "Contact", %{
+                 "strategy" => :top_zero,
+                 "$top" => 50,
+                 "$skip" => 5,
+                 "$select" => "Id"
+               })
+
+      assert_receive {:req, "GET", "/0/odata/Contact", q2, _}
+      assert q2["$top"] == "0"
+      assert q2["$count"] == "true"
+      refute Map.has_key?(q2, "$skip")
+      refute Map.has_key?(q2, "$select")
+
+      assert {:ok, %{"Id" => ^uuid, "@odata.id" => _}} =
+               OData.create(client, "Contact", %{"Name" => "New"})
+
+      assert {:ok, nil} = OData.get_navigation(client, "Contact", uuid, "Account")
+      assert {:ok, nil} = OData.get_field(client, "Contact", uuid, "MiddleName")
+
+      assert {:ok, 9} = OData3.count(client, "Contact", top: 10, inlinecount: "allpages")
+
+      assert_receive {:req, "GET",
+                      "/0/ServiceModel/EntityDataService.svc/ContactCollection/$count", q3,
+                      [accept3]}
+
+      assert q3 == %{}
+      refute accept3 =~ "odata.metadata=minimal"
+      assert accept3 =~ "text/plain"
+
+      assert {:ok, %{"Id" => ^uuid}} =
+               OData3.create(client, "Contact", %{"Name" => "Legacy"})
+
+      assert :ok = OData3.delete(client, "Contact", uuid)
+
+      expected_del_path =
+        "/0/ServiceModel/EntityDataService.svc/ContactCollection(guid'#{uuid}')"
+
+      assert_receive {:req, "DELETE", ^expected_del_path, _, [accept_del]}
+
+      assert accept_del == "application/json; odata=verbose"
+    end
+
+    test "Auth.login_forms preserves comma values, drops cleared cookies, and keeps undecoded BPMCSRF" do
+      alias Creatio.Auth
+
+      plug = fn conn ->
+        conn
+        |> Map.put(:resp_headers, [
+          {"set-cookie", ".ASPXAUTH=tok%2B1,seg=val; path=/; HttpOnly"},
+          {"set-cookie", "OldCookie=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/"},
+          {"set-cookie", "BPMCSRF=\"abc%2Bdef\"; path=/"}
+        ])
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(%{"Code" => 0}))
+      end
+
+      client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: plug])
+      assert {:ok, authed} = Auth.login_forms(client, "Supervisor", "Supervisor")
+
+      assert authed.cookie =~ ".ASPXAUTH=tok%2B1,seg=val"
+      refute authed.cookie =~ "OldCookie"
+      assert authed.bpmcsrf == "\"abc%2Bdef\""
+    end
+
+    test "DataService.custom_service normalizes string GET, skips empty list JSON body, handles nil req_options, and rejects 200 WCF errors" do
+      alias Creatio.DataService
+
+      parent = self()
+
+      plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(parent, {:custom_svc, conn.method, body})
+
+        case conn.request_path do
+          "/0/rest/Svc/Ping" ->
+            Req.Test.json(conn, %{"ok" => true})
+
+          "/0/rest/Svc/WcfErr" ->
+            Req.Test.json(conn, %{"responseStatus" => %{"ErrorCode" => "E"}})
+
+          "/0/rest/Svc/ErrObj" ->
+            Req.Test.json(conn, %{"error" => %{"message" => "fail"}})
+        end
+      end
+
+      ro =
+        Client.new(base_url: "https://mycreatio.com", read_only: true, req_options: [plug: plug])
+
+      assert {:ok, %{"ok" => true}} =
+               DataService.custom_service(ro, "Svc", "Ping", [], method: "GET", req_options: nil)
+
+      assert_receive {:custom_svc, "GET", ""}
+
+      assert {:error, %Error{status: 200}} =
+               DataService.custom_service(ro, "Svc", "WcfErr", [], method: "GET")
+
+      assert {:error, %Error{status: 200}} =
+               DataService.custom_service(ro, "Svc", "ErrObj", [], method: "GET")
     end
   end
 end

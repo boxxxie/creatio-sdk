@@ -504,7 +504,7 @@ defmodule Creatio.TestDSL.ODataDSL do
       assert last_req.method == "PUT"
 
       assert last_req.request_path ==
-               "/0/odata/#{unquote(entity)}(#{unquote(id)})/#{unquote(field)}"
+               "/0/odata/#{unquote(entity)}(#{Creatio.Validation.format_record_key(unquote(id), :odata4)})/#{unquote(field)}"
 
       assert last_req.headers["content-type"] == [
                "application/octet-stream; IEEE754Compatible=true"
@@ -524,7 +524,7 @@ defmodule Creatio.TestDSL.ODataDSL do
       assert last_req.method == "PUT"
 
       assert last_req.request_path ==
-               "/0/odata/#{unquote(entity)}(#{unquote(id)})/#{unquote(field)}"
+               "/0/odata/#{unquote(entity)}(#{Creatio.Validation.format_record_key(unquote(id), :odata4)})/#{unquote(field)}"
 
       assert last_req.headers["content-type"] == [
                "application/json; IEEE754Compatible=true"
@@ -544,7 +544,7 @@ defmodule Creatio.TestDSL.ODataDSL do
       assert last_req.method == "DELETE"
 
       assert last_req.request_path ==
-               "/0/odata/#{unquote(entity)}(#{unquote(id)})/#{unquote(field)}"
+               "/0/odata/#{unquote(entity)}(#{Creatio.Validation.format_record_key(unquote(id), :odata4)})/#{unquote(field)}"
 
       assert last_req.headers["accept"] == ["application/json, text/plain, */*"]
 

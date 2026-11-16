@@ -12,6 +12,7 @@ defmodule Creatio.Features.OData3LegacyEntitiesTest do
   @cursor_id3 "33333333-3333-3333-3333-333333333333"
   @next_page_url "https://mycreatio.com/0/ServiceModel/EntityDataService.svc/AccountCollection?$skiptoken=next"
   @waf_entity_id "00000000-0000-0000-0000-000000000001"
+  @sample_guid "12345678-1234-1234-1234-123456789abc"
 
   @odata3_count_cases [
     {"path strategy plain text integer", [strategy: :path, format: :plain_text, count: 10], [],
@@ -90,15 +91,15 @@ defmodule Creatio.Features.OData3LegacyEntitiesTest do
 
   describe "OData 3 Single Entity, Navigation & Field Access" do
     scenario "fetches a single OData 3 entity by GUID and formats guid key literal" do
-      @given odata3_entity("Contact", "1234-5678",
-               record: %{"Id" => "1234-5678", "Name" => "Bob"}
+      @given odata3_entity("Contact", @sample_guid,
+               record: %{"Id" => @sample_guid, "Name" => "Bob"}
              )
-      @upon getting_odata3_entity("Contact", "{1234-5678}")
-      @then entity_returned(%{"Id" => "1234-5678", "Name" => "Bob"})
-      @then requested_odata3_entity_guid("Contact", "1234-5678")
+      @upon getting_odata3_entity("Contact", "{#{@sample_guid}}")
+      @then entity_returned(%{"Id" => @sample_guid, "Name" => "Bob"})
+      @then requested_odata3_entity_guid("Contact", @sample_guid)
       @then odata3_verbose_headers_sent()
-      @upon getting_odata3_entity("Contact", "1234-5678", bang: true)
-      @then entity_returned(%{"Id" => "1234-5678", "Name" => "Bob"})
+      @upon getting_odata3_entity("Contact", @sample_guid, bang: true)
+      @then entity_returned(%{"Id" => @sample_guid, "Name" => "Bob"})
     end
 
     scenario "retrieves OData 3 navigation properties and wrapped or raw field values" do
@@ -318,7 +319,7 @@ defmodule Creatio.Features.OData3LegacyEntitiesTest do
               {:ok, %{"Id" => "2"}},
               {:ok, %{"Id" => "3"}}
             ])
-      @then query_parameters_mapped(skip: 2, top: 2)
+      @then query_parameters_mapped(skip: 3, top: 2)
 
       @upon streaming_odata3_entities(Query.new("Contact"), query_first: true, bang: true)
       @then streamed_entities_match([%{"Id" => "1"}, %{"Id" => "2"}, %{"Id" => "3"}])
@@ -340,7 +341,7 @@ defmodule Creatio.Features.OData3LegacyEntitiesTest do
               page_size: 2
             )
       @then streamed_entities_match([{:ok, %{"Id" => "3"}}])
-      @then query_parameters_mapped(skip: 2, top: 2)
+      @then query_parameters_mapped(skip: 3, top: 2)
     end
 
     scenario "paginates OData 3 streams using keyset cursor_field and d.__next without $skip" do

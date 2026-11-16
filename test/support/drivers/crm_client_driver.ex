@@ -826,6 +826,9 @@ defmodule Creatio.TestDrivers.CRMClientDriver do
 
         {:raw_req, method, path} ->
           Req.request(client.req, method: method, url: path)
+
+        {:raw_req, method, path, req_opts} ->
+          Req.request(client.req, [method: method, url: path] ++ req_opts)
       end
 
     Map.put(ctx, :result, result)
