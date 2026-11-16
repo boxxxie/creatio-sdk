@@ -86,12 +86,13 @@ defmodule Creatio.TestDSL.SafetyDSL do
 
   def sending_transport_requests(ctx, entries) when is_list(entries) do
     results =
-      Enum.map(entries, fn {label, method, endpoint_kind} ->
-        path = resolve_transport_endpoint(endpoint_kind)
-        before_count = length(CreatioServerDriver.recorded_requests(ctx))
-        after_ctx = CRMClientDriver.invoke_operation(ctx, {:raw_req, method, path})
-        after_count = length(CreatioServerDriver.recorded_requests(after_ctx))
-        {label, Map.fetch!(after_ctx, :result), after_count - before_count}
+      Enum.map(entries, fn
+        {label, method, endpoint_kind} ->
+          {path, req_opts} = resolve_transport_request(endpoint_kind)
+          before_count = length(CreatioServerDriver.recorded_requests(ctx))
+          after_ctx = CRMClientDriver.invoke_operation(ctx, {:raw_req, method, path, req_opts})
+          after_count = length(CreatioServerDriver.recorded_requests(after_ctx))
+          {label, Map.fetch!(after_ctx, :result), after_count - before_count}
       end)
 
     Map.put(ctx, :matrix_results, results)
@@ -337,6 +338,28 @@ defmodule Creatio.TestDSL.SafetyDSL do
   # ---------------------------------------------------------------------------
   # Private Helpers
   # ---------------------------------------------------------------------------
+
+  defp resolve_transport_request(:batch_endpoint) do
+    {"/0/odata/$batch", [json: %{"requests" => [%{"method" => "GET", "url" => "Contact"}]}]}
+  end
+
+  defp resolve_transport_request(:empty_batch_endpoint), do: {"/0/odata/$batch", []}
+
+  defp resolve_transport_request(:mutating_json_batch) do
+    {"/0/odata/$batch",
+     [json: %{"requests" => [%{"method" => "DELETE", "url" => "Contact('1')"}]}]}
+  end
+
+  defp resolve_transport_request(:mutating_multipart_batch) do
+    {"/0/odata/$batch",
+     [
+       headers: [{"content-type", "multipart/mixed; boundary=b_mut"}],
+       body:
+         "--b_mut\r\nContent-Type: application/http\r\n\r\nPOST Contact HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{}\r\n--b_mut--\r\n"
+     ]}
+  end
+
+  defp resolve_transport_request(kind), do: {resolve_transport_endpoint(kind), []}
 
   defp resolve_transport_endpoint(:odata_entity_query), do: "/0/odata/Contact"
   defp resolve_transport_endpoint(:odata_collection), do: "/0/odata/Contact"

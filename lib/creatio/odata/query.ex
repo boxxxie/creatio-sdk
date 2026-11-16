@@ -25,7 +25,7 @@ defmodule Creatio.OData.Query do
       {:ok, records} = Creatio.OData.execute(client, query)
   """
 
-  alias Creatio.Util
+  alias Creatio.Validation
 
   defstruct [
     :entity,
@@ -546,7 +546,7 @@ defmodule Creatio.OData.Query do
   @doc false
   @spec require_entity!(t(), String.t()) :: String.t()
   def require_entity!(%__MODULE__{entity: entity}, fun_name) when is_binary(entity) do
-    Util.require_entity_name!(entity, fun_name)
+    Validation.require_entity_name!(entity, fun_name)
   end
 
   def require_entity!(other, fun_name) do
@@ -791,7 +791,7 @@ defmodule Creatio.OData.Query do
 
       byte_size(str) >= 6 and String.downcase(binary_part(str, 0, 5)) == "guid'" and
           String.ends_with?(str, "'") ->
-        "guid'#{Util.clean_guid(str)}'"
+        "guid'#{Validation.clean_guid(str)}'"
 
       Keyword.get(opts, :quoted, true) ->
         "'#{escape_single_quotes(str)}'"
@@ -802,7 +802,7 @@ defmodule Creatio.OData.Query do
   end
 
   defp format_guid_literal(guid, opts) do
-    clean = Util.clean_guid(guid)
+    clean = Validation.clean_guid(guid)
     if odata3?(opts), do: "guid'#{clean}'", else: clean
   end
 

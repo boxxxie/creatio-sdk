@@ -94,7 +94,7 @@ defmodule Creatio.Features.AuthenticationTest do
              )
       @upon logging_in_with_forms("Supervisor", "pw")
       @then client_is_authenticated_via_forms(
-              csrf_token: "abc+123+==",
+              csrf_token: "abc+123%2B==",
               cookies_include: [".ASPXAUTH=ticket1"],
               single_cookie_name: "bpmcsrf"
             )

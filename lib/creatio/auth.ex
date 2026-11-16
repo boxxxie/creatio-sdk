@@ -133,20 +133,28 @@ defmodule Creatio.Auth do
     * `:token_url` - Overrides the token endpoint path or full URL (defaults to `"/connect/token"`).
     * `:req_options` - Additional options merged into the request.
   """
-  @spec login_oauth(Client.t(), keyword()) ::
+  @spec login_oauth(Client.t() | Req.Request.t(), Creatio.opts()) ::
           {:ok, Client.t(), map()} | {:error, Error.t()}
-  def login_oauth(%Client{} = client, opts \\ []) do
-    client_id = Keyword.get(opts, :client_id) || client.client_id
-    client_secret = Keyword.get(opts, :client_secret) || client.client_secret
+  def login_oauth(client_or_req, opts \\ [])
+
+  def login_oauth(%Req.Request{} = req, opts) do
+    client_opts = opts |> Util.drop_opt(:url) |> Util.drop_opt(:req_options)
+    client = Client.from_req(req, client_opts)
+    login_oauth(client, opts)
+  end
+
+  def login_oauth(%Client{} = client, opts) do
+    client_id = Util.get_opt(opts, :client_id) || client.client_id
+    client_secret = Util.get_opt(opts, :client_secret) || client.client_secret
 
     identity_url =
-      case Keyword.get(opts, :identity_service_url) || client.identity_service_url do
+      case Util.get_opt(opts, :identity_service_url) || client.identity_service_url do
         url when is_binary(url) -> url |> String.trim() |> String.trim_trailing("/")
         _ -> ""
       end
 
     token_path =
-      Keyword.get(opts, :token_url) || Keyword.get(client.options, :token_url) ||
+      Util.get_opt(opts, :token_url) || Keyword.get(client.options, :token_url) ||
         "/connect/token"
 
     full_token_url? = String.starts_with?(token_path, ["http://", "https://"])
@@ -241,9 +249,17 @@ defmodule Creatio.Auth do
 
   Sends a `GET` request to `/0/api/OAuthHealthCheck`.
   """
-  @spec oauth_health_check(Client.t(), Creatio.opts()) ::
+  @spec oauth_health_check(Client.t() | Req.Request.t(), Creatio.opts()) ::
           {:ok, map() | String.t()} | {:error, Error.t()}
-  def oauth_health_check(%Client{} = client, opts \\ []) do
+  def oauth_health_check(client_or_req, opts \\ [])
+
+  def oauth_health_check(%Req.Request{} = req, opts) do
+    client_opts = opts |> Util.drop_opt(:url) |> Util.drop_opt(:req_options)
+    client = Client.from_req(req, client_opts)
+    oauth_health_check(client, opts)
+  end
+
+  def oauth_health_check(%Client{} = client, opts) do
     Telemetry.span(:auth, %{auth_mode: :health_check, base_url: client.base_url}, fn ->
       raw_url = Util.get_opt(opts, :url, "/0/api/OAuthHealthCheck")
 
@@ -379,9 +395,10 @@ defmodule Creatio.Auth do
 
   defp handle_openid_response({:error, exception}), do: Error.wrap_error(exception)
 
-  # Reuses client.req (Finch pool, TLS, retry, :plug) without leaking CRM session headers
+  # Reuses client.req (Finch pool, TLS, retry, :plug) without leaking CRM session headers or CRM read_only_guard
   defp identity_base_req(%Client{req: %Req.Request{} = req}, auth_mode) do
     req
+    |> Client.detach_read_only_guard()
     |> Req.Request.put_option(:base_url, nil)
     |> Req.Request.put_private(:creatio_client_meta, %{base_url: nil, auth_mode: auth_mode})
     |> Req.Request.delete_header("authorization")
@@ -401,33 +418,42 @@ defmodule Creatio.Auth do
   end
 
   defp parse_set_cookie_raw(raw) when is_binary(raw) do
-    parse_set_cookie_raw([raw])
+    ~r/,\s*(?=[A-Za-z0-9_.-]+=)/
+    |> Regex.split(raw)
+    |> parse_set_cookie_raw()
   end
 
   defp parse_set_cookie_raw(list) when is_list(list) do
     # Deduplicate by cookie name keeping the latest Set-Cookie header value
-    # (IIS commonly clears a cookie before setting its new value in the same response).
+    # (IIS commonly clears a cookie before setting its new value in the same response),
+    # and drop cookies cleared with an empty value (e.g. `Name=; Expires=...`).
     {ordered_names, by_name} =
       list
-      |> Enum.flat_map(fn item when is_binary(item) ->
-        Regex.split(~r/,\s*(?=[A-Za-z0-9_.-]+=)/, item)
-      end)
+      |> Enum.filter(&is_binary/1)
       |> Enum.map(fn cookie_str ->
         cookie_str
-        |> String.split(";")
+        |> String.split(";", parts: 2)
         |> List.first()
         |> String.trim()
       end)
       |> Enum.reject(&(&1 == "" or is_nil(&1)))
       |> Enum.reduce({[], %{}}, fn cookie, {names, acc} ->
-        name_key =
-          case String.split(cookie, "=", parts: 2) do
-            [name, _val] -> String.downcase(String.trim(name))
-            [name] -> String.downcase(String.trim(name))
-          end
+        case String.split(cookie, "=", parts: 2) do
+          [name, val] ->
+            trimmed_name = String.trim(name)
+            trimmed_val = String.trim(val)
+            name_key = String.downcase(trimmed_name)
 
-        names = if Map.has_key?(acc, name_key), do: names, else: [name_key | names]
-        {names, Map.put(acc, name_key, cookie)}
+            if trimmed_name == "" or trimmed_val == "" do
+              {List.delete(names, name_key), Map.delete(acc, name_key)}
+            else
+              names = if Map.has_key?(acc, name_key), do: names, else: [name_key | names]
+              {names, Map.put(acc, name_key, "#{trimmed_name}=#{trimmed_val}")}
+            end
+
+          _ ->
+            {names, acc}
+        end
       end)
 
     ordered_names
@@ -442,20 +468,14 @@ defmodule Creatio.Auth do
       |> Enum.find_value(fn cookie ->
         cookie = String.trim(cookie)
 
-        case Regex.run(~r/^bpmcsrf=(.*)$/i, cookie) do
-          [_, val] when val != "" -> safe_uri_decode(val)
+        case Regex.run(~r/\Abpmcsrf=(.+)\z/i, cookie) do
+          [_, val] -> val
           _ -> nil
         end
       end)
 
     from_cookies || extract_header_val(headers, "bpmcsrf") ||
       extract_header_val(headers, "BPMCSRF")
-  end
-
-  defp safe_uri_decode(val) do
-    URI.decode(val)
-  rescue
-    ArgumentError -> val
   end
 
   defp extract_header_val(headers, name) when is_map(headers) do

@@ -107,15 +107,16 @@ defmodule Creatio do
   @doc """
   Authenticates via OAuth 2.0 client credentials against the Identity Service.
   """
-  @spec login_oauth(Client.t(), keyword()) :: {:ok, Client.t(), map()} | {:error, Error.t()}
-  defdelegate login_oauth(client, opts \\ []), to: Auth
+  @spec login_oauth(Client.t() | Req.Request.t(), opts()) ::
+          {:ok, Client.t(), map()} | {:error, Error.t()}
+  defdelegate login_oauth(client_or_req, opts \\ []), to: Auth
 
   @doc """
   Checks OAuth health endpoint (`/0/api/OAuthHealthCheck`).
   """
-  @spec oauth_health_check(Client.t(), opts()) ::
+  @spec oauth_health_check(Client.t() | Req.Request.t(), opts()) ::
           {:ok, map() | String.t()} | {:error, Error.t()}
-  defdelegate oauth_health_check(client, opts \\ []), to: Auth
+  defdelegate oauth_health_check(client_or_req, opts \\ []), to: Auth
 
   @doc """
   Retrieves OpenID configuration (`/.well-known/openid-configuration`).

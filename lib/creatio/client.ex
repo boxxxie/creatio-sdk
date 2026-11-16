@@ -6,7 +6,7 @@ defmodule Creatio.Client do
   read-only safety guards, and content negotiation required by Creatio.
   """
 
-  alias Creatio.{Telemetry, Util}
+  alias Creatio.{Telemetry, Validation}
 
   @sensitive_option_keys [
     :auth_token,
@@ -121,7 +121,7 @@ defmodule Creatio.Client do
     req_options =
       case Keyword.get(opts_list, :req_options, []) do
         nil -> []
-        val -> Util.to_keyword_opts(val)
+        val -> Validation.to_keyword_opts(val)
       end
 
     read_only = resolve_read_only(opts_list)
@@ -173,9 +173,33 @@ defmodule Creatio.Client do
     base_url =
       Keyword.get(opts_list, :base_url) || req.options[:base_url] || ""
 
-    auth_token = Keyword.get(opts_list, :auth_token) || Keyword.get(opts_list, :bearer_token)
-    cookie = Keyword.get(opts_list, :cookie)
-    bpmcsrf = Keyword.get(opts_list, :bpmcsrf)
+    opt_auth_token = Keyword.get(opts_list, :auth_token) || Keyword.get(opts_list, :bearer_token)
+    opt_cookie = Keyword.get(opts_list, :cookie)
+    opt_bpmcsrf = Keyword.get(opts_list, :bpmcsrf)
+
+    has_auth_token_opt? =
+      Keyword.has_key?(opts_list, :auth_token) or Keyword.has_key?(opts_list, :bearer_token)
+
+    has_cookie_opt? = Keyword.has_key?(opts_list, :cookie)
+    has_bpmcsrf_opt? = Keyword.has_key?(opts_list, :bpmcsrf)
+
+    req_for_auth =
+      req
+      |> then(fn r ->
+        if has_auth_token_opt? and is_nil(opt_auth_token),
+          do: Req.Request.delete_header(r, "authorization"),
+          else: r
+      end)
+      |> then(fn r ->
+        if has_cookie_opt? and is_nil(opt_cookie),
+          do: Req.Request.delete_header(r, "cookie"),
+          else: r
+      end)
+      |> then(fn r ->
+        if has_bpmcsrf_opt? and is_nil(opt_bpmcsrf),
+          do: Req.Request.delete_header(r, "bpmcsrf"),
+          else: r
+      end)
 
     read_only =
       case Keyword.fetch(opts_list, :read_only) do
@@ -183,19 +207,67 @@ defmodule Creatio.Client do
         _ -> Keyword.has_key?(req.request_steps, :read_only_guard)
       end
 
+    has_req_auth? = Req.Request.get_header(req_for_auth, "authorization") != []
+    has_req_cookie? = Req.Request.get_header(req_for_auth, "cookie") != []
+    has_req_bpmcsrf? = Req.Request.get_header(req_for_auth, "bpmcsrf") != []
+
+    explicit_auth_mode = Keyword.fetch(opts_list, :auth_mode)
+
     auth_mode =
-      Keyword.get_lazy(opts_list, :auth_mode, fn ->
-        cond do
-          auth_token || Req.Request.get_header(req, "authorization") != [] -> :bearer
-          cookie || bpmcsrf || Req.Request.get_header(req, "cookie") != [] -> :forms
-          true -> :none
-        end
-      end)
+      case explicit_auth_mode do
+        {:ok, mode} ->
+          mode
+
+        :error ->
+          cond do
+            opt_auth_token -> :bearer
+            opt_cookie || opt_bpmcsrf -> :forms
+            has_req_auth? -> :bearer
+            has_req_cookie? || has_req_bpmcsrf? -> :forms
+            true -> :none
+          end
+      end
+
+    {auth_token, cookie, bpmcsrf} =
+      case auth_mode do
+        :bearer ->
+          token = opt_auth_token || extract_bearer_token(req_for_auth)
+          {token, nil, nil}
+
+        :forms ->
+          resolved_cookie =
+            cond do
+              has_cookie_opt? -> opt_cookie
+              true -> extract_cookie_header(req_for_auth)
+            end
+
+          resolved_bpmcsrf =
+            cond do
+              has_bpmcsrf_opt? -> opt_bpmcsrf
+              has_cookie_opt? -> nil
+              true -> extract_bpmcsrf_header(req_for_auth)
+            end
+
+          {nil, resolved_cookie, resolved_bpmcsrf}
+
+        _ ->
+          {nil, nil, nil}
+      end
+
+    req_for_auth =
+      if explicit_auth_mode == {:ok, :none} do
+        req_for_auth
+        |> Req.Request.delete_header("authorization")
+        |> Req.Request.delete_header("cookie")
+        |> Req.Request.delete_header("bpmcsrf")
+      else
+        req_for_auth
+      end
 
     trimmed_base = String.trim_trailing(base_url, "/")
 
     configured_req =
-      req
+      req_for_auth
       |> maybe_put_base_url(trimmed_base)
       |> put_header_if_absent("accept", "application/json; odata.metadata=minimal")
       |> put_header_if_absent("forceusesession", "true")
@@ -323,10 +395,7 @@ defmodule Creatio.Client do
           client.req
           |> Req.Request.delete_header("cookie")
           |> Req.Request.delete_header("bpmcsrf")
-          |> put_or_delete_header(
-            "authorization",
-            client.auth_token && "Bearer #{client.auth_token}"
-          )
+          |> maybe_put_header("authorization", client.auth_token && "Bearer #{client.auth_token}")
 
         :forms ->
           client.req
@@ -355,14 +424,28 @@ defmodule Creatio.Client do
         client.read_only and not Keyword.has_key?(req.request_steps, :read_only_guard) ->
           Req.Request.append_request_steps(req, read_only_guard: &read_only_guard/1)
 
-        not client.read_only and Keyword.has_key?(req.request_steps, :read_only_guard) ->
-          %{req | request_steps: Keyword.delete(req.request_steps, :read_only_guard)}
+        not client.read_only and
+            (Keyword.has_key?(req.request_steps, :read_only_guard) or
+               :read_only_guard in req.current_request_steps) ->
+          detach_read_only_guard(req)
 
         true ->
           req
       end
 
     %{client | req: req}
+  end
+
+  @doc false
+  @spec detach_read_only_guard(Req.Request.t()) :: Req.Request.t()
+  def detach_read_only_guard(
+        %Req.Request{request_steps: steps, current_request_steps: current} = req
+      ) do
+    %Req.Request{
+      req
+      | request_steps: Keyword.delete(steps, :read_only_guard),
+        current_request_steps: List.delete(current, :read_only_guard)
+    }
   end
 
   defp read_only_guard(req) do
@@ -372,7 +455,7 @@ defmodule Creatio.Client do
         other -> URI.parse(to_string(other)).path || ""
       end
 
-    case Util.safe_normalized_path(raw_path) do
+    case Validation.safe_normalized_path(raw_path) do
       {:error, :invalid_path} ->
         {req,
          Creatio.Error.new(
@@ -389,12 +472,16 @@ defmodule Creatio.Client do
             "/DataService/json/SyncReply/SelectQuery",
             "/ServiceModel/AuthService.svc/Login",
             "/AuthService.svc/Login",
-            "/connect/token",
-            "/odata/$batch"
+            "/connect/token"
           ]
 
-          if not String.contains?(path, "/0/rest/") and
-               Enum.any?(allowed_suffixes, &String.ends_with?(path, &1)) do
+          allowed? =
+            not String.contains?(path, "/0/rest/") and
+              (Enum.any?(allowed_suffixes, &String.ends_with?(path, &1)) or
+                 (req.method == :post and String.ends_with?(path, "/odata/$batch") and
+                    read_only_batch_request?(req)))
+
+          if allowed? do
             req
           else
             {req,
@@ -405,6 +492,170 @@ defmodule Creatio.Client do
              )}
           end
         end
+    end
+  end
+
+  defp read_only_batch_request?(%Req.Request{options: options} = req) do
+    cond do
+      Map.get(options, :json) != nil ->
+        read_only_json_batch?(Map.get(options, :json))
+
+      Map.get(options, :compress_body) == true ->
+        false
+
+      true ->
+        raw_body = Map.get(options, :body) || req.body
+
+        if is_binary(raw_body) or is_list(raw_body) do
+          bin = IO.iodata_to_binary(raw_body)
+
+          ct =
+            req |> Req.Request.get_header("content-type") |> List.first("") |> String.downcase()
+
+          cond do
+            String.contains?(ct, "multipart/mixed") or
+                String.starts_with?(String.trim_leading(bin), "--") ->
+              read_only_multipart_batch?(bin, ct)
+
+            String.contains?(ct, "application/json") or
+                String.starts_with?(
+                  bin |> String.trim_leading("\uFEFF") |> String.trim_leading(),
+                  "{"
+                ) ->
+              case Jason.decode(String.trim_leading(bin, "\uFEFF")) do
+                {:ok, decoded} -> read_only_json_batch?(decoded)
+                _ -> false
+              end
+
+            true ->
+              false
+          end
+        else
+          false
+        end
+    end
+  end
+
+  defp read_only_json_batch?(%{"requests" => requests}) when is_list(requests) do
+    Enum.all?(requests, &read_only_json_batch_item?/1)
+  end
+
+  defp read_only_json_batch?(%{requests: requests}) when is_list(requests) do
+    Enum.all?(requests, &read_only_json_batch_item?/1)
+  end
+
+  defp read_only_json_batch?(_), do: false
+
+  defp read_only_json_batch_item?(item) when is_map(item) do
+    method = item["method"] || item[:method]
+
+    (is_binary(method) or is_atom(method)) and
+      (method |> to_string() |> String.trim() |> String.upcase()) in ["GET", "HEAD", "OPTIONS"]
+  end
+
+  defp read_only_json_batch_item?(_), do: false
+
+  defp read_only_multipart_batch?(body, content_type) when is_binary(body) do
+    boundary =
+      Validation.extract_boundary_from_header(content_type) ||
+        extract_multipart_boundary(body)
+
+    if is_binary(boundary) and boundary != "" and
+         Regex.match?(
+           ~r/(?:\r\n|\n|\A)--#{Regex.escape(boundary)}(?:--)?[ \t]*(?=\r\n|\n|\z)/,
+           body
+         ) do
+      body
+      |> Validation.split_multipart_parts(boundary)
+      |> Enum.all?(&read_only_multipart_part?/1)
+    else
+      false
+    end
+  end
+
+  defp read_only_multipart_part?(raw_part) do
+    part = String.trim_leading(raw_part, "\r\n") |> String.trim_leading("\n")
+
+    case :binary.match(part, ["\r\n\r\n", "\n\n"]) do
+      {pos, len} ->
+        mime_head = binary_part(part, 0, pos)
+        mime_body = binary_part(part, pos + len, byte_size(part) - (pos + len))
+        ct = extract_mime_content_type(mime_head)
+
+        cond do
+          String.contains?(ct, "multipart/mixed") ->
+            read_only_multipart_batch?(mime_body, ct)
+
+          String.contains?(ct, "application/http") ->
+            first_line =
+              mime_body
+              |> String.trim_leading("\r\n")
+              |> String.trim_leading("\n")
+              |> String.split(["\r\n", "\n"], parts: 2)
+              |> hd()
+              |> String.trim()
+
+            Regex.match?(~r/\A(?:GET|HEAD|OPTIONS)\s+\S+\s+HTTP\/[12](?:\.\d)?\z/i, first_line)
+
+          true ->
+            false
+        end
+
+      :nomatch ->
+        false
+    end
+  end
+
+  defp extract_multipart_boundary(str) do
+    case Regex.run(~r/(?:^|\r?\n)--([A-Za-z0-9_.-]+)/, str) do
+      [_, boundary] -> Validation.clean_boundary_str(boundary)
+      _ -> nil
+    end
+  end
+
+  defp extract_mime_content_type(head) do
+    head
+    |> String.split(["\r\n", "\n"], trim: true)
+    |> Enum.find_value("", fn line ->
+      case :binary.split(line, ":") do
+        [k, v] ->
+          if String.downcase(String.trim(k)) == "content-type",
+            do: String.downcase(String.trim(v))
+
+        _ ->
+          nil
+      end
+    end)
+  end
+
+  defp extract_bearer_token(req) do
+    case Req.Request.get_header(req, "authorization") do
+      [val | _] when is_binary(val) ->
+        case Regex.run(~r/\ABearer\s+(.+)\z/i, String.trim(val)) do
+          [_, token] ->
+            trimmed = String.trim(token)
+            if trimmed != "", do: trimmed, else: nil
+
+          _ ->
+            nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp extract_cookie_header(req) do
+    case Req.Request.get_header(req, "cookie") do
+      [] -> nil
+      vals -> Enum.join(vals, "; ")
+    end
+  end
+
+  defp extract_bpmcsrf_header(req) do
+    case Req.Request.get_header(req, "bpmcsrf") do
+      [val | _] -> val
+      _ -> nil
     end
   end
 

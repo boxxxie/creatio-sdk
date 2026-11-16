@@ -247,6 +247,211 @@ defmodule Creatio.ClientTest do
                  Req.post(ro.req, url: path, json: %{})
       end
     end
+
+    test "from_req/2 preserves existing auth headers on Req.Request and honors explicit overrides" do
+      bearer_client =
+        Client.new(
+          base_url: "https://mycreatio.com",
+          auth_token: "tok-123"
+        )
+
+      bearer_req = Client.to_req(bearer_client)
+      rehydrated_bearer = Client.from_req(bearer_req)
+
+      assert rehydrated_bearer.auth_mode == :bearer
+      assert rehydrated_bearer.auth_token == "tok-123"
+      assert Req.Request.get_header(rehydrated_bearer.req, "authorization") == ["Bearer tok-123"]
+
+      # Custom non-Bearer Authorization scheme is also preserved when opts == []
+      custom_req =
+        Req.new(
+          base_url: "https://mycreatio.com",
+          headers: %{"authorization" => "CustomScheme xyz"}
+        )
+
+      rehydrated_custom = Client.from_req(custom_req)
+      assert rehydrated_custom.auth_mode == :bearer
+      assert rehydrated_custom.auth_token == nil
+
+      assert Req.Request.get_header(rehydrated_custom.req, "authorization") == [
+               "CustomScheme xyz"
+             ]
+
+      # Forms headers preserved when opts == []
+      forms_client =
+        Client.new(
+          base_url: "https://mycreatio.com",
+          cookie: ".ASPXAUTH=abc; BPMCSRF=csrf-1",
+          bpmcsrf: "csrf-1"
+        )
+
+      rehydrated_forms = Client.from_req(Client.to_req(forms_client))
+      assert rehydrated_forms.auth_mode == :forms
+      assert rehydrated_forms.cookie == ".ASPXAUTH=abc; BPMCSRF=csrf-1"
+      assert rehydrated_forms.bpmcsrf == "csrf-1"
+
+      assert Req.Request.get_header(rehydrated_forms.req, "cookie") == [
+               ".ASPXAUTH=abc; BPMCSRF=csrf-1"
+             ]
+
+      assert Req.Request.get_header(rehydrated_forms.req, "bpmcsrf") == ["csrf-1"]
+
+      # Explicit forms credentials override an existing bearer Authorization header
+      switched_to_forms =
+        Client.from_req(bearer_req, cookie: ".ASPXAUTH=new", bpmcsrf: "csrf-new")
+
+      assert switched_to_forms.auth_mode == :forms
+      assert switched_to_forms.auth_token == nil
+      assert switched_to_forms.cookie == ".ASPXAUTH=new"
+      assert switched_to_forms.bpmcsrf == "csrf-new"
+      assert Req.Request.get_header(switched_to_forms.req, "authorization") == []
+      assert Req.Request.get_header(switched_to_forms.req, "cookie") == [".ASPXAUTH=new"]
+      assert Req.Request.get_header(switched_to_forms.req, "bpmcsrf") == ["csrf-new"]
+
+      # Explicit auth_token overrides existing forms headers
+      switched_to_bearer = Client.from_req(Client.to_req(forms_client), auth_token: "new-tok")
+      assert switched_to_bearer.auth_mode == :bearer
+      assert switched_to_bearer.auth_token == "new-tok"
+      assert switched_to_bearer.cookie == nil
+      assert switched_to_bearer.bpmcsrf == nil
+
+      assert Req.Request.get_header(switched_to_bearer.req, "authorization") == [
+               "Bearer new-tok"
+             ]
+
+      assert Req.Request.get_header(switched_to_bearer.req, "cookie") == []
+      assert Req.Request.get_header(switched_to_bearer.req, "bpmcsrf") == []
+
+      # Explicit auth_mode: :none clears auth headers
+      cleared = Client.from_req(bearer_req, auth_mode: :none)
+      assert cleared.auth_mode == :none
+      assert cleared.auth_token == nil
+      assert Req.Request.get_header(cleared.req, "authorization") == []
+    end
+
+    test "read_only_guard blocks mutating or opaque $batch payloads while allowing read-only $batch" do
+      plug = fn conn ->
+        Req.Test.json(conn, %{"responses" => [%{"id" => "1", "status" => 200, "body" => %{}}]})
+      end
+
+      ro =
+        Client.new(
+          base_url: "https://mycreatio.com",
+          read_only: true,
+          req_options: [plug: plug, retry: false]
+        )
+
+      req = Client.to_req(ro)
+
+      # JSON $batch containing a POST mutation is blocked
+      assert {:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}} =
+               Req.post(req,
+                 url: "/0/odata/$batch",
+                 json: %{
+                   "requests" => [
+                     %{"id" => "1", "method" => "GET", "url" => "Contact"},
+                     %{"id" => "2", "method" => "POST", "url" => "Contact", "body" => %{}}
+                   ]
+                 }
+               )
+
+      # Raw multipart $batch containing a PATCH mutation is blocked
+      mutating_multipart =
+        "--batch_ro\r\nContent-Type: application/http\r\nContent-Transfer-Encoding: binary\r\n\r\nPATCH Contact(00000000-0000-0000-0000-000000000001) HTTP/1.1\r\n\r\n{\"Name\":\"X\"}\r\n--batch_ro--\r\n"
+
+      assert {:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}} =
+               Req.post(req,
+                 url: "/0/odata/$batch",
+                 headers: %{"content-type" => "multipart/mixed; boundary=batch_ro"},
+                 body: mutating_multipart
+               )
+
+      # Compressed or uninspectable $batch body fails closed in read-only mode
+      assert {:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}} =
+               Req.post(req,
+                 url: "/0/odata/$batch",
+                 headers: %{
+                   "content-type" => "application/json",
+                   "content-encoding" => "gzip"
+                 },
+                 body: :zlib.gzip(~s({"requests":[{"id":"1","method":"GET","url":"Contact"}]}))
+               )
+
+      # Non-POST method to /odata/$batch is blocked
+      assert {:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}} =
+               Req.put(req, url: "/0/odata/$batch", json: %{"requests" => []})
+
+      # Purely read-only GET JSON and multipart $batch requests are allowed
+      assert {:ok, %Req.Response{status: 200}} =
+               Req.post(req,
+                 url: "/0/odata/$batch",
+                 json: %{"requests" => [%{"id" => "1", "method" => "GET", "url" => "Contact"}]}
+               )
+
+      ro_multipart =
+        "--batch_ro\r\nContent-Type: application/http\r\nContent-Transfer-Encoding: binary\r\n\r\nGET Contact HTTP/1.1\r\n\r\n--batch_ro--\r\n"
+
+      assert {:ok, %Req.Response{status: 200}} =
+               Req.post(req,
+                 url: "/0/odata/$batch",
+                 headers: %{"content-type" => "multipart/mixed; boundary=batch_ro"},
+                 body: ro_multipart
+               )
+    end
+
+    test "Auth.login_oauth works on read_only client with custom token_url and accepts Req.Request" do
+      plug = fn conn ->
+        case {conn.method, conn.request_path} do
+          {"POST", "/oauth2/v2.0/token"} ->
+            Req.Test.json(conn, %{"access_token" => "ro-oauth-tok", "expires_in" => 3600})
+
+          {"GET", "/0/api/OAuthHealthCheck"} ->
+            Req.Test.json(conn, %{"status" => "Healthy"})
+
+          _ ->
+            Req.Test.json(conn, %{"ok" => true})
+        end
+      end
+
+      ro =
+        Client.new(
+          base_url: "https://mycreatio.com",
+          identity_service_url: "https://identity.mycreatio.com",
+          client_id: "cid",
+          client_secret: "csec",
+          read_only: true,
+          req_options: [plug: plug, retry: false]
+        )
+
+      assert {:ok, %Client{} = authed, %{"access_token" => "ro-oauth-tok"}} =
+               Creatio.Auth.login_oauth(ro, token_url: "/oauth2/v2.0/token")
+
+      assert authed.read_only == true
+      assert authed.auth_token == "ro-oauth-tok"
+      assert Keyword.has_key?(authed.req.request_steps, :read_only_guard)
+
+      # Ensure read-only guard stays active on the authenticated client
+      assert {:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}} =
+               Creatio.create(authed, "Contact", %{"Name" => "Blocked"})
+
+      # %Req.Request{} input works for both login_oauth/2 and oauth_health_check/2
+      raw_req =
+        Req.new(
+          base_url: "https://mycreatio.com",
+          plug: plug,
+          retry: false
+        )
+
+      assert {:ok, %Client{auth_token: "ro-oauth-tok"}, _body} =
+               Creatio.Auth.login_oauth(raw_req,
+                 identity_service_url: "https://identity.mycreatio.com",
+                 client_id: "cid",
+                 client_secret: "csec",
+                 token_url: "/oauth2/v2.0/token"
+               )
+
+      assert {:ok, %{"status" => "Healthy"}} = Creatio.Auth.oauth_health_check(raw_req)
+    end
   end
 end
 
