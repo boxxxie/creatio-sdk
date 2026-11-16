@@ -359,7 +359,7 @@ defmodule Creatio.Features.AuthenticationTest do
 
       @given creatio_oauth_health_status("{broken", content_type: "application/json")
       @upon checking_oauth_health()
-      @then authentication_fails_with(status: nil)
+      @then authentication_fails_with(status: 200)
     end
   end
 end

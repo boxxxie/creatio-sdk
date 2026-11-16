@@ -506,9 +506,7 @@ defmodule Creatio.TestDSL.ODataDSL do
       assert last_req.request_path ==
                "/0/odata/#{unquote(entity)}(#{Creatio.Validation.format_record_key(unquote(id), :odata4)})/#{unquote(field)}"
 
-      assert last_req.headers["content-type"] == [
-               "application/octet-stream; IEEE754Compatible=true"
-             ]
+      assert last_req.headers["content-type"] == ["application/octet-stream"]
 
       assert last_req.raw_body == unquote(expected_bytes)
       ctx
@@ -548,9 +546,7 @@ defmodule Creatio.TestDSL.ODataDSL do
 
       assert last_req.headers["accept"] == ["application/json, text/plain, */*"]
 
-      assert last_req.headers["content-type"] == [
-               "application/octet-stream; IEEE754Compatible=true"
-             ]
+      refute Map.has_key?(last_req.headers, "content-type")
 
       ctx
     end

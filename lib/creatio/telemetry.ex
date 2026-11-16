@@ -370,13 +370,7 @@ defmodule Creatio.Telemetry do
   defp sanitize_meta_value(val) when is_map(val) and not is_struct(val),
     do: sanitize_metadata(val)
 
-  defp sanitize_meta_value(val) when is_list(val) do
-    if Keyword.keyword?(val) do
-      Enum.map(val, fn {k, v} -> {k, sanitize_meta_entry(k, v)} end)
-    else
-      Enum.map(val, &sanitize_meta_value/1)
-    end
-  end
+  defp sanitize_meta_value(val) when is_list(val), do: sanitize_meta_list(val)
 
   defp sanitize_meta_value(val) when is_tuple(val) do
     val
@@ -387,6 +381,18 @@ defmodule Creatio.Telemetry do
 
   defp sanitize_meta_value(val) when is_binary(val), do: redact_text_secrets(val)
   defp sanitize_meta_value(val), do: val
+
+  defp sanitize_meta_list([]), do: []
+
+  defp sanitize_meta_list([{k, v} | rest]) when is_atom(k) or is_binary(k) do
+    [{k, sanitize_meta_entry(k, v)} | sanitize_meta_list(rest)]
+  end
+
+  defp sanitize_meta_list([head | rest]) do
+    [sanitize_meta_value(head) | sanitize_meta_list(rest)]
+  end
+
+  defp sanitize_meta_list(improper_tail), do: sanitize_meta_value(improper_tail)
 
   defp sanitize_uri(%URI{userinfo: userinfo, path: path, query: query, fragment: fragment} = uri) do
     %URI{
@@ -469,7 +475,7 @@ defmodule Creatio.Telemetry do
     str
     |> String.replace(~r/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+=*/i, "\\1 [REDACTED]")
     |> String.replace(
-      ~r/\b(BPMCSRF|BPMLOADER|\.ASPXAUTH|ASP\.NET_SessionId)=[^;\s,&"']+/i,
+      ~r/(?<![A-Za-z0-9_])(BPMCSRF|BPMLOADER|\.ASPXAUTH|ASP\.NET_SessionId)=[^;\s,&"']+/i,
       "\\1=[REDACTED]"
     )
     |> String.replace(
@@ -519,23 +525,33 @@ defmodule Creatio.Telemetry do
   end
 
   defp sanitize_response_body(val, depth) when is_list(val) do
-    {head, tail} = Enum.split(val, @max_sanitized_items)
-
-    mapped =
-      if Keyword.keyword?(val) do
-        Enum.map(head, &sanitize_response_entry(&1, depth))
-      else
-        Enum.map(head, &sanitize_response_body(&1, depth + 1))
-      end
-
-    if tail == [] do
-      mapped
-    else
-      mapped ++ ["[TRUNCATED #{length(tail)} items]"]
-    end
+    sanitize_response_list(val, depth, 0)
   end
 
   defp sanitize_response_body(val, _depth), do: sanitize_meta_value(val)
+
+  defp sanitize_response_list([], _depth, _count), do: []
+
+  defp sanitize_response_list([_ | _] = list, _depth, count)
+       when count >= @max_sanitized_items do
+    ["[TRUNCATED #{count_remaining_items(list, 0)} items]"]
+  end
+
+  defp sanitize_response_list([{k, v} | rest], depth, count) when is_atom(k) or is_binary(k) do
+    [sanitize_response_entry({k, v}, depth) | sanitize_response_list(rest, depth, count + 1)]
+  end
+
+  defp sanitize_response_list([head | rest], depth, count) do
+    [sanitize_response_body(head, depth + 1) | sanitize_response_list(rest, depth, count + 1)]
+  end
+
+  defp sanitize_response_list(improper_tail, depth, _count) do
+    sanitize_response_body(improper_tail, depth + 1)
+  end
+
+  defp count_remaining_items([], acc), do: acc
+  defp count_remaining_items([_ | rest], acc), do: count_remaining_items(rest, acc + 1)
+  defp count_remaining_items(_improper_tail, acc), do: acc + 1
 
   defp sanitize_response_entry({k, v}, depth) do
     key_down = k |> to_string() |> String.downcase()
@@ -579,13 +595,81 @@ defmodule Creatio.Telemetry do
 
   defp outcome_metadata(_), do: %{result: :ok, status: :ok, error: nil}
 
-  defp attach_request_step(%Req.Request{request_steps: steps} = req) do
+  defp attach_request_step(
+         %Req.Request{request_steps: steps, current_request_steps: current} = req
+       ) do
     if Keyword.has_key?(steps, :creatio_telemetry) do
       req
     else
-      Req.Request.prepend_request_steps(req, creatio_telemetry: &__MODULE__.handle_req_start/1)
+      step = {:creatio_telemetry, &__MODULE__.handle_req_start/1}
+      anchor = last_present_step(steps, [:encode_body, :put_base_url])
+
+      updated_steps =
+        cond do
+          anchor ->
+            insert_step_after(steps, anchor, step)
+
+          Keyword.has_key?(steps, :read_only_guard) ->
+            insert_step_before(steps, :read_only_guard, step)
+
+          true ->
+            [step | steps]
+        end
+
+      updated_current =
+        cond do
+          anchor && anchor in current ->
+            insert_name_after(current, anchor, :creatio_telemetry)
+
+          :read_only_guard in current ->
+            insert_name_before(current, :read_only_guard, :creatio_telemetry)
+
+          true ->
+            [:creatio_telemetry | current]
+        end
+
+      %Req.Request{req | request_steps: updated_steps, current_request_steps: updated_current}
     end
   end
+
+  defp last_present_step(steps, candidates) do
+    steps
+    |> Keyword.keys()
+    |> Enum.filter(&(&1 in candidates))
+    |> List.last()
+  end
+
+  defp insert_step_after([], _anchor, step), do: [step]
+
+  defp insert_step_after([{anchor, _} = head | tail], anchor, step) do
+    [head, step | tail]
+  end
+
+  defp insert_step_after([head | tail], anchor, step) do
+    [head | insert_step_after(tail, anchor, step)]
+  end
+
+  defp insert_step_before([], _target, step), do: [step]
+
+  defp insert_step_before([{target, _} = head | tail], target, step) do
+    [step, head | tail]
+  end
+
+  defp insert_step_before([head | tail], target, step) do
+    [head | insert_step_before(tail, target, step)]
+  end
+
+  defp insert_name_after([], _anchor, name), do: [name]
+  defp insert_name_after([anchor | tail], anchor, name), do: [anchor, name | tail]
+
+  defp insert_name_after([head | tail], anchor, name),
+    do: [head | insert_name_after(tail, anchor, name)]
+
+  defp insert_name_before([], _target, name), do: [name]
+  defp insert_name_before([target | tail], target, name), do: [name, target | tail]
+
+  defp insert_name_before([head | tail], target, name),
+    do: [head | insert_name_before(tail, target, name)]
 
   defp attach_response_step(%Req.Request{response_steps: steps} = req) do
     if Keyword.has_key?(steps, :creatio_telemetry) do

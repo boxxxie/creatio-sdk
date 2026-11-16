@@ -65,7 +65,7 @@ client |> Creatio.stream(query) |> Enum.map(& &1["Id"])
 
 - Use `Creatio.get_field_value(client, entity, id, field, opts)` (or `odata3_get_field_value/5`) to fetch raw scalars or binary streams without automatic JSON decoding (`decode_body: false` is always enforced, even if `:req_options` passes `decode_body: true`).
 - Forward `:into` (e.g. `into: File.stream!("/path/to/file")`), `:headers`, `:req_options`, and OData query options cleanly through `get_field_value/5`.
-- When `:into` is a `Collectable` (such as `File.stream!/1`), chunk forwarding is gated to `2xx` responses (`204` returns `{:ok, nil}` without opening/writing the sink): non-`2xx` error bodies stay buffered so `4xx`/`5xx` server payloads never corrupt the target file and are preserved in `%Creatio.Error{}`. For custom 2-arity `into:` funs (`fn {:data, chunk}, {req, resp} -> ... end`), the callback itself controls status gating.
+- When `:into` is a `Collectable` (such as `File.stream!/1`) or a 2-arity callback (`fn {:data, chunk}, {req, resp} -> ... end`), chunk forwarding is gated to valid `2xx` responses (`204` returns `{:ok, nil}` without opening or invoking the sink): non-`2xx` error bodies (up to 64 KB) and `200` WAF/HTML/JSON error envelopes stay buffered so error payloads never corrupt the sink and are preserved in `%Creatio.Error{}`.
 - Upload binaries, `File.Stream`, or arbitrary `Stream` chunks via `Creatio.update_field(client, entity, id, field, data, opts)` (uses `application/octet-stream` for binary/stream bodies or `Jason.encode_to_iodata!/1` for scalar/map values).
 - Pass `return: :minimal` on `create/4`, `update/5`, or `Batch.new/1` / `Batch.add/4` to send `Prefer: return=minimal` and extract `Id` / `@odata.id` from `204` `odata-entityid` / `location` headers.
 

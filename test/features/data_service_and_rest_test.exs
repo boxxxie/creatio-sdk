@@ -213,7 +213,7 @@ defmodule Creatio.Features.DataServiceAndRestTest do
                raw_body: "{broken"
              )
       @upon running_select_query(%{})
-      @then data_service_failed_with(status: nil)
+      @then data_service_failed_with(status: 200)
 
       @given data_service_endpoint("SelectQuery", content_type: "text/plain", raw_body: "{broken")
       @upon running_select_query(%{})

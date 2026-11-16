@@ -60,7 +60,7 @@ defmodule Creatio.Batch do
   @spec new(Creatio.opts()) :: t()
   def new(opts \\ []) do
     %__MODULE__{
-      continue_on_error: Util.get_opt(opts, :continue_on_error, false),
+      continue_on_error: Util.get_opt(opts, :continue_on_error, false) == true,
       return: Util.get_opt(opts, :return)
     }
   end
@@ -94,7 +94,7 @@ defmodule Creatio.Batch do
 
     prefer =
       build_prefer(
-        batch.continue_on_error or Util.get_opt(opts, :continue_on_error, false),
+        resolve_continue_on_error(batch, opts),
         Util.get_opt(opts, :return, batch.return)
       )
 
@@ -307,7 +307,7 @@ defmodule Creatio.Batch do
         do_execute_requests(
           client,
           requests,
-          batch.continue_on_error or Util.get_opt(opts, :continue_on_error, false),
+          resolve_continue_on_error(batch, opts),
           Util.get_opt(opts, :return, batch.return),
           format,
           opts
@@ -332,7 +332,11 @@ defmodule Creatio.Batch do
       :batch,
       %{format: format, operation_count: length(requests), base_url: client.base_url},
       fn ->
-        normalized = Enum.map(requests, &normalize_raw_request/1)
+        normalized =
+          requests
+          |> Enum.with_index(1)
+          |> Enum.map(fn {req, idx} -> normalize_raw_request(req, idx) end)
+
         validate_contiguous_atomicity_groups!(normalized)
 
         do_execute_requests(
@@ -525,7 +529,7 @@ defmodule Creatio.Batch do
         content_type = resp |> get_resp_content_type() |> String.downcase()
 
         if String.contains?(content_type, "multipart/mixed") and is_binary(resp.body) do
-          parse_multipart_response(resp.body, extract_boundary_from_header(content_type))
+          parse_multipart_with_resp(resp, extract_boundary_from_header(content_type))
         else
           {:error, Error.from_response(resp)}
         end
@@ -538,9 +542,9 @@ defmodule Creatio.Batch do
 
         cond do
           String.contains?(content_type, "multipart/mixed") ->
-            parse_multipart_response(resp_body, extract_boundary_from_header(content_type))
+            parse_multipart_with_resp(resp, extract_boundary_from_header(content_type))
 
-          String.trim(resp_body) == "" ->
+          Util.blank_body?(resp_body) ->
             {:ok, []}
 
           true ->
@@ -563,6 +567,21 @@ defmodule Creatio.Batch do
     Error.wrap_error(exception)
   end
 
+  defp parse_multipart_with_resp(%Req.Response{} = resp, boundary) do
+    case parse_multipart_response(resp.body, boundary) do
+      {:ok, responses} ->
+        {:ok, responses}
+
+      {:error, %Error{} = err} ->
+        {:error,
+         %Error{
+           err
+           | status: err.status || resp.status,
+             response: err.response || Error.from_response(resp).response
+         }}
+    end
+  end
+
   defp parse_json_batch_response(%Req.Response{body: %{"responses" => raw_responses}}) do
     responses =
       Enum.map(raw_responses, fn r ->
@@ -578,30 +597,6 @@ defmodule Creatio.Batch do
     {:ok, responses}
   end
 
-  defp parse_json_batch_response(%Req.Response{body: %{"error" => _}} = resp) do
-    {:error, Error.from_response(resp)}
-  end
-
-  defp parse_json_batch_response(%Req.Response{body: %{"errorInfo" => %{} = info}} = resp)
-       when map_size(info) > 0 do
-    {:error, Error.from_response(resp)}
-  end
-
-  defp parse_json_batch_response(%Req.Response{body: %{"ErrorInfo" => %{} = info}} = resp)
-       when map_size(info) > 0 do
-    {:error, Error.from_response(resp)}
-  end
-
-  defp parse_json_batch_response(%Req.Response{body: %{"success" => val}} = resp)
-       when val in [false, "false"] do
-    {:error, Error.from_response(resp)}
-  end
-
-  defp parse_json_batch_response(%Req.Response{body: %{"Success" => val}} = resp)
-       when val in [false, "false"] do
-    {:error, Error.from_response(resp)}
-  end
-
   defp parse_json_batch_response(%Req.Response{body: body_str} = resp) when is_binary(body_str) do
     cleaned_body = String.trim_leading(body_str, "\uFEFF")
 
@@ -611,7 +606,7 @@ defmodule Creatio.Batch do
 
       _ ->
         if String.starts_with?(String.trim_leading(cleaned_body), "--") do
-          parse_multipart_response(cleaned_body, nil)
+          parse_multipart_with_resp(%Req.Response{resp | body: cleaned_body}, nil)
         else
           {:error,
            Error.new(
@@ -625,16 +620,20 @@ defmodule Creatio.Batch do
   end
 
   defp parse_json_batch_response(%Req.Response{body: %{} = entity} = resp) do
-    {:ok,
-     [
-       %Response{
-         id: entity["Id"] || entity["id"] || "1",
-         status: resp.status,
-         headers: resp.headers,
-         body: entity,
-         atomicity_group: nil
-       }
-     ]}
+    if Util.error_payload?(entity) do
+      {:error, Error.from_response(resp)}
+    else
+      {:ok,
+       [
+         %Response{
+           id: entity["Id"] || entity["id"] || "1",
+           status: resp.status,
+           headers: resp.headers,
+           body: entity,
+           atomicity_group: nil
+         }
+       ]}
+    end
   end
 
   @doc """
@@ -645,31 +644,74 @@ defmodule Creatio.Batch do
   @spec parse_multipart_response(String.t(), String.t() | nil) ::
           {:ok, [Response.t()]} | {:error, Error.t()}
   def parse_multipart_response(body, boundary \\ nil) when is_binary(body) do
-    detected_boundary =
-      if is_binary(boundary) and String.trim(boundary) != "" do
-        clean_boundary_str(boundary)
-      else
-        extract_boundary(body)
-      end
-
-    if is_nil(detected_boundary) or detected_boundary == "" do
-      {:ok, []}
+    if Util.html_or_xml_markup?(%Req.Response{body: body}) do
+      {:error,
+       Error.new(
+         message: "Unexpected HTML/XML response in multipart batch",
+         details: :binary.copy(body)
+       )}
     else
-      {:ok, do_parse_multipart(body, detected_boundary, nil)}
+      detected_boundary =
+        if is_binary(boundary) and String.trim(boundary) != "" do
+          clean_boundary_str(boundary)
+        else
+          extract_boundary(body)
+        end
+
+      cond do
+        not is_binary(detected_boundary) or detected_boundary == "" ->
+          if String.starts_with?(String.trim_leading(body), "--") do
+            {:error,
+             Error.new(
+               message: "Malformed multipart batch response: missing or invalid boundary",
+               details: :binary.copy(body)
+             )}
+          else
+            {:ok, []}
+          end
+
+        true ->
+          do_parse_multipart(body, detected_boundary, nil)
+      end
     end
   end
 
   defp do_parse_multipart(body, boundary, current_group) do
-    body
-    |> Validation.split_multipart_parts(boundary)
-    |> Enum.flat_map(&parse_multipart_part(&1, current_group))
+    if has_closing_boundary?(body, boundary) do
+      body
+      |> Validation.split_multipart_parts(boundary)
+      |> Enum.reduce_while({:ok, []}, fn raw_part, {:ok, acc} ->
+        case parse_multipart_part(raw_part, current_group) do
+          {:ok, items} -> {:cont, {:ok, Enum.reverse(items, acc)}}
+          {:error, _} = err -> {:halt, err}
+        end
+      end)
+      |> case do
+        {:ok, rev_items} -> {:ok, Enum.reverse(rev_items)}
+        {:error, _} = err -> err
+      end
+    else
+      {:error,
+       Error.new(
+         message:
+           "Malformed or truncated multipart batch response: missing closing boundary --#{boundary}--",
+         details: :binary.copy(body)
+       )}
+    end
+  end
+
+  defp has_closing_boundary?(body, boundary) do
+    Regex.match?(
+      ~r/(?:\r\n|\n|\A)--#{Regex.escape(boundary)}--[ \t]*(?=\r\n|\n|\z)/,
+      body
+    )
   end
 
   defp parse_multipart_part(raw_part, current_group) do
     part = strip_part_crlf(raw_part)
 
     if part == "" or String.starts_with?(part, "--") do
-      []
+      {:ok, []}
     else
       {mime_head, mime_body} = split_blank_line(part)
       mime_headers = parse_headers(mime_head)
@@ -678,7 +720,7 @@ defmodule Creatio.Batch do
       if String.contains?(String.downcase(mime_ct), "multipart/mixed") do
         case extract_boundary_from_header(mime_ct) do
           nil ->
-            []
+            {:error, Error.new(message: "Malformed nested multipart changeset: missing boundary")}
 
           inner_boundary ->
             group = extract_group_name(inner_boundary)
@@ -717,18 +759,22 @@ defmodule Creatio.Batch do
               :binary.copy(http_body)
           end
 
-        [
-          %Response{
-            id: id,
-            status: status,
-            headers: headers,
-            body: parsed_body,
-            atomicity_group: current_group && :binary.copy(current_group)
-          }
-        ]
+        {:ok,
+         [
+           %Response{
+             id: id,
+             status: status,
+             headers: headers,
+             body: parsed_body,
+             atomicity_group: current_group && :binary.copy(current_group)
+           }
+         ]}
 
       :error ->
-        []
+        {:error,
+         Error.new(
+           message: "Malformed HTTP response part in multipart batch: #{inspect(status_line)}"
+         )}
     end
   end
 
@@ -948,10 +994,12 @@ defmodule Creatio.Batch do
     |> String.upcase()
   end
 
-  defp normalize_raw_request(req) when is_map(req) do
+  defp normalize_raw_request(req, idx) when is_map(req) do
     normalized =
       Enum.reduce(req, %{}, fn
         {:atomicity_group, v}, acc -> Map.put(acc, "atomicityGroup", v)
+        {:method, nil}, acc -> Map.put(acc, "method", nil)
+        {"method", nil}, acc -> Map.put(acc, "method", nil)
         {:method, v}, acc -> Map.put(acc, "method", validate_http_method!(v))
         {"method", v}, acc -> Map.put(acc, "method", validate_http_method!(v))
         {k, v}, acc -> Map.put(acc, to_string(k), v)
@@ -960,9 +1008,12 @@ defmodule Creatio.Batch do
     method = validate_http_method!(normalized["method"] || "GET")
     url = validate_batch_url!(normalized["url"])
 
-    if Map.has_key?(normalized, "id") and not is_nil(normalized["id"]) do
-      validate_item_id!(normalized["id"])
-    end
+    id_str =
+      case normalized["id"] do
+        nil -> "req_#{idx}"
+        "" -> "req_#{idx}"
+        id -> validate_item_id!(id)
+      end
 
     case normalized["atomicityGroup"] do
       nil -> :ok
@@ -977,13 +1028,17 @@ defmodule Creatio.Batch do
         normalized
       end
 
-    if Map.has_key?(normalized, "headers") and not is_nil(normalized["headers"]) do
-      _ = merge_headers_case_insensitive(%{}, normalized["headers"])
-    end
+    base_headers =
+      %{"Accept" => "application/json; odata.metadata=minimal"}
+      |> maybe_put_body_content_type(normalized["body"])
+
+    headers = merge_headers_case_insensitive(base_headers, normalized["headers"])
 
     normalized
+    |> Map.put("id", id_str)
     |> Map.put("method", method)
     |> Map.put("url", url)
+    |> Map.put("headers", headers)
   end
 
   defp build_entity_key_url!(entity, id, fun_name) do
@@ -1056,7 +1111,7 @@ defmodule Creatio.Batch do
 
   defp validate_atomicity_group!(group) when is_binary(group) do
     if group == "" or byte_size(group) > 49 or
-         not Regex.match?(~r/^[A-Za-z0-9_.-]+$/, group) do
+         not Regex.match?(~r/\A[A-Za-z0-9_.-]+\z/, group) do
       raise ArgumentError,
             "invalid atomicity_group #{inspect(group)}: expected non-empty ASCII token [A-Za-z0-9_.-] of at most 49 bytes"
     end
@@ -1070,7 +1125,7 @@ defmodule Creatio.Batch do
 
   defp validate_boundary!(name, boundary) when is_binary(boundary) do
     if boundary == "" or byte_size(boundary) > 70 or
-         not Regex.match?(~r/^[A-Za-z0-9_.-]+$/, boundary) do
+         not Regex.match?(~r/\A[A-Za-z0-9_.-]+\z/, boundary) do
       raise ArgumentError,
             "invalid #{name} #{inspect(boundary)}: expected non-empty ASCII token [A-Za-z0-9_.-] of at most 70 bytes"
     end
@@ -1127,7 +1182,7 @@ defmodule Creatio.Batch do
   defp validate_http_method!(method) when is_binary(method) or is_atom(method) do
     method_str = method |> to_string() |> String.trim() |> String.upcase()
 
-    if method_str == "" or not Regex.match?(~r/^[A-Z0-9_-]+$/, method_str) do
+    if method_str == "" or not Regex.match?(~r/\A[A-Z0-9_-]+\z/, method_str) do
       raise ArgumentError, "invalid batch HTTP method: #{inspect(method)}"
     end
 
@@ -1139,7 +1194,7 @@ defmodule Creatio.Batch do
   end
 
   defp validate_header_name!(name) do
-    if name == "" or not Regex.match?(~r/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/, name) do
+    if name == "" or not Regex.match?(~r/\A[!#$%&'*+\-.^_`|~0-9A-Za-z]+\z/, name) do
       raise ArgumentError, "invalid batch header name: #{inspect(name)}"
     end
 
@@ -1261,21 +1316,28 @@ defmodule Creatio.Batch do
   defp parse_status_code(s) when is_integer(s), do: s
 
   defp parse_status_code(s) when is_binary(s) do
-    case Integer.parse(s) do
-      {int, _} -> int
+    case Integer.parse(String.trim(s)) do
+      {int, ""} -> int
       _ -> s
     end
   end
 
   defp parse_status_code(other), do: other
 
+  defp resolve_continue_on_error(%__MODULE__{continue_on_error: default}, opts) do
+    case Util.get_opt(opts, :continue_on_error) do
+      val when is_boolean(val) -> val
+      _ -> default
+    end
+  end
+
   defp extract_group_name(boundary) do
-    case Regex.run(~r/^changeset_([A-Za-z0-9_.-]+)_[A-Za-z0-9]+$/i, boundary) do
+    case Regex.run(~r/\Achangeset_([A-Za-z0-9_.-]+)_[A-Za-z0-9]+\z/i, boundary) do
       [_, group] ->
         group
 
       _ ->
-        case Regex.run(~r/^changeset_([A-Za-z0-9_.-]+)$/i, boundary) do
+        case Regex.run(~r/\Achangeset_([A-Za-z0-9_.-]+)\z/i, boundary) do
           [_, group] -> group
           _ -> "changeset"
         end

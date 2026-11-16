@@ -595,5 +595,96 @@ defmodule Creatio.BatchTest do
       assert prefer =~ "continue-on-error"
       assert prefer =~ "return=minimal"
     end
+
+    test "rejects trailing newlines and populates raw list defaults with continue_on_error override" do
+      assert_raise ArgumentError, ~r/invalid boundary/, fn ->
+        Batch.to_multipart(Batch.new() |> Batch.add_get("Contact"), boundary: "batch_1\n")
+      end
+
+      assert_raise ArgumentError, ~r/invalid atomicity_group/, fn ->
+        Batch.new() |> Batch.add_create("Contact", %{"Name" => "A"}, atomicity_group: "grp\n")
+      end
+
+      assert_raise ArgumentError, ~r/invalid batch header name/, fn ->
+        Batch.new() |> Batch.add("GET", "Contact", headers: %{"X-Test\n" => "v"})
+      end
+
+      parent = self()
+
+      raw_plug = fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+
+        send(
+          parent,
+          {:batch_payload, Jason.decode!(raw), Plug.Conn.get_req_header(conn, "prefer")}
+        )
+
+        Req.Test.json(conn, %{"responses" => [%{"id" => "req_1", "status" => 200, "body" => %{}}]})
+      end
+
+      raw_client =
+        Creatio.Client.new(base_url: "https://mycreatio.com", req_options: [plug: raw_plug])
+
+      assert {:ok, _} =
+               Batch.execute(raw_client, [
+                 %{url: "Contact"},
+                 %{method: :post, url: "Contact", body: %{"Name" => "Alice"}}
+               ])
+
+      assert_receive {:batch_payload, %{"requests" => [r1, r2]}, _}
+      assert r1["id"] == "req_1"
+      assert r1["method"] == "GET"
+      assert r1["headers"]["Accept"] == "application/json; odata.metadata=minimal"
+      assert r2["id"] == "req_2"
+      assert r2["method"] == "POST"
+      assert r2["headers"]["Content-Type"] =~ "application/json"
+
+      # continue_on_error: false overrides Batch.new(continue_on_error: true)
+      batch_coe =
+        Batch.new(continue_on_error: true)
+        |> Batch.add_get("Contact", "1", continue_on_error: false)
+
+      [op_no_coe] = Batch.requests(batch_coe)
+      refute Map.has_key?(op_no_coe["headers"], "Prefer")
+
+      assert {:ok, _} = Batch.execute(raw_client, batch_coe, continue_on_error: false)
+      assert_receive {:batch_payload, _, []}
+    end
+
+    test "normalizes Response.to_error/1 headers/status and rejects truncated, HTML, or -- multipart" do
+      # Response.to_error/1 normalizes headers to list values and non-integer status to nil
+      resp_item = %Response{
+        id: "1",
+        status: "not_a_code",
+        headers: %{"Content-Type" => "application/json", "x-req" => "abc"},
+        body: %{"error" => %{"message" => "Bad"}}
+      }
+
+      err = Response.to_error(resp_item)
+      assert err.status == nil
+      assert Req.Response.get_header(err.response, "content-type") == ["application/json"]
+      assert Req.Response.get_header(err.response, "x-req") == ["abc"]
+
+      # Truncated / HTML multipart responses return {:error, %Error{}}
+      assert {:error, %Error{}} =
+               Batch.parse_multipart_response(
+                 "--batch_1\r\nContent-Type: application/http\r\n\r\nHTTP/1.1 200 OK\r\n",
+                 "batch_1"
+               )
+
+      assert {:error, %Error{}} =
+               Batch.parse_multipart_response("<html><body>WAF</body></html>", "batch_1")
+
+      assert {:error, %Error{}} = Batch.parse_multipart_response("-- not a valid multipart")
+
+      # BOM-only empty 200 batch response returns {:ok, []}
+      bom_empty_client =
+        Creatio.Client.new(
+          base_url: "https://mycreatio.com",
+          req_options: [plug: fn conn -> Plug.Conn.send_resp(conn, 200, "\uFEFF   ") end]
+        )
+
+      assert {:ok, []} = Batch.execute(bom_empty_client, Batch.new() |> Batch.add_get("Contact"))
+    end
   end
 end

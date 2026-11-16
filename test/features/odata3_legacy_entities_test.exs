@@ -495,9 +495,9 @@ defmodule Creatio.Features.OData3LegacyEntitiesTest do
       @upon updating_odata3_entity("Lead", @waf_entity_id, %{"Name" => "X"},
               return: :representation
             )
-      @then operation_failed_with(status: nil)
+      @then operation_failed_with(status: 200)
       @upon getting_odata3_field("Lead", @waf_entity_id, "Name")
-      @then operation_failed_with(status: nil)
+      @then operation_failed_with(status: 200)
 
       @given odata3_updatable_entity("Lead", @waf_entity_id,
                status: 200,

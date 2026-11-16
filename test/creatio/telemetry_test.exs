@@ -968,5 +968,72 @@ defmodule Creatio.TelemetryTest do
 
       assert Enum.find(sanitized.conn.req_headers, &(elem(&1, 0) == "x-ok")) == {"x-ok", "yes"}
     end
+
+    test "redacts .ASPXAUTH cookies, string-keyed tuple lists, and handles improper lists safely" do
+      err = %Error{
+        status: 401,
+        message: "\".ASPXAUTH=secret-aspx-cookie; BPMLOADER=secret-loader\"",
+        details: [
+          {"client_secret", "tuple-secret"},
+          {"bpmcsrf", "tuple-csrf"},
+          [:improper_head | :improper_tail]
+        ],
+        response: %Req.Response{
+          status: 401,
+          body: [1 | :improper_resp_tail]
+        }
+      }
+
+      sanitized = Telemetry.sanitize_metadata(%{error: err})
+
+      refute sanitized.error.message =~ "secret-aspx-cookie"
+      refute sanitized.error.message =~ "secret-loader"
+      assert sanitized.error.message =~ ".ASPXAUTH=[REDACTED]"
+      assert sanitized.error.message =~ "BPMLOADER=[REDACTED]"
+
+      assert [
+               {"client_secret", "[REDACTED]"},
+               {"bpmcsrf", "[REDACTED]"},
+               [:improper_head | :improper_tail]
+             ] = sanitized.error.details
+
+      assert sanitized.error.response.body == [1 | :improper_resp_tail]
+
+      assert_raise RuntimeError, "boom", fn ->
+        Telemetry.span(:odata, %{action: :test}, fn ->
+          raise RuntimeError, "boom"
+        end)
+      end
+
+      assert_receive {:telemetry_event, [:creatio, :odata, :exception], _, _}
+    end
+
+    test "request telemetry runs after encode_body and put_base_url (no orphaned :start on EncodeError, virtual dir path matches)" do
+      plug = fn conn -> Req.Test.json(conn, %{"value" => []}) end
+
+      client =
+        Client.new(
+          base_url: "https://crm.test/creatio",
+          req_options: [plug: plug]
+        )
+
+      drain_events()
+
+      assert {:ok, []} = OData.list(client, "Contact")
+
+      assert_receive {:telemetry_event, [:creatio, :request, :start], _, start_meta}
+      assert_receive {:telemetry_event, [:creatio, :request, :stop], _, stop_meta}
+      assert start_meta.path == "/creatio/0/odata/Contact"
+      assert stop_meta.path == "/creatio/0/odata/Contact"
+
+      drain_events()
+
+      assert_raise Jason.EncodeError, fn ->
+        Req.post(client.req, url: "/0/odata/Contact", json: %{bad: <<0xFF>>})
+      end
+
+      events = drain_events()
+      refute Enum.any?(events, fn {ev, _, _} -> ev == [:creatio, :request, :start] end)
+    end
   end
 end

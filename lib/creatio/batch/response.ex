@@ -34,9 +34,44 @@ defmodule Creatio.Batch.Response do
   @spec to_error(t()) :: Error.t()
   def to_error(%__MODULE__{} = resp) do
     Error.from_response(%Req.Response{
-      status: resp.status,
-      headers: resp.headers || %{},
+      status: normalize_status(resp.status),
+      headers: normalize_req_headers(resp.headers),
       body: resp.body
     })
   end
+
+  defp normalize_status(status) when is_integer(status), do: status
+
+  defp normalize_status(status) when is_binary(status) do
+    case Integer.parse(String.trim(status)) do
+      {int, ""} -> int
+      _ -> nil
+    end
+  end
+
+  defp normalize_status(_), do: nil
+
+  defp normalize_req_headers(nil), do: %{}
+
+  defp normalize_req_headers(headers) when is_map(headers) do
+    Map.new(headers, fn {k, v} ->
+      {k |> to_string() |> String.downcase(), normalize_header_vals(v)}
+    end)
+  end
+
+  defp normalize_req_headers(headers) when is_list(headers) do
+    Enum.reduce(headers, %{}, fn
+      {k, v}, acc ->
+        Map.put(acc, k |> to_string() |> String.downcase(), normalize_header_vals(v))
+
+      _, acc ->
+        acc
+    end)
+  end
+
+  defp normalize_req_headers(_), do: %{}
+
+  defp normalize_header_vals(vals) when is_list(vals), do: Enum.map(vals, &to_string/1)
+  defp normalize_header_vals(nil), do: []
+  defp normalize_header_vals(val), do: [to_string(val)]
 end

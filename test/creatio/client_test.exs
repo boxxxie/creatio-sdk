@@ -550,4 +550,98 @@ defmodule Creatio.ClientEnvTest do
     assert none_client.auth_token == nil
     assert Req.Request.get_header(none_client.req, "authorization") == []
   end
+
+  test "disabling read_only via from_req/2 clears current_request_steps and executes requests without KeyError" do
+    plug = fn conn -> Req.Test.json(conn, %{"ok" => true}) end
+
+    ro_client =
+      Client.new(
+        base_url: "https://mycreatio.com",
+        read_only: true,
+        req_options: [plug: plug]
+      )
+
+    assert :read_only_guard in ro_client.req.current_request_steps
+
+    rw_client = Client.from_req(ro_client.req, read_only: false)
+    refute Keyword.has_key?(rw_client.req.request_steps, :read_only_guard)
+    refute :read_only_guard in rw_client.req.current_request_steps
+
+    assert {:ok, %Req.Response{status: 200}} =
+             Req.post(rw_client.req, url: "/0/odata/Contact", json: %{"Name" => "Alice"})
+  end
+
+  test "read_only_guard blocks case-insensitive /0/rest/ paths and non-POST methods on whitelisted suffixes" do
+    plug = fn conn -> Req.Test.json(conn, %{"ok" => true}) end
+
+    ro =
+      Client.new(
+        base_url: "https://mycreatio.com",
+        read_only: true,
+        req_options: [plug: plug]
+      )
+
+    for {method, path} <- [
+          {:post, "/0/REST/MyService/AuthService.svc/Login"},
+          {:post, "/0/Rest/MyService/DataService/json/SyncReply/SelectQuery"},
+          {:delete, "/ServiceModel/AuthService.svc/Login"},
+          {:put, "/0/DataService/json/SyncReply/SelectQuery"},
+          {:patch, "/connect/token"}
+        ] do
+      assert {:error, %Creatio.Error{status: 403, code: "ReadOnlyMode"}} =
+               Req.request(ro.req, method: method, url: path, json: %{})
+    end
+  end
+
+  test "handles UTF-8 BOM-prefixed application/json responses and trims env/bearer secrets" do
+    bom_plug = fn conn ->
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.send_resp(200, "\uFEFF" <> Jason.encode!(%{"value" => [%{"Id" => "1"}]}))
+    end
+
+    default_client = Client.new(base_url: "https://mycreatio.com", req_options: [plug: bom_plug])
+    assert default_client.req.options[:decode_body] == false
+    assert {:ok, [%{"Id" => "1"}]} = Creatio.OData.list(default_client, "Contact")
+
+    explicit_decode_client =
+      Client.new(
+        base_url: "https://mycreatio.com",
+        req_options: [plug: bom_plug, decode_body: true]
+      )
+
+    assert {:ok, [%{"Id" => "1"}]} = Creatio.OData.list(explicit_decode_client, "Contact")
+
+    prev_url = System.get_env("CREATIO_BASE_URL")
+    prev_tok = System.get_env("CREATIO_AUTH_TOKEN")
+    prev_cid = System.get_env("CREATIO_CLIENT_ID")
+    prev_sec = System.get_env("CREATIO_CLIENT_SECRET")
+
+    on_exit(fn ->
+      for {k, v} <- [
+            {"CREATIO_BASE_URL", prev_url},
+            {"CREATIO_AUTH_TOKEN", prev_tok},
+            {"CREATIO_CLIENT_ID", prev_cid},
+            {"CREATIO_CLIENT_SECRET", prev_sec}
+          ] do
+        if is_binary(v), do: System.put_env(k, v), else: System.delete_env(k)
+      end
+    end)
+
+    System.put_env("CREATIO_BASE_URL", " https://env.creatio.com/\n")
+    System.put_env("CREATIO_AUTH_TOKEN", " env-token \n")
+    System.put_env("CREATIO_CLIENT_ID", " env-cid \n")
+    System.put_env("CREATIO_CLIENT_SECRET", " env-csec \n")
+
+    trimmed = Client.new()
+    assert trimmed.base_url == "https://env.creatio.com"
+    assert trimmed.auth_token == "env-token"
+    assert trimmed.client_id == "env-cid"
+    assert trimmed.client_secret == "env-csec"
+    assert Req.Request.get_header(trimmed.req, "authorization") == ["Bearer env-token"]
+
+    updated = Client.put_bearer_token(trimmed, "  new-tok \n")
+    assert updated.auth_token == "new-tok"
+    assert Req.Request.get_header(updated.req, "authorization") == ["Bearer new-tok"]
+  end
 end

@@ -243,7 +243,7 @@ defmodule Creatio.DataService do
             {:error, Error.from_response(resp)}
 
           {:ok, %Req.Response{status: status, body: %{} = body} = resp} when status in 200..299 ->
-            if body["success"] in [false, "false"] or body["Success"] in [false, "false"] do
+            if Util.error_payload?(body) do
               {:error, Error.from_response(resp)}
             else
               {:ok, body}
@@ -314,19 +314,36 @@ defmodule Creatio.DataService do
               final_payload
             end
 
-          req_opts =
+          {req_with_headers, req_opts} =
             cond do
-              is_nil(final_payload) -> req_opts
-              is_binary(final_payload) -> Keyword.put(req_opts, :body, final_payload)
-              true -> Keyword.put(req_opts, :json, final_payload)
+              is_nil(final_payload) ->
+                {req_with_extra_headers, req_opts}
+
+              is_binary(final_payload) ->
+                req_with_ct =
+                  if Req.Request.get_header(req_with_extra_headers, "content-type") == [] and
+                       json_binary?(final_payload) do
+                    Req.Request.put_header(
+                      req_with_extra_headers,
+                      "content-type",
+                      "application/json; charset=utf-8"
+                    )
+                  else
+                    req_with_extra_headers
+                  end
+
+                {req_with_ct, Keyword.put(req_opts, :body, final_payload)}
+
+              true ->
+                {req_with_extra_headers, Keyword.put(req_opts, :json, final_payload)}
             end
 
-          case Req.request(req_with_extra_headers, req_opts) do
+          case Req.request(req_with_headers, req_opts) do
             {:ok, %Req.Response{} = raw_resp} ->
               case Util.decode_api_response(raw_resp) do
                 {:ok, %Req.Response{status: status, body: body} = resp}
                 when status in 200..299 ->
-                  if wcf_error_payload?(body) do
+                  if Util.error_payload?(body) do
                     {:error, Error.from_response(resp)}
                   else
                     {:ok, body}
@@ -370,8 +387,9 @@ defmodule Creatio.DataService do
     end
   end
 
-  defp resolve_custom_payload_and_params(:delete, payload, params)
-       when is_nil(payload) or payload == %{} or payload == [] do
+  defp resolve_custom_payload_and_params(http_method, payload, params)
+       when http_method in [:delete, :options] and
+              (is_nil(payload) or payload == %{} or payload == []) do
     {nil, params}
   end
 
@@ -405,15 +423,15 @@ defmodule Creatio.DataService do
     raise ArgumentError, "invalid HTTP method for custom_service/5: #{inspect(other)}"
   end
 
-  defp wcf_error_payload?(%{"error" => _}), do: true
-  defp wcf_error_payload?(%{"errorInfo" => %{} = info}) when map_size(info) > 0, do: true
-  defp wcf_error_payload?(%{"ErrorInfo" => %{} = info}) when map_size(info) > 0, do: true
-  defp wcf_error_payload?(%{"responseStatus" => %{} = rs}) when map_size(rs) > 0, do: true
-  defp wcf_error_payload?(%{"ResponseStatus" => %{} = rs}) when map_size(rs) > 0, do: true
-  defp wcf_error_payload?(%{"Exception" => %{} = ex}) when map_size(ex) > 0, do: true
-  defp wcf_error_payload?(%{"success" => val}) when val in [false, "false"], do: true
-  defp wcf_error_payload?(%{"Success" => val}) when val in [false, "false"], do: true
-  defp wcf_error_payload?(_), do: false
+  defp json_binary?(bin) when is_binary(bin) do
+    trimmed = bin |> String.trim_leading("\uFEFF") |> String.trim_leading()
+
+    if String.starts_with?(trimmed, ["{", "["]) do
+      match?({:ok, _}, Jason.decode(trimmed))
+    else
+      false
+    end
+  end
 
   defp stringify_keys(nil), do: %{}
 
@@ -470,7 +488,7 @@ defmodule Creatio.DataService do
     trimmed = String.trim(val)
 
     if trimmed != "" and trimmed not in [".", ".."] and not String.contains?(trimmed, "..") and
-         Regex.match?(~r/^[A-Za-z0-9_.-]+$/, trimmed) do
+         Regex.match?(~r/\A[A-Za-z0-9_.-]+\z/, trimmed) do
       trimmed
     else
       raise ArgumentError,
@@ -488,8 +506,11 @@ defmodule Creatio.DataService do
 
     case Util.safe_normalized_path(raw_path) do
       {:ok, path} ->
+        path_down = String.downcase(path)
+
         action == "SelectQuery" and
-          not String.contains?(path, "/0/rest/") and
+          not String.contains?(path_down, "/0/rest/") and
+          not String.starts_with?(String.trim_leading(path_down, "/"), "0/rest/") and
           String.ends_with?(path, "/DataService/json/SyncReply/SelectQuery")
 
       {:error, :invalid_path} ->

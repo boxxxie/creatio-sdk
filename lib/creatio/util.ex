@@ -31,7 +31,7 @@ defmodule Creatio.Util do
         %{}
 
       uri ->
-        case Regex.run(~r/\(([^()]+)\)\s*$/, uri) do
+        case Regex.run(~r/\(([^()]+)\)\s*\z/, uri) do
           [_, raw_id] ->
             cleaned = strip_guid_syntax(raw_id)
 
@@ -157,6 +157,34 @@ defmodule Creatio.Util do
      )}
   end
 
+  @doc false
+  @spec blank_body?(any()) :: boolean()
+  def blank_body?(nil), do: true
+
+  def blank_body?(bin) when is_binary(bin) do
+    bin |> String.trim() |> String.trim_leading("\uFEFF") |> String.trim() == ""
+  end
+
+  def blank_body?(_), do: false
+
+  @doc false
+  @spec error_payload?(any()) :: boolean()
+  def error_payload?(%{"error" => _}), do: true
+  def error_payload?(%{"d" => %{"error" => _}}), do: true
+  def error_payload?(%{"errorInfo" => %{} = info}) when map_size(info) > 0, do: true
+  def error_payload?(%{"ErrorInfo" => %{} = info}) when map_size(info) > 0, do: true
+  def error_payload?(%{"responseStatus" => %{} = rs}) when map_size(rs) > 0, do: true
+  def error_payload?(%{"ResponseStatus" => %{} = rs}) when map_size(rs) > 0, do: true
+  def error_payload?(%{"Exception" => %{} = ex}) when map_size(ex) > 0, do: true
+
+  def error_payload?(%{"ExceptionMessage" => msg}) when is_binary(msg) do
+    String.trim(msg) != ""
+  end
+
+  def error_payload?(%{"success" => val}) when val in [false, "false"], do: true
+  def error_payload?(%{"Success" => val}) when val in [false, "false"], do: true
+  def error_payload?(_), do: false
+
   @doc """
   Validates an HTTP `200`/`201` void mutation response, rejecting HTML/XML WAF pages
   and corrupt/non-empty unexpected payloads.
@@ -173,13 +201,10 @@ defmodule Creatio.Util do
             :ok
 
           bin when is_binary(bin) ->
-            if String.trim(bin) == "", do: :ok, else: {:error, Error.from_response(resp)}
+            if blank_body?(bin), do: :ok, else: {:error, Error.from_response(resp)}
 
-          %{"error" => _} ->
-            {:error, Error.from_response(resp)}
-
-          %{} ->
-            :ok
+          %{} = body ->
+            if error_payload?(body), do: {:error, Error.from_response(resp)}, else: :ok
 
           _other ->
             {:error, Error.from_response(resp)}
@@ -261,6 +286,7 @@ defmodule Creatio.Util do
     "<!doctype",
     "<html",
     "<?xml",
+    "<!--",
     "<iframe",
     "<head",
     "<body",
@@ -390,8 +416,15 @@ defmodule Creatio.Util do
           {:select, select_val} ->
             put_non_empty_csv_opt(acc, "$select", select_val)
 
+          {:filter, nil} ->
+            acc
+
           {:filter, bin} when is_binary(bin) ->
             if String.trim(bin) == "", do: acc, else: Map.put(acc, "$filter", bin)
+
+          {:filter, other} ->
+            raise ArgumentError,
+                  "expected :filter to be a binary string or nil, got: #{inspect(other)}"
 
           {key, order_val} when key in [:orderby, :order_by] ->
             orderby_str = format_orderby_opt(order_val)
@@ -478,28 +511,48 @@ defmodule Creatio.Util do
 
   defp merge_param_entries(acc, entries) when is_list(entries) do
     Enum.reduce(entries, acc, fn
-      {_k, nil}, a -> a
-      {k, v}, a -> Map.put(a, to_string(k), format_extra_param_val(v))
-      _, a -> a
+      {_k, nil}, a ->
+        a
+
+      {k, v}, a ->
+        key_str = to_string(k)
+
+        if key_str == "$filter" and is_binary(v) and String.trim(v) == "" do
+          a
+        else
+          Map.put(a, key_str, format_extra_param_val(v))
+        end
+
+      _, a ->
+        a
     end)
   end
 
   defp normalize_odata_opt_key("select"), do: :select
   defp normalize_odata_opt_key("$select"), do: :select
+  defp normalize_odata_opt_key(:"$select"), do: :select
   defp normalize_odata_opt_key("filter"), do: :filter
   defp normalize_odata_opt_key("$filter"), do: :filter
+  defp normalize_odata_opt_key(:"$filter"), do: :filter
   defp normalize_odata_opt_key("orderby"), do: :orderby
   defp normalize_odata_opt_key("order_by"), do: :order_by
   defp normalize_odata_opt_key("$orderby"), do: :orderby
+  defp normalize_odata_opt_key(:"$orderby"), do: :orderby
   defp normalize_odata_opt_key("top"), do: :top
   defp normalize_odata_opt_key("$top"), do: :top
+  defp normalize_odata_opt_key(:"$top"), do: :top
   defp normalize_odata_opt_key("skip"), do: :skip
   defp normalize_odata_opt_key("$skip"), do: :skip
+  defp normalize_odata_opt_key(:"$skip"), do: :skip
   defp normalize_odata_opt_key("expand"), do: :expand
   defp normalize_odata_opt_key("$expand"), do: :expand
+  defp normalize_odata_opt_key(:"$expand"), do: :expand
   defp normalize_odata_opt_key("count"), do: :count
+  defp normalize_odata_opt_key("$count"), do: :count
+  defp normalize_odata_opt_key(:"$count"), do: :count
   defp normalize_odata_opt_key("inlinecount"), do: :inlinecount
   defp normalize_odata_opt_key("$inlinecount"), do: :inlinecount
+  defp normalize_odata_opt_key(:"$inlinecount"), do: :inlinecount
   defp normalize_odata_opt_key("params"), do: :params
   defp normalize_odata_opt_key("req_options"), do: :ignore
   defp normalize_odata_opt_key("return"), do: :ignore
@@ -539,7 +592,7 @@ defmodule Creatio.Util do
     opts_kw = normalize_stream_opts(opts)
     page_list_fun = upgrade_stream_list_fun(list_fun)
 
-    page_size = opts_kw |> Keyword.get(:page_size, 100) |> parse_non_neg_int(100) |> max(1)
+    page_size = opts_kw |> Keyword.get(:page_size) |> resolve_positive_opt!(:page_size, 100)
 
     cursor_field =
       case Keyword.get(opts_kw, :cursor_field) do
@@ -557,15 +610,10 @@ defmodule Creatio.Util do
     max_records = resolve_max_records!(Keyword.get(opts_kw, :max_records), effective_top)
 
     initial_skip =
-      cond do
-        Keyword.has_key?(opts_kw, :skip) ->
-          opts_kw |> Keyword.get(:skip, 0) |> parse_non_neg_int(0)
-
-        is_integer(query_skip) and query_skip >= 0 ->
-          query_skip
-
-        true ->
-          0
+      if Keyword.has_key?(opts_kw, :skip) do
+        resolve_non_neg_opt!(Keyword.get(opts_kw, :skip), :skip) || query_skip || 0
+      else
+        if is_integer(query_skip) and query_skip >= 0, do: query_skip, else: 0
       end
 
     base_opts =
@@ -630,11 +678,11 @@ defmodule Creatio.Util do
 
           case page_list_fun.(client, target, page_opts) do
             {:ok, records} when is_list(records) ->
-              emit_stream_page(records, nil, cursor_field, state, client)
+              emit_stream_page(records, nil, cursor_field, state, client, fetch_size)
 
             {:ok, %{records: records} = meta} when is_list(records) ->
               next_link = extract_next_link(meta[:raw])
-              emit_stream_page(records, next_link, cursor_field, state, client)
+              emit_stream_page(records, next_link, cursor_field, state, client, fetch_size)
 
             {:ok, other} ->
               err = Error.new(message: "Unexpected stream page response: #{inspect(other)}")
@@ -765,7 +813,13 @@ defmodule Creatio.Util do
 
   defp merge_extra_params(acc_params, _val), do: acc_params
 
-  defp format_extra_param_val(val) when is_list(val), do: Enum.map_join(val, ",", &to_string/1)
+  defp format_extra_param_val(val) when is_list(val) do
+    Enum.map_join(val, ",", fn
+      {col, dir} -> "#{col} #{dir}"
+      item -> to_string(item)
+    end)
+  end
+
   defp format_extra_param_val(val), do: to_string(val)
 
   @doc """
@@ -1023,10 +1077,10 @@ defmodule Creatio.Util do
 
   defp strip_query_filter_if_overridden(other, _cursor_field), do: other
 
-  defp emit_stream_page([], _next_link, _cursor_field, _state, _client),
+  defp emit_stream_page([], _next_link, _cursor_field, _state, _client, _fetch_size),
     do: {:halt, nil}
 
-  defp emit_stream_page(records, next_link, cursor_field, state, client) do
+  defp emit_stream_page(records, next_link, cursor_field, state, client, fetch_size) do
     {emitted, next_remaining, cap_reached?} =
       if is_integer(state.remaining) do
         sliced = Enum.take(records, state.remaining)
@@ -1043,58 +1097,75 @@ defmodule Creatio.Util do
     else
       last_record = List.last(emitted)
 
-      cursor_val =
-        case {cursor_field, last_record} do
-          {field, %{} = rec} when is_binary(field) -> Map.get(rec, field)
-          _ -> nil
-        end
+      has_next? =
+        is_binary(next_link) and next_link != "" and trusted_next_link?(next_link, client)
 
-      if cursor_field != nil and is_nil(cursor_val) do
-        err =
-          Error.new(
-            message:
-              "Keyset pagination cursor_field #{inspect(cursor_field)} is missing or nil in returned record"
-          )
+      saw_next_link? = state.saw_next_link? or has_next?
 
-        wrapped = Enum.map(emitted, &{:ok, &1}) ++ [{:error, err}]
-        {wrapped, %{state | halt?: true}}
-      else
-        next_cursor =
-          cond do
-            is_nil(cursor_field) ->
-              nil
+      done? =
+        cap_reached? or
+          (saw_next_link? and not has_next?) or
+          (not is_nil(cursor_field) and len < fetch_size and not has_next?)
 
-            cursor_field != "Id" and is_map(last_record) and
-                not is_nil(Map.get(last_record, "Id")) ->
-              {:composite_cursor, cursor_val, Map.get(last_record, "Id")}
+      next_params =
+        if is_nil(cursor_field) and has_next?,
+          do: next_link_query_params(next_link, client),
+          else: %{}
 
-            true ->
-              cursor_val
-          end
+      wrapped = Enum.map(emitted, &{:ok, &1})
 
-        has_next? =
-          is_binary(next_link) and next_link != "" and trusted_next_link?(next_link, client)
+      case resolve_next_cursor(cursor_field, last_record, done?) do
+        {:ok, next_cursor} ->
+          {wrapped,
+           %{
+             offset: state.offset + len,
+             cursor: next_cursor,
+             remaining: next_remaining,
+             next_params: next_params,
+             saw_next_link?: saw_next_link?,
+             halt?: done?
+           }}
 
-        next_params =
-          if is_nil(cursor_field) and has_next?,
-            do: next_link_query_params(next_link, client),
-            else: %{}
-
-        saw_next_link? = state.saw_next_link? or has_next?
-        done? = cap_reached? or (saw_next_link? and not has_next?)
-
-        wrapped = Enum.map(emitted, &{:ok, &1})
-
-        {wrapped,
-         %{
-           offset: state.offset + len,
-           cursor: next_cursor,
-           remaining: next_remaining,
-           next_params: next_params,
-           saw_next_link?: saw_next_link?,
-           halt?: done?
-         }}
+        {:error, err} ->
+          {wrapped ++ [{:error, err}], %{state | halt?: true}}
       end
+    end
+  end
+
+  defp resolve_next_cursor(nil, _last_record, _done?), do: {:ok, nil}
+
+  defp resolve_next_cursor(cursor_field, last_record, _done?) when not is_map(last_record) do
+    {:error,
+     Error.new(
+       message:
+         "Keyset pagination cursor_field #{inspect(cursor_field)} is missing or nil in returned record"
+     )}
+  end
+
+  defp resolve_next_cursor(_cursor_field, _last_record, true), do: {:ok, nil}
+
+  defp resolve_next_cursor(cursor_field, %{} = last_record, false) do
+    cursor_val = Map.get(last_record, cursor_field)
+
+    cond do
+      is_nil(cursor_val) ->
+        {:error,
+         Error.new(
+           message:
+             "Keyset pagination cursor_field #{inspect(cursor_field)} is missing or nil in returned record"
+         )}
+
+      cursor_field == "Id" ->
+        {:ok, cursor_val}
+
+      is_nil(Map.get(last_record, "Id")) ->
+        {:error,
+         Error.new(
+           message: "Keyset pagination tie-breaker \"Id\" is missing or nil in returned record"
+         )}
+
+      true ->
+        {:ok, {:composite_cursor, cursor_val, Map.get(last_record, "Id")}}
     end
   end
 
@@ -1298,16 +1369,24 @@ defmodule Creatio.Util do
   defp resolve_max_records!(nil, _query_top), do: nil
   defp resolve_max_records!(n, _query_top), do: resolve_non_neg_opt!(n, :max_records)
 
-  defp parse_non_neg_int(val, _default) when is_integer(val) and val >= 0, do: val
+  defp resolve_positive_opt!(nil, _opt_name, default), do: default
+  defp resolve_positive_opt!(n, _opt_name, _default) when is_integer(n) and n > 0, do: n
 
-  defp parse_non_neg_int(val, default) when is_binary(val) do
-    case Integer.parse(String.trim(val)) do
-      {int, ""} when int >= 0 -> int
-      _ -> default
+  defp resolve_positive_opt!(bin, opt_name, _default) when is_binary(bin) do
+    case Integer.parse(String.trim(bin)) do
+      {int, ""} when int > 0 ->
+        int
+
+      _ ->
+        raise ArgumentError,
+              "expected :#{opt_name} to be a positive integer, got: #{inspect(bin)}"
     end
   end
 
-  defp parse_non_neg_int(_, default), do: default
+  defp resolve_positive_opt!(other, opt_name, _default) do
+    raise ArgumentError,
+          "expected :#{opt_name} to be a positive integer, got: #{inspect(other)}"
+  end
 
   @transport_opt_keys [:into, :headers, :req_options, "into", "headers", "req_options"]
 
@@ -1353,12 +1432,7 @@ defmodule Creatio.Util do
       start = skip_leading_ws_and_bom(body, 0, size)
 
       case decode_json_slice(body, start, size) do
-        {:ok, %{"error" => _}} -> true
-        {:ok, %{"errorInfo" => %{} = info}} when map_size(info) > 0 -> true
-        {:ok, %{"ErrorInfo" => %{} = info}} when map_size(info) > 0 -> true
-        {:ok, %{"Exception" => %{} = ex}} when map_size(ex) > 0 -> true
-        {:ok, %{"success" => val}} when val in [false, "false"] -> true
-        {:ok, %{"Success" => val}} when val in [false, "false"] -> true
+        {:ok, decoded} -> error_payload?(decoded)
         _ -> false
       end
     else
@@ -1369,8 +1443,7 @@ defmodule Creatio.Util do
   defp json_error_envelope?(_), do: false
 
   defp execute_field_value_get(req, req_opts, sink)
-       when not is_nil(sink) and not is_function(sink, 2) and
-              sink not in [:self, :legacy_self] do
+       when not is_nil(sink) and sink not in [:self, :legacy_self] do
     run_status_gated_collectable(req, req_opts, sink)
   end
 
@@ -1378,7 +1451,7 @@ defmodule Creatio.Util do
     Req.get(req, req_opts)
   end
 
-  defp run_status_gated_collectable(req, req_opts, collectable) do
+  defp run_status_gated_collectable(req, req_opts, sink) do
     state_ref = make_ref()
 
     into_fun = fn {:data, chunk}, {req_acc, %Req.Response{status: status} = resp_acc} ->
@@ -1389,11 +1462,11 @@ defmodule Creatio.Util do
           {:cont, {req_acc, resp_acc}}
 
         status in [200, 206] ->
-          handle_collectable_chunk(state_ref, attempt_ref, collectable, chunk, req_acc, resp_acc)
+          handle_collectable_chunk(state_ref, attempt_ref, sink, chunk, req_acc, resp_acc)
 
         true ->
-          current_body = if is_binary(resp_acc.body), do: resp_acc.body, else: ""
-          {:cont, {req_acc, %Req.Response{resp_acc | body: current_body <> chunk}}}
+          capped = append_capped_body(resp_acc.body, chunk)
+          {:cont, {req_acc, %Req.Response{resp_acc | body: capped}}}
       end
     end
 
@@ -1403,7 +1476,7 @@ defmodule Creatio.Util do
           {:ok, resp}
 
         {:ok, %Req.Response{status: status} = resp} when status in [200, 206] ->
-          finalize_gated_collectable(state_ref, collectable, resp)
+          finalize_gated_collectable(state_ref, sink, resp)
 
         other ->
           other
@@ -1428,7 +1501,7 @@ defmodule Creatio.Util do
 
   defp halt_and_delete_collector(state_ref) do
     case Process.delete(state_ref) do
-      {_attempt_ref, {:opened, acc, collector}} -> collector.(acc, :halt)
+      {_attempt_ref, {:opened, {:collectable, acc, collector}}} -> collector.(acc, :halt)
       _ -> :ok
     end
   end
@@ -1436,7 +1509,7 @@ defmodule Creatio.Util do
   defp handle_collectable_chunk(
          state_ref,
          attempt_ref,
-         collectable,
+         sink,
          chunk,
          req_acc,
          %Req.Response{} = resp_acc
@@ -1448,20 +1521,17 @@ defmodule Creatio.Util do
       end
 
     case current_state do
-      {:opened, acc, collector} ->
-        next_acc = collector.(acc, {:cont, chunk})
-        Process.put(state_ref, {attempt_ref, {:opened, next_acc, collector}})
-        {:cont, {req_acc, resp_acc}}
+      {:opened, sink_state} ->
+        push_sink_chunk(state_ref, attempt_ref, sink_state, chunk, req_acc, resp_acc)
 
       :rejected ->
-        current = if is_binary(resp_acc.body), do: resp_acc.body, else: ""
-        capped = if byte_size(current) < 65_536, do: current <> chunk, else: current
+        capped = append_capped_body(resp_acc.body, chunk)
         {:cont, {req_acc, %Req.Response{resp_acc | body: capped}}}
 
       pending ->
         buf =
           case pending do
-            {:pending, existing} -> existing
+            {:pending, existing, _last_req} -> existing
             nil -> ""
           end
 
@@ -1473,26 +1543,56 @@ defmodule Creatio.Util do
             Process.put(state_ref, {attempt_ref, :rejected})
 
             rejected_resp =
-              %Req.Response{resp_acc | body: combined}
+              %Req.Response{resp_acc | body: append_capped_body("", combined)}
               |> Req.Response.put_private(:creatio_stream_rejected, true)
 
             {:cont, {req_acc, rejected_resp}}
 
           byte_size(combined) >= 1024 ->
-            {acc, collector} = Collectable.into(collectable)
-            Process.put(state_ref, {attempt_ref, {:opened, acc, collector}})
-            next_acc = collector.(acc, {:cont, combined})
-            Process.put(state_ref, {attempt_ref, {:opened, next_acc, collector}})
-            {:cont, {req_acc, resp_acc}}
+            sink_state = open_sink(sink)
+            Process.put(state_ref, {attempt_ref, {:opened, sink_state}})
+            push_sink_chunk(state_ref, attempt_ref, sink_state, combined, req_acc, resp_acc)
 
           true ->
-            Process.put(state_ref, {attempt_ref, {:pending, combined}})
+            Process.put(state_ref, {attempt_ref, {:pending, combined, req_acc}})
             {:cont, {req_acc, resp_acc}}
         end
     end
   end
 
-  defp finalize_gated_collectable(state_ref, collectable, %Req.Response{} = resp) do
+  defp open_sink(sink) when is_function(sink, 2), do: {:fun, sink}
+
+  defp open_sink(collectable) do
+    {acc, collector} = Collectable.into(collectable)
+    {:collectable, acc, collector}
+  end
+
+  defp push_sink_chunk(
+         state_ref,
+         attempt_ref,
+         {:collectable, acc, collector},
+         chunk,
+         req_acc,
+         resp_acc
+       ) do
+    next_acc = collector.(acc, {:cont, chunk})
+    Process.put(state_ref, {attempt_ref, {:opened, {:collectable, next_acc, collector}}})
+    {:cont, {req_acc, resp_acc}}
+  end
+
+  defp push_sink_chunk(state_ref, attempt_ref, {:fun, fun}, chunk, req_acc, resp_acc) do
+    case fun.({:data, chunk}, {req_acc, resp_acc}) do
+      {:cont, {next_req, next_resp}} ->
+        Process.put(state_ref, {attempt_ref, {:opened, {:fun, fun}}})
+        {:cont, {next_req, next_resp}}
+
+      {:halt, {next_req, next_resp}} ->
+        Process.put(state_ref, {attempt_ref, {:opened, {:fun, fun}}})
+        {:halt, {next_req, next_resp}}
+    end
+  end
+
+  defp finalize_gated_collectable(state_ref, sink, %Req.Response{} = resp) do
     resp_attempt = Map.get(resp.private, :creatio_stream_attempt)
 
     entry =
@@ -1500,7 +1600,7 @@ defmodule Creatio.Util do
         {^resp_attempt, state} when not is_nil(resp_attempt) ->
           state
 
-        {_other_attempt, {:opened, old_acc, old_collector}} ->
+        {_other_attempt, {:opened, {:collectable, old_acc, old_collector}}} ->
           old_collector.(old_acc, :halt)
           nil
 
@@ -1509,38 +1609,67 @@ defmodule Creatio.Util do
       end
 
     case entry do
-      {:opened, acc, collector} ->
+      {:opened, {:collectable, acc, collector}} ->
         final_body = collector.(acc, :done)
         {:ok, %Req.Response{resp | body: final_body}}
+
+      {:opened, {:fun, _fun}} ->
+        {:ok, resp}
 
       :rejected ->
         {:ok, Req.Response.put_private(resp, :creatio_stream_rejected, true)}
 
-      {:pending, buf} ->
+      {:pending, buf, last_req} ->
         probe_resp = %Req.Response{resp | body: buf}
 
         if html_or_xml_response?(probe_resp) or json_error_envelope?(probe_resp) do
           {:ok, Req.Response.put_private(probe_resp, :creatio_stream_rejected, true)}
         else
-          {acc, collector} = Collectable.into(collectable)
-
-          next_acc =
-            try do
-              if buf == "", do: acc, else: collector.(acc, {:cont, buf})
-            rescue
-              exception ->
-                collector.(acc, :halt)
-                reraise exception, __STACKTRACE__
-            end
-
-          final_body = collector.(next_acc, :done)
-          {:ok, %Req.Response{resp | body: final_body}}
+          finalize_pending_sink(sink, buf, last_req, resp)
         end
 
       nil ->
-        {acc, collector} = Collectable.into(collectable)
-        final_body = collector.(acc, :done)
-        {:ok, %Req.Response{resp | body: final_body}}
+        if is_function(sink, 2) do
+          {:ok, resp}
+        else
+          {:collectable, acc, collector} = open_sink(sink)
+          final_body = collector.(acc, :done)
+          {:ok, %Req.Response{resp | body: final_body}}
+        end
+    end
+  end
+
+  defp finalize_pending_sink(sink, "", _last_req, resp) when is_function(sink, 2), do: {:ok, resp}
+
+  defp finalize_pending_sink(sink, buf, last_req, resp) when is_function(sink, 2) do
+    {_action, {_req, final_resp}} = sink.({:data, buf}, {last_req, resp})
+    {:ok, final_resp}
+  end
+
+  defp finalize_pending_sink(collectable, buf, _last_req, %Req.Response{} = resp) do
+    {:collectable, acc, collector} = open_sink(collectable)
+
+    next_acc =
+      try do
+        if buf == "", do: acc, else: collector.(acc, {:cont, buf})
+      rescue
+        exception ->
+          collector.(acc, :halt)
+          reraise exception, __STACKTRACE__
+      end
+
+    final_body = collector.(next_acc, :done)
+    {:ok, %Req.Response{resp | body: final_body}}
+  end
+
+  defp append_capped_body(existing, chunk, max_bytes \\ 65_536) do
+    current = if is_binary(existing), do: existing, else: ""
+    remaining = max_bytes - byte_size(current)
+
+    cond do
+      remaining <= 0 -> current
+      byte_size(chunk) <= remaining -> current <> chunk
+      true -> current <> binary_part(chunk, 0, remaining)
     end
   end
 

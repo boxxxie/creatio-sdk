@@ -195,20 +195,22 @@ defmodule Creatio.OData3 do
         case Req.get(req, req_opts) do
           {:ok, %Req.Response{} = raw_resp} ->
             case Util.decode_api_response(raw_resp) do
-              {:ok, %Req.Response{status: 200, body: %{"error" => _}} = resp} ->
-                {:error, Error.from_response(resp)}
-
-              {:ok, %Req.Response{status: 200, body: %{"d" => %{"error" => _}}} = resp} ->
-                {:error, Error.from_response(resp)}
-
-              {:ok, %Req.Response{status: 200, body: %{"d" => %{} = record}}} ->
-                {:ok, record}
+              {:ok, %Req.Response{status: 200, body: %{"d" => %{} = record} = body} = resp} ->
+                if Util.error_payload?(body) or Util.error_payload?(record) do
+                  {:error, Error.from_response(resp)}
+                else
+                  {:ok, record}
+                end
 
               {:ok, %Req.Response{status: 200, body: %{"d" => _non_map}} = resp} ->
                 {:error, Error.from_response(resp)}
 
-              {:ok, %Req.Response{status: 200, body: %{} = body}} ->
-                {:ok, body}
+              {:ok, %Req.Response{status: 200, body: %{} = body} = resp} ->
+                if Util.error_payload?(body) do
+                  {:error, Error.from_response(resp)}
+                else
+                  {:ok, body}
+                end
 
               {_, resp} ->
                 {:error, Error.from_response(resp)}
@@ -273,27 +275,38 @@ defmodule Creatio.OData3 do
 
           {:ok, %Req.Response{} = raw_resp} ->
             case Util.decode_api_response(raw_resp) do
-              {:ok, %Req.Response{status: 200, body: %{"error" => _}} = resp} ->
-                {:error, Error.from_response(resp)}
-
-              {:ok, %Req.Response{status: 200, body: %{"d" => %{"error" => _}}} = resp} ->
-                {:error, Error.from_response(resp)}
-
-              {:ok, %Req.Response{status: 200, body: %{"d" => %{"results" => records}}}}
+              {:ok, %Req.Response{status: 200, body: %{"d" => %{"results" => records}}} = resp}
               when is_list(records) ->
-                {:ok, records}
+                if Util.error_payload?(resp.body) do
+                  {:error, Error.from_response(resp)}
+                else
+                  {:ok, records}
+                end
 
-              {:ok, %Req.Response{status: 200, body: %{"d" => records}}} when is_list(records) ->
-                {:ok, records}
+              {:ok, %Req.Response{status: 200, body: %{"d" => records}} = resp}
+              when is_list(records) ->
+                if Util.error_payload?(resp.body) do
+                  {:error, Error.from_response(resp)}
+                else
+                  {:ok, records}
+                end
 
-              {:ok, %Req.Response{status: 200, body: %{"d" => %{} = record}}} ->
-                {:ok, record}
+              {:ok, %Req.Response{status: 200, body: %{"d" => %{} = record} = body} = resp} ->
+                if Util.error_payload?(body) or Util.error_payload?(record) do
+                  {:error, Error.from_response(resp)}
+                else
+                  {:ok, record}
+                end
 
               {:ok, %Req.Response{status: 200, body: %{"d" => _non_collection}} = resp} ->
                 {:error, Error.from_response(resp)}
 
-              {:ok, %Req.Response{status: 200, body: %{} = body}} ->
-                {:ok, body}
+              {:ok, %Req.Response{status: 200, body: %{} = body} = resp} ->
+                if Util.error_payload?(body) do
+                  {:error, Error.from_response(resp)}
+                else
+                  {:ok, body}
+                end
 
               {:ok, %Req.Response{status: 200, body: list}} when is_list(list) ->
                 {:ok, list}
@@ -366,20 +379,31 @@ defmodule Creatio.OData3 do
 
           {:ok, %Req.Response{} = raw_resp} ->
             case Util.decode_api_response(raw_resp) do
-              {:ok, %Req.Response{status: 200, body: %{"error" => _}} = resp} ->
-                {:error, Error.from_response(resp)}
+              {:ok, %Req.Response{status: 200, body: %{"d" => %{} = d_map} = body} = resp} ->
+                cond do
+                  Util.error_payload?(body) or Util.error_payload?(d_map) ->
+                    {:error, Error.from_response(resp)}
 
-              {:ok, %Req.Response{status: 200, body: %{"d" => %{"error" => _}}} = resp} ->
-                {:error, Error.from_response(resp)}
+                  odata3_wrapped_field?(d_map, field_name) ->
+                    {:ok, Map.fetch!(d_map, field_name)}
 
-              {:ok, %Req.Response{status: 200, body: %{"d" => %{} = d_map}}} ->
-                {:ok, Map.get(d_map, field_name, d_map)}
+                  true ->
+                    {:ok, d_map}
+                end
 
-              {:ok, %Req.Response{status: 200, body: %{"d" => val}}} ->
-                {:ok, val}
+              {:ok, %Req.Response{status: 200, body: %{"d" => val} = body} = resp} ->
+                if Util.error_payload?(body) do
+                  {:error, Error.from_response(resp)}
+                else
+                  {:ok, val}
+                end
 
-              {:ok, %Req.Response{status: 200, body: %{} = map}} ->
-                {:ok, map}
+              {:ok, %Req.Response{status: 200, body: %{} = map} = resp} ->
+                if Util.error_payload?(map) do
+                  {:error, Error.from_response(resp)}
+                else
+                  {:ok, map}
+                end
 
               {:ok, %Req.Response{status: 200, body: list}} when is_list(list) ->
                 {:ok, list}
@@ -728,29 +752,29 @@ defmodule Creatio.OData3 do
 
             {:ok, %Req.Response{} = raw_resp} ->
               case Util.decode_api_response(raw_resp) do
-                {:ok, %Req.Response{status: status, body: %{"error" => _}} = resp}
+                {:ok, %Req.Response{status: status, body: %{"d" => %{} = record} = body} = resp}
                 when status in [200, 201] ->
-                  {:error, Error.from_response(resp)}
-
-                {:ok, %Req.Response{status: status, body: %{"d" => %{"error" => _}}} = resp}
-                when status in [200, 201] ->
-                  {:error, Error.from_response(resp)}
-
-                {:ok, %Req.Response{status: status, body: %{"d" => %{} = record}}}
-                when status in [200, 201] ->
-                  {:ok, record}
+                  if Util.error_payload?(body) or Util.error_payload?(record) do
+                    {:error, Error.from_response(resp)}
+                  else
+                    {:ok, record}
+                  end
 
                 {:ok, %Req.Response{status: status, body: %{"d" => _non_map}} = resp}
                 when status in [200, 201] ->
                   {:error, Error.from_response(resp)}
 
-                {:ok, %Req.Response{status: status, body: %{} = body}}
+                {:ok, %Req.Response{status: status, body: %{} = body} = resp}
                 when status in [200, 201] ->
-                  {:ok, body}
+                  if Util.error_payload?(body) do
+                    {:error, Error.from_response(resp)}
+                  else
+                    {:ok, body}
+                  end
 
                 {:ok, %Req.Response{status: 201, body: body, headers: headers}}
                 when is_nil(body) or is_binary(body) ->
-                  if empty_body?(body) do
+                  if Util.blank_body?(body) do
                     {:ok, Util.extract_created_entity(headers)}
                   else
                     {:error, Error.from_response(raw_resp)}
@@ -960,28 +984,35 @@ defmodule Creatio.OData3 do
 
   defp extract_odata3_count(%Req.Response{} = resp), do: {:error, Error.from_response(resp)}
 
+  defp odata3_wrapped_field?(d_map, field_name) when is_map(d_map) do
+    Map.has_key?(d_map, field_name) and
+      Enum.reject(Map.keys(d_map), &(&1 == "__metadata")) == [field_name]
+  end
+
   defp handle_ok_update_body(resp) do
     case resp.body do
-      %{"error" => _} ->
-        {:error, Error.from_response(resp)}
-
-      %{"d" => %{"error" => _}} ->
-        {:error, Error.from_response(resp)}
-
-      %{"d" => %{} = record} ->
-        {:ok, record}
+      %{"d" => %{} = record} = body ->
+        if Util.error_payload?(body) or Util.error_payload?(record) do
+          {:error, Error.from_response(resp)}
+        else
+          {:ok, record}
+        end
 
       %{"d" => _} ->
         {:error, Error.from_response(resp)}
 
       %{} = body ->
-        {:ok, body}
+        if Util.error_payload?(body) do
+          {:error, Error.from_response(resp)}
+        else
+          {:ok, body}
+        end
 
       nil ->
         :ok
 
       bin when is_binary(bin) ->
-        if(String.trim(bin) == "", do: :ok, else: {:error, Error.from_response(resp)})
+        if(Util.blank_body?(bin), do: :ok, else: {:error, Error.from_response(resp)})
 
       _other ->
         {:error, Error.from_response(resp)}
@@ -1002,13 +1033,6 @@ defmodule Creatio.OData3 do
   end
 
   defp parse_count_value(_other), do: nil
-
-  defp empty_body?(nil), do: true
-
-  defp empty_body?(bin) when is_binary(bin),
-    do: bin |> String.trim_leading("\uFEFF") |> String.trim() == ""
-
-  defp empty_body?(_), do: false
 
   defp drop_opt(opts, key), do: Util.drop_opt(opts, key)
 

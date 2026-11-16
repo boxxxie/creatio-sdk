@@ -123,6 +123,10 @@ defmodule Creatio.Error do
   defp redact_header_value(nil), do: nil
   defp redact_header_value(_val), do: "[REDACTED]"
 
+  defp parse_error_body(%{"d" => %{"error" => _} = inner}) do
+    parse_error_body(inner)
+  end
+
   defp parse_error_body(%{"error" => %{} = err}) do
     code = first_non_blank([err["code"], err["Code"], err["errorCode"], err["ErrorCode"]])
     raw_msg = err["message"] || err["Message"]
@@ -159,9 +163,29 @@ defmodule Creatio.Error do
     {code, desc, nil}
   end
 
-  defp parse_error_body(%{"Exception" => %{} = ex}) do
-    msg = first_non_blank([ex["Message"], ex["message"], ex["ExceptionMessage"]])
-    code = first_non_blank([ex["ErrorCode"], ex["errorCode"], ex["Code"], ex["code"]])
+  defp parse_error_body(%{"Exception" => %{} = ex} = body) do
+    msg =
+      first_non_blank([
+        body["Message"],
+        body["message"],
+        body["ExceptionMessage"],
+        ex["Message"],
+        ex["message"],
+        ex["ExceptionMessage"]
+      ])
+
+    code =
+      first_non_blank([
+        ex["ErrorCode"],
+        ex["errorCode"],
+        ex["Code"],
+        ex["code"],
+        body["ErrorCode"],
+        body["errorCode"],
+        body["Code"],
+        body["code"]
+      ])
+
     {code, msg, ex}
   end
 
@@ -232,8 +256,30 @@ defmodule Creatio.Error do
   end
 
   defp parse_error_body(%{"Code" => code} = body) when is_map(body) do
-    msg = first_non_blank([body["Message"], body["ExceptionMessage"], body["Exception"]])
-    {code, msg, body["Exception"]}
+    ex = body["Exception"]
+
+    ex_msg =
+      case ex do
+        %{} ->
+          first_non_blank([ex["Message"], ex["message"], ex["ExceptionMessage"]]) ||
+            if(map_size(ex) > 0, do: inspect(ex), else: nil)
+
+        bin when is_binary(bin) ->
+          if(String.trim(bin) != "", do: bin, else: nil)
+
+        _ ->
+          nil
+      end
+
+    msg =
+      first_non_blank([
+        body["Message"],
+        body["message"],
+        body["ExceptionMessage"],
+        ex_msg
+      ])
+
+    {code, if(is_binary(msg), do: msg, else: nil), ex}
   end
 
   defp parse_error_body(%{"Message" => msg} = body) when is_map(body) do

@@ -627,7 +627,7 @@ defmodule Creatio.OData.Query do
   defp contains_or_outside_quotes?(expr) do
     expr
     |> replace_quoted_literals(<<>>)
-    |> then(&Regex.match?(~r/(?:^|[\s()])or(?:$|[\s()])/i, &1))
+    |> then(&Regex.match?(~r/(?:\A|[\s()])or(?:\z|[\s()])/i, &1))
   end
 
   defp replace_quoted_literals(<<"'", rest::binary>>, acc) do

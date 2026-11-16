@@ -224,11 +224,12 @@ defmodule Creatio.OData do
         case Req.get(req, req_opts) do
           {:ok, %Req.Response{} = raw_resp} ->
             case Util.decode_api_response(raw_resp) do
-              {:ok, %Req.Response{status: 200, body: %{"error" => _}} = resp} ->
-                {:error, Error.from_response(resp)}
-
-              {:ok, %Req.Response{status: 200, body: %{} = record}} ->
-                {:ok, record}
+              {:ok, %Req.Response{status: 200, body: %{} = record} = resp} ->
+                if Util.error_payload?(record) do
+                  {:error, Error.from_response(resp)}
+                else
+                  {:ok, record}
+                end
 
               {_, resp} ->
                 {:error, Error.from_response(resp)}
@@ -290,18 +291,23 @@ defmodule Creatio.OData do
 
           {:ok, %Req.Response{} = raw_resp} ->
             case Util.decode_api_response(raw_resp) do
-              {:ok, %Req.Response{status: 200, body: %{"error" => _}} = resp} ->
-                {:error, Error.from_response(resp)}
-
               {:ok, %Req.Response{status: 200, body: %{"@odata.null" => true}}} ->
                 {:ok, nil}
 
-              {:ok, %Req.Response{status: 200, body: %{"value" => records}}}
+              {:ok, %Req.Response{status: 200, body: %{"value" => records} = body} = resp}
               when is_list(records) ->
-                {:ok, records}
+                if Util.error_payload?(body) do
+                  {:error, Error.from_response(resp)}
+                else
+                  {:ok, records}
+                end
 
-              {:ok, %Req.Response{status: 200, body: %{} = map}} ->
-                {:ok, map}
+              {:ok, %Req.Response{status: 200, body: %{} = map} = resp} ->
+                if Util.error_payload?(map) do
+                  {:error, Error.from_response(resp)}
+                else
+                  {:ok, map}
+                end
 
               {:ok, %Req.Response{status: 200, body: list}} when is_list(list) ->
                 {:ok, list}
@@ -372,17 +378,20 @@ defmodule Creatio.OData do
 
           {:ok, %Req.Response{} = raw_resp} ->
             case Util.decode_api_response(raw_resp) do
-              {:ok, %Req.Response{status: 200, body: %{"error" => _}} = resp} ->
-                {:error, Error.from_response(resp)}
-
               {:ok, %Req.Response{status: 200, body: %{"@odata.null" => true}}} ->
                 {:ok, nil}
 
-              {:ok, %Req.Response{status: 200, body: %{"value" => val}}} ->
-                {:ok, val}
+              {:ok, %Req.Response{status: 200, body: %{} = map} = resp} ->
+                cond do
+                  Util.error_payload?(map) ->
+                    {:error, Error.from_response(resp)}
 
-              {:ok, %Req.Response{status: 200, body: %{} = map}} ->
-                {:ok, map}
+                  odata4_wrapped_value?(map) ->
+                    {:ok, Map.fetch!(map, "value")}
+
+                  true ->
+                    {:ok, map}
+                end
 
               {:ok, %Req.Response{status: 200, body: list}} when is_list(list) ->
                 {:ok, list}
@@ -707,17 +716,17 @@ defmodule Creatio.OData do
 
             {:ok, %Req.Response{} = raw_resp} ->
               case Util.decode_api_response(raw_resp) do
-                {:ok, %Req.Response{status: status, body: %{"error" => _}} = resp}
+                {:ok, %Req.Response{status: status, body: %{} = body} = resp}
                 when status in [200, 201] ->
-                  {:error, Error.from_response(resp)}
-
-                {:ok, %Req.Response{status: status, body: %{} = body}}
-                when status in [200, 201] ->
-                  {:ok, body}
+                  if Util.error_payload?(body) do
+                    {:error, Error.from_response(resp)}
+                  else
+                    {:ok, body}
+                  end
 
                 {:ok, %Req.Response{status: 201, body: body, headers: headers}}
                 when is_nil(body) or is_binary(body) ->
-                  if empty_body?(body) do
+                  if Util.blank_body?(body) do
                     {:ok, Util.extract_created_entity(headers)}
                   else
                     {:error, Error.from_response(raw_resp)}
@@ -904,7 +913,13 @@ defmodule Creatio.OData do
           Creatio.opts()
         ) ::
           :ok | {:error, Error.t()}
-  def update_field(client_or_req, entity, id, field_name, value, opts \\ []) do
+  def update_field(client_or_req, entity, id, field_name, value, opts \\ [])
+
+  def update_field(client_or_req, entity, id, field_name, nil, opts) do
+    delete_field(client_or_req, entity, id, field_name, opts)
+  end
+
+  def update_field(client_or_req, entity, id, field_name, value, opts) do
     entity = require_entity_name!(entity, "update_field/6")
     clean = clean_id(id)
     field_name = Util.require_field_name!(field_name, "update_field/6")
@@ -973,16 +988,33 @@ defmodule Creatio.OData do
   defp encode_field_payload(value, _opts)
        when is_struct(value, File.Stream) or is_struct(value, IO.Stream) or
               is_struct(value, Stream) or is_function(value, 2) do
-    {value, "application/octet-stream; IEEE754Compatible=true"}
+    {value, "application/octet-stream"}
   end
 
-  defp encode_field_payload(value, _opts)
-       when is_map(value) or (is_list(value) and not is_nil(value)) do
+  defp encode_field_payload(value, _opts) when is_map(value) and not is_struct(value) do
     {Jason.encode_to_iodata!(value), "application/json; IEEE754Compatible=true"}
   end
 
+  defp encode_field_payload(value, opts) when is_list(value) do
+    explicit_ct = Util.get_opt(opts, :content_type)
+    raw? = Util.get_opt(opts, :raw, false) == true
+
+    cond do
+      raw? ->
+        {value, non_blank_opt(explicit_ct) || "application/octet-stream"}
+
+      is_binary(explicit_ct) and String.trim(explicit_ct) != "" and
+          not json_content_type?(explicit_ct) ->
+        {value, explicit_ct}
+
+      true ->
+        {Jason.encode_to_iodata!(value), "application/json; IEEE754Compatible=true"}
+    end
+  end
+
   defp encode_field_payload(value, _opts)
-       when is_boolean(value) or is_number(value) or is_atom(value) do
+       when is_boolean(value) or is_number(value) or
+              (is_atom(value) and not is_nil(value)) or is_struct(value) do
     {Jason.encode_to_iodata!(%{"value" => value}), "application/json; IEEE754Compatible=true"}
   end
 
@@ -995,7 +1027,7 @@ defmodule Creatio.OData do
         {value, explicit_ct}
 
       raw? or not String.valid?(value) ->
-        {value, "application/octet-stream; IEEE754Compatible=true"}
+        {value, "application/octet-stream"}
 
       true ->
         {Jason.encode_to_iodata!(%{"value" => value}), "application/json; IEEE754Compatible=true"}
@@ -1003,7 +1035,17 @@ defmodule Creatio.OData do
   end
 
   defp encode_field_payload(value, _opts) do
-    {value, "application/octet-stream; IEEE754Compatible=true"}
+    {value, "application/octet-stream"}
+  end
+
+  defp non_blank_opt(val) when is_binary(val) do
+    if String.trim(val) == "", do: nil, else: val
+  end
+
+  defp non_blank_opt(_), do: nil
+
+  defp json_content_type?(ct) when is_binary(ct) do
+    String.contains?(String.downcase(ct), "json")
   end
 
   @doc """
@@ -1062,12 +1104,7 @@ defmodule Creatio.OData do
           url = "/0/odata/#{entity}(#{clean})/#{field_name}"
 
           base_req =
-            client.req
-            |> Req.Request.put_header("accept", "application/json, text/plain, */*")
-            |> Req.Request.put_header(
-              "content-type",
-              "application/octet-stream; IEEE754Compatible=true"
-            )
+            Req.Request.put_header(client.req, "accept", "application/json, text/plain, */*")
 
           {req, req_opts} =
             Util.prepare_req_call(base_req, opts, [url: url], normalize_params(opts))
@@ -1209,33 +1246,34 @@ defmodule Creatio.OData do
 
   defp handle_ok_update_body(resp) do
     case resp.body do
-      %{"error" => _} ->
-        {:error, Error.from_response(resp)}
-
       %{} = body ->
-        {:ok, body}
+        if Util.error_payload?(body) do
+          {:error, Error.from_response(resp)}
+        else
+          {:ok, body}
+        end
 
       nil ->
         :ok
 
       bin when is_binary(bin) ->
-        if(String.trim(bin) == "", do: :ok, else: {:error, Error.from_response(resp)})
+        if(Util.blank_body?(bin), do: :ok, else: {:error, Error.from_response(resp)})
 
       _other ->
         {:error, Error.from_response(resp)}
     end
   end
 
+  defp odata4_wrapped_value?(map) when is_map(map) do
+    Map.has_key?(map, "value") and
+      Enum.all?(Map.keys(map), fn k ->
+        k == "value" or String.starts_with?(k, "@") or String.starts_with?(k, "odata.")
+      end)
+  end
+
   defp handle_ok_void_response(raw_resp), do: Util.ok_void_response(raw_resp)
 
   defp require_entity_name!(entity, fun_name), do: Util.require_entity_name!(entity, fun_name)
-
-  defp empty_body?(nil), do: true
-
-  defp empty_body?(bin) when is_binary(bin),
-    do: bin |> String.trim_leading("\uFEFF") |> String.trim() == ""
-
-  defp empty_body?(_), do: false
 
   defp pop_opt(opts, key), do: Util.pop_opt(opts, key)
   defp drop_opt(opts, key), do: Util.drop_opt(opts, key)

@@ -248,7 +248,7 @@ defmodule Creatio.UtilTest do
 
       assert msg =~ "Unexpected stream page response"
 
-      # Keyset cursor escaping single quotes when filter is nil or "", plus non-numeric page_size fallback
+      # Keyset cursor escaping single quotes when filter is nil or ""
       parent = self()
 
       string_cursor_fun = fn _client, _entity, opts ->
@@ -265,7 +265,7 @@ defmodule Creatio.UtilTest do
                  client,
                  "Contact",
                  %{
-                   page_size: "invalid",
+                   page_size: 100,
                    cursor_field: "Name",
                    after_cursor: "O'Brien",
                    filter: ""
@@ -276,18 +276,18 @@ defmodule Creatio.UtilTest do
 
       assert_receive {:cursor_filter, "Name gt 'O''Brien'", 100}
 
-      # Integer cursor and filter: nil branch
+      # Integer cursor with tie-breaker Id and filter: nil branch
       int_cursor_fun = fn _client, _entity, opts ->
         send(parent, {:int_cursor, Keyword.get(opts, :filter)})
 
         if Keyword.get(opts, :filter) == "Seq gt 41" do
-          {:ok, [%{"Seq" => 42}, %{"Seq" => 43}]}
+          {:ok, [%{"Id" => "id-42", "Seq" => 42}, %{"Id" => "id-43", "Seq" => 43}]}
         else
           {:ok, []}
         end
       end
 
-      assert [%{"Seq" => 42}, %{"Seq" => 43}] =
+      assert [%{"Id" => "id-42", "Seq" => 42}, %{"Id" => "id-43", "Seq" => 43}] =
                Util.paginate_stream!(
                  client,
                  "Contact",
@@ -298,7 +298,7 @@ defmodule Creatio.UtilTest do
                |> Enum.to_list()
 
       assert_receive {:int_cursor, "Seq gt 41"}
-      assert_receive {:int_cursor, "Seq gt 43"}
+      assert_receive {:int_cursor, "(Seq gt 43 or (Seq eq 43 and Id gt 'id-43'))"}
     end
   end
 
@@ -1213,6 +1213,299 @@ defmodule Creatio.UtilTest do
 
       assert {:error, %Error{status: 200}} =
                DataService.custom_service(ro, "Svc", "ErrObj", [], method: "GET")
+    end
+
+    test "keyset pagination handles nullable final-page cursors without error and errors on missing intermediate tie-breaker Id" do
+      client = Client.new(base_url: "https://crm.test")
+
+      # Short final page with nil nullable cursor_field should NOT emit a bogus error
+      short_final_fun = fn _c, _t, _opts ->
+        {:ok, [%{"Id" => "id-1", "ModifiedOn" => nil}]}
+      end
+
+      assert [{:ok, %{"Id" => "id-1", "ModifiedOn" => nil}}] =
+               Util.paginate_stream(
+                 client,
+                 "Contact",
+                 [cursor_field: "ModifiedOn", page_size: 2],
+                 :odata4,
+                 short_final_fun
+               )
+               |> Enum.to_list()
+
+      # Cap-reached final page (max_records: 1) with nil cursor_field should NOT emit a bogus error
+      assert [%{"Id" => "id-1", "ModifiedOn" => nil}] =
+               Util.paginate_stream!(
+                 client,
+                 "Contact",
+                 [cursor_field: "ModifiedOn", page_size: 1, max_records: 1],
+                 :odata4,
+                 short_final_fun
+               )
+               |> Enum.to_list()
+
+      # Intermediate page with cursor_field != "Id" and nil "Id" MUST emit error instead of falling back
+      missing_id_fun = fn _c, _t, _opts ->
+        {:ok, [%{"ModifiedOn" => "2026-01-01T00:00:00Z"}]}
+      end
+
+      assert [{:ok, %{"ModifiedOn" => "2026-01-01T00:00:00Z"}}, {:error, %Error{message: msg}}] =
+               Util.paginate_stream(
+                 client,
+                 "Contact",
+                 [cursor_field: "ModifiedOn", page_size: 1],
+                 :odata4,
+                 missing_id_fun
+               )
+               |> Enum.to_list()
+
+      assert msg =~ "tie-breaker"
+    end
+
+    test "OData and OData3 preserve ComplexType fields, wrap structs, stream iodata raw lists, delegate nil update_field to DELETE, and reject 200 error envelopes" do
+      parent = self()
+
+      plug = fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        send(parent, {:req, conn.method, conn.request_path, conn.req_headers, raw})
+
+        case {conn.method, conn.request_path} do
+          {"GET", "/0/odata/Contact('1')/Money"} ->
+            Req.Test.json(conn, %{"value" => 100, "currency" => "USD"})
+
+          {"GET", "/0/ServiceModel/EntityDataService.svc/ContactCollection('1')/Address"} ->
+            Req.Test.json(conn, %{"d" => %{"Address" => "123 Main", "City" => "NYC"}})
+
+          {"PUT", "/0/odata/Contact('1')/BirthDate"} ->
+            Plug.Conn.send_resp(conn, 204, "")
+
+          {"PUT", "/0/odata/Contact('1')/Data"} ->
+            Plug.Conn.send_resp(conn, 200, "\uFEFF   ")
+
+          {"DELETE", "/0/odata/Contact('1')/MiddleName"} ->
+            Plug.Conn.send_resp(conn, 204, "")
+
+          {"POST", "/0/odata/Contact"} ->
+            Req.Test.json(conn, %{
+              "errorInfo" => %{"errorCode" => "E1", "message" => "Create fail"}
+            })
+
+          {"PATCH", "/0/odata/Contact('1')"} ->
+            Req.Test.json(conn, %{"ExceptionMessage" => "Patch fail"})
+
+          {"DELETE", "/0/odata/Contact('1')"} ->
+            Req.Test.json(conn, %{"d" => %{"error" => %{"message" => "Delete fail"}}})
+
+          {"POST", "/0/DataService/json/SyncReply/SelectQuery"} ->
+            Req.Test.json(conn, %{
+              "responseStatus" => %{"ErrorCode" => "DS1", "Message" => "DS fail"}
+            })
+
+          {"GET", "/.well-known/openid-configuration"} ->
+            Req.Test.json(conn, %{"error" => "oidc_error"})
+        end
+      end
+
+      client = Client.new(base_url: "https://crm.test", req_options: [plug: plug])
+
+      assert {:ok, %{"value" => 100, "currency" => "USD"}} =
+               OData.get_field(client, "Contact", "1", "Money")
+
+      assert {:ok, %{"Address" => "123 Main", "City" => "NYC"}} =
+               OData3.get_field(client, "Contact", "1", "Address")
+
+      assert :ok = OData.update_field(client, "Contact", "1", "BirthDate", ~D[2026-01-15])
+
+      assert_receive {:req, "PUT", "/0/odata/Contact('1')/BirthDate", _,
+                      ~s({"value":"2026-01-15"})}
+
+      assert :ok =
+               OData.update_field(client, "Contact", "1", "Data", ["hello", " ", "world"],
+                 content_type: "application/octet-stream"
+               )
+
+      assert_receive {:req, "PUT", "/0/odata/Contact('1')/Data", headers_put, "hello world"}
+
+      assert List.keyfind(headers_put, "content-type", 0) ==
+               {"content-type", "application/octet-stream"}
+
+      assert :ok = OData.update_field(client, "Contact", "1", "MiddleName", nil)
+      assert_receive {:req, "DELETE", "/0/odata/Contact('1')/MiddleName", _, ""}
+
+      assert {:error, %Error{code: "E1", message: "Create fail"}} =
+               OData.create(client, "Contact", %{"Name" => "X"})
+
+      assert {:error, %Error{message: "Patch fail"}} =
+               OData.update(client, "Contact", "1", %{"Name" => "Y"})
+
+      assert {:error, %Error{message: "Delete fail"}} = OData.delete(client, "Contact", "1")
+
+      assert {:error, %Error{code: "DS1", message: "DS fail"}} =
+               Creatio.DataService.select_query(client, %{})
+
+      assert {:error, %Error{status: 200}} =
+               Auth.openid_configuration("https://crm.test/.well-known/openid-configuration",
+                 req_options: [plug: plug]
+               )
+    end
+
+    test "normalizes $-prefixed OData options, rejects non-binary :filter and invalid :skip/:page_size" do
+      assert_raise ArgumentError, ~r/expected :filter to be a binary/, fn ->
+        Util.normalize_odata_params([filter: [Name: "Alice"]], %{}, {"$count", "true"})
+      end
+
+      params =
+        Util.normalize_odata_params(
+          %{
+            "$count" => true,
+            "$top" => nil,
+            "$orderby" => [{"Name", :asc}],
+            :params => %{"$filter" => ""}
+          },
+          %{},
+          {"$inlinecount", "allpages"}
+        )
+
+      assert params == %{"$inlinecount" => "allpages", "$orderby" => "Name asc"}
+
+      client = Client.new(base_url: "https://crm.test")
+
+      for bad_opts <- [
+            [page_size: 0],
+            [page_size: -1],
+            [page_size: "bad"],
+            [skip: -1],
+            [skip: "bad"]
+          ] do
+        assert_raise ArgumentError, fn ->
+          Util.paginate_stream(client, "Contact", bad_opts, :odata4, fn _, _, _ -> {:ok, []} end)
+        end
+      end
+    end
+
+    test "DataService OPTIONS/pre-encoded JSON, Auth forms/OAuth/cookies, HTML comment WAF, and 2-arity into: gating" do
+      parent = self()
+
+      plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(parent, {:svc_req, conn.method, conn.request_path, conn.req_headers, body})
+
+        case {conn.method, conn.request_path} do
+          {"OPTIONS", "/0/rest/Svc/Ep"} ->
+            Plug.Conn.send_resp(conn, 204, "")
+
+          {"POST", "/0/rest/Svc/Ep"} ->
+            Req.Test.json(conn, %{"ok" => true})
+
+          {"POST", "/ServiceModel/AuthService.svc/Login"} ->
+            if String.contains?(body, "bad") do
+              Req.Test.json(conn, %{"Code" => 1, "Message" => ""})
+            else
+              conn
+              |> Map.put(:resp_headers, [
+                {"set-cookie", ".ASPXAUTH=auth1; Path=/0; HttpOnly"},
+                {"set-cookie", "BPMCSRF=valid_csrf; Path=/0; HttpOnly"},
+                {"set-cookie", "BPMCSRF=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT"}
+              ])
+              |> Plug.Conn.put_resp_content_type("application/json")
+              |> Plug.Conn.send_resp(200, Jason.encode!(%{"Code" => 0}))
+            end
+
+          {"POST", "/connect/token"} ->
+            Req.Test.json(conn, %{"access_token" => "tok-uc", "expires_in" => 3600})
+
+          {"GET", "/0/api/OAuthHealthCheck"} ->
+            conn
+            |> Plug.Conn.put_resp_content_type("text/html")
+            |> Plug.Conn.send_resp(200, "<!-- Incapsula WAF --><div>Blocked</div>")
+        end
+      end
+
+      client = Client.new(base_url: "https://crm.test", req_options: [plug: plug])
+
+      assert {:ok, ""} = Creatio.DataService.custom_service(client, "Svc", "Ep", method: :options)
+      assert_receive {:svc_req, "OPTIONS", "/0/rest/Svc/Ep", _, ""}
+
+      assert {:ok, %{"ok" => true}} =
+               Creatio.DataService.custom_service(client, "Svc", "Ep", ~s({"a":1}))
+
+      assert_receive {:svc_req, "POST", "/0/rest/Svc/Ep", json_headers, ~s({"a":1})}
+
+      assert List.keyfind(json_headers, "content-type", 0) ==
+               {"content-type", "application/json; charset=utf-8"}
+
+      assert {:ok, authed} = Auth.login_forms(client, "user", "good")
+      assert_receive {:svc_req, "POST", "/ServiceModel/AuthService.svc/Login", login_headers, _}
+      assert List.keyfind(login_headers, "accept", 0) == {"accept", "application/json"}
+      assert authed.bpmcsrf == "valid_csrf"
+      assert authed.cookie =~ "BPMCSRF=valid_csrf"
+
+      assert {:error, %Error{code: 1, message: "Invalid credentials"}} =
+               Auth.login_forms(client, "user", "bad")
+
+      assert {:ok, _oauth_client, %{"access_token" => "tok-uc"}} =
+               Auth.login_oauth(client,
+                 client_id: "cid",
+                 client_secret: "csec",
+                 token_url: "HTTPS://id.crm.test/connect/token"
+               )
+
+      assert {:error, %Error{status: 200}} = Auth.oauth_health_check(client)
+      assert Util.html_or_xml_markup?(%Req.Response{body: "  <!-- comment waf -->"})
+
+      # 2-arity into: fun is status-gated and non-2xx errors are capped at 64 KB
+      huge_err = String.duplicate("X", 100_000)
+
+      stream_plug = fn conn ->
+        case conn.request_path do
+          "/err" ->
+            Plug.Conn.send_resp(conn, 500, huge_err)
+
+          "/waf" ->
+            conn
+            |> Plug.Conn.put_resp_content_type("text/html")
+            |> Plug.Conn.send_resp(200, "<!-- waf --><html>blocked</html>")
+
+          "/ok" ->
+            Plug.Conn.send_resp(conn, 200, "small-ok")
+        end
+      end
+
+      into_cb = fn {:data, chunk}, {req, resp} ->
+        send(parent, {:into_chunk, chunk})
+        {:cont, {req, %{resp | body: (resp.body || "") <> chunk}}}
+      end
+
+      assert {:error, %Error{status: 500, response: err_resp}} =
+               Util.fetch_field_value(
+                 Req.new(base_url: "https://crm.test"),
+                 "/err",
+                 into: into_cb,
+                 req_options: [plug: stream_plug, retry: false]
+               )
+
+      assert byte_size(err_resp.body) == 65_536
+      refute_received {:into_chunk, _}
+
+      assert {:error, %Error{status: 200}} =
+               Util.fetch_field_value(
+                 Req.new(base_url: "https://crm.test"),
+                 "/waf",
+                 into: into_cb,
+                 req_options: [plug: stream_plug, retry: false]
+               )
+
+      refute_received {:into_chunk, _}
+
+      assert {:ok, "small-ok"} =
+               Util.fetch_field_value(
+                 Req.new(base_url: "https://crm.test"),
+                 "/ok",
+                 into: into_cb,
+                 req_options: [plug: stream_plug, retry: false]
+               )
+
+      assert_receive {:into_chunk, "small-ok"}
     end
   end
 end

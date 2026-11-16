@@ -95,7 +95,7 @@ defmodule Creatio.Client do
          Application.get_env(:creatio, :base_url) ||
          System.get_env("CREATIO_BASE_URL") ||
          "")
-      |> String.trim_trailing("/")
+      |> normalize_base_url()
 
     cookie = Keyword.get(opts_list, :cookie)
     bpmcsrf = Keyword.get(opts_list, :bpmcsrf)
@@ -109,14 +109,16 @@ defmodule Creatio.Client do
       |> normalize_optional_url()
 
     client_id =
-      Keyword.get(opts_list, :client_id) ||
-        Application.get_env(:creatio, :client_id) ||
-        System.get_env("CREATIO_CLIENT_ID")
+      (Keyword.get(opts_list, :client_id) ||
+         Application.get_env(:creatio, :client_id) ||
+         System.get_env("CREATIO_CLIENT_ID"))
+      |> normalize_optional_string()
 
     client_secret =
-      Keyword.get(opts_list, :client_secret) ||
-        Application.get_env(:creatio, :client_secret) ||
-        System.get_env("CREATIO_CLIENT_SECRET")
+      (Keyword.get(opts_list, :client_secret) ||
+         Application.get_env(:creatio, :client_secret) ||
+         System.get_env("CREATIO_CLIENT_SECRET"))
+      |> normalize_optional_string()
 
     req_options =
       case Keyword.get(opts_list, :req_options, []) do
@@ -133,7 +135,8 @@ defmodule Creatio.Client do
         true -> :none
       end
 
-    base_opts = if base_url != "", do: [base_url: base_url], else: []
+    base_opts =
+      if base_url != "", do: [base_url: base_url, decode_body: false], else: [decode_body: false]
 
     req =
       base_opts
@@ -231,7 +234,7 @@ defmodule Creatio.Client do
     {auth_token, cookie, bpmcsrf} =
       case auth_mode do
         :bearer ->
-          token = opt_auth_token || extract_bearer_token(req_for_auth)
+          token = normalize_optional_string(opt_auth_token) || extract_bearer_token(req_for_auth)
           {token, nil, nil}
 
         :forms ->
@@ -264,11 +267,12 @@ defmodule Creatio.Client do
         req_for_auth
       end
 
-    trimmed_base = String.trim_trailing(base_url, "/")
+    trimmed_base = normalize_base_url(base_url)
 
     configured_req =
       req_for_auth
       |> maybe_put_base_url(trimmed_base)
+      |> maybe_disable_decode_body()
       |> put_header_if_absent("accept", "application/json; odata.metadata=minimal")
       |> put_header_if_absent("forceusesession", "true")
 
@@ -280,8 +284,8 @@ defmodule Creatio.Client do
       bpmcsrf: bpmcsrf,
       identity_service_url:
         opts_list |> Keyword.get(:identity_service_url) |> normalize_optional_url(),
-      client_id: Keyword.get(opts_list, :client_id),
-      client_secret: Keyword.get(opts_list, :client_secret),
+      client_id: opts_list |> Keyword.get(:client_id) |> normalize_optional_string(),
+      client_secret: opts_list |> Keyword.get(:client_secret) |> normalize_optional_string(),
       read_only: read_only,
       req: configured_req,
       options: sanitize_stored_options(opts_list)
@@ -300,6 +304,14 @@ defmodule Creatio.Client do
     end
   end
 
+  defp maybe_disable_decode_body(%Req.Request{options: opts} = req) do
+    if Map.has_key?(opts, :decode_body) do
+      req
+    else
+      Req.Request.put_option(req, :decode_body, false)
+    end
+  end
+
   @doc """
   Ensures that the input is a `%Creatio.Client{}`, converting a `%Req.Request{}` if necessary.
   """
@@ -312,11 +324,13 @@ defmodule Creatio.Client do
   """
   @spec put_bearer_token(t(), String.t()) :: t()
   def put_bearer_token(%__MODULE__{} = client, token) when is_binary(token) do
-    if String.trim(token) == "" do
+    trimmed = String.trim(token)
+
+    if trimmed == "" do
       raise ArgumentError, "expected non-empty bearer token binary"
     end
 
-    client = %{client | auth_token: token, auth_mode: :bearer, cookie: nil, bpmcsrf: nil}
+    client = %{client | auth_token: trimmed, auth_mode: :bearer, cookie: nil, bpmcsrf: nil}
     apply_auth_headers(client)
   end
 
@@ -348,25 +362,28 @@ defmodule Creatio.Client do
   def to_req(%__MODULE__{req: req}), do: req
 
   defp resolve_auth_token(opts_list, cookie, bpmcsrf) do
-    case Keyword.fetch(opts_list, :auth_token) do
-      {:ok, val} ->
-        val
+    raw =
+      case Keyword.fetch(opts_list, :auth_token) do
+        {:ok, val} ->
+          val
 
-      :error ->
-        case Keyword.fetch(opts_list, :bearer_token) do
-          {:ok, val} ->
-            val
+        :error ->
+          case Keyword.fetch(opts_list, :bearer_token) do
+            {:ok, val} ->
+              val
 
-          :error ->
-            if cookie || bpmcsrf do
-              nil
-            else
-              Application.get_env(:creatio, :auth_token) ||
-                System.get_env("CREATIO_AUTH_TOKEN") ||
-                System.get_env("CREATIO_BEARER_TOKEN")
-            end
-        end
-    end
+            :error ->
+              if cookie || bpmcsrf do
+                nil
+              else
+                Application.get_env(:creatio, :auth_token) ||
+                  System.get_env("CREATIO_AUTH_TOKEN") ||
+                  System.get_env("CREATIO_BEARER_TOKEN")
+              end
+          end
+      end
+
+    normalize_optional_string(raw)
   end
 
   defp resolve_read_only(opts) do
@@ -385,7 +402,11 @@ defmodule Creatio.Client do
     normalize_read_only(raw)
   end
 
-  defp normalize_read_only(val) when val in [true, "true", "TRUE", "1", 1], do: true
+  defp normalize_read_only(val) when is_binary(val) do
+    String.trim(val) in ["true", "TRUE", "1"]
+  end
+
+  defp normalize_read_only(val) when val in [true, 1], do: true
   defp normalize_read_only(_), do: false
 
   defp apply_auth_headers(%__MODULE__{} = client) do
@@ -417,6 +438,7 @@ defmodule Creatio.Client do
         base_url: client.base_url,
         auth_mode: client.auth_mode
       })
+      |> attach_json_bom_step()
       |> Telemetry.attach_req_steps()
 
     req =
@@ -444,7 +466,7 @@ defmodule Creatio.Client do
     %Req.Request{
       req
       | request_steps: Keyword.delete(steps, :read_only_guard),
-        current_request_steps: List.delete(current, :read_only_guard)
+        current_request_steps: Enum.reject(current, &(&1 == :read_only_guard))
     }
   end
 
@@ -475,10 +497,16 @@ defmodule Creatio.Client do
             "/connect/token"
           ]
 
+          path_down = String.downcase(path)
+
+          rest_path? =
+            String.contains?(path_down, "/0/rest/") or
+              String.starts_with?(String.trim_leading(path_down, "/"), "0/rest/")
+
           allowed? =
-            not String.contains?(path, "/0/rest/") and
+            req.method == :post and not rest_path? and
               (Enum.any?(allowed_suffixes, &String.ends_with?(path, &1)) or
-                 (req.method == :post and String.ends_with?(path, "/odata/$batch") and
+                 (String.ends_with?(path_down, "/odata/$batch") and
                     read_only_batch_request?(req)))
 
           if allowed? do
@@ -712,6 +740,62 @@ defmodule Creatio.Client do
         other
     end)
   end
+
+  defp attach_json_bom_step(%Req.Request{response_steps: steps} = req) do
+    if Keyword.has_key?(steps, :creatio_strip_json_bom) or
+         not Keyword.has_key?(steps, :decode_body) do
+      req
+    else
+      updated =
+        Enum.flat_map(steps, fn
+          {:decode_body, _} = step ->
+            [{:creatio_strip_json_bom, &__MODULE__.strip_json_bom_response/1}, step]
+
+          step ->
+            [step]
+        end)
+
+      %Req.Request{req | response_steps: updated}
+    end
+  end
+
+  @doc false
+  @spec strip_json_bom_response({Req.Request.t(), Req.Response.t()}) ::
+          {Req.Request.t(), Req.Response.t()}
+  def strip_json_bom_response(
+        {%Req.Request{options: opts} = req,
+         %Req.Response{body: <<0xEF, 0xBB, 0xBF, rest::binary>>} = resp}
+      ) do
+    if opts[:decode_body] != false and opts[:raw] != true and json_response_ct?(resp) do
+      {req, %Req.Response{resp | body: rest}}
+    else
+      {req, resp}
+    end
+  end
+
+  def strip_json_bom_response(pair), do: pair
+
+  defp json_response_ct?(%Req.Response{} = resp) do
+    case Req.Response.get_header(resp, "content-type") do
+      [ct | _] -> String.contains?(String.downcase(ct), "json")
+      _ -> false
+    end
+  end
+
+  defp normalize_base_url(url) when is_binary(url) do
+    url |> String.trim() |> String.trim_trailing("/")
+  end
+
+  defp normalize_base_url(_), do: ""
+
+  defp normalize_optional_string(val) when is_binary(val) do
+    case String.trim(val) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_optional_string(_), do: nil
 
   defp normalize_optional_url(url) when is_binary(url) do
     case url |> String.trim() |> String.trim_trailing("/") do

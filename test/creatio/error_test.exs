@@ -159,5 +159,32 @@ defmodule Creatio.ErrorTest do
     html_err = Error.from_response(%Req.Response{status: 502, body: huge_html})
     assert byte_size(html_err.message) < 600
     assert html_err.message =~ "[truncated"
+
+    odata3_err =
+      Error.from_response(%Req.Response{
+        status: 200,
+        body: %{
+          "d" => %{
+            "error" => %{
+              "code" => "OData3Code",
+              "message" => %{"value" => "OData3 inner failure"}
+            }
+          }
+        }
+      })
+
+    assert %Error{status: 200, code: "OData3Code", message: "OData3 inner failure"} = odata3_err
+
+    nested_ex_err =
+      Error.from_response(%Req.Response{
+        status: 200,
+        body: %{
+          "Code" => -1,
+          "Message" => "",
+          "Exception" => %{"Message" => "Nested exception message"}
+        }
+      })
+
+    assert %Error{status: 200, code: -1, message: "Nested exception message"} = nested_ex_err
   end
 end

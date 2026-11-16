@@ -568,7 +568,7 @@ defmodule Creatio.Features.ODataEntitiesTest do
       @then last_request_omitted_query_param("$skip")
       @then query_parameters_mapped(
               orderby: "Id asc",
-              filter: "(Active eq true) and (Id gt #{@cursor_id3})"
+              filter: "(Active eq true) and (Id gt #{@cursor_id2})"
             )
 
       @upon streaming_entities(Query.new("Contact") |> Query.filter_eq("Active", true),
@@ -818,9 +818,9 @@ defmodule Creatio.Features.ODataEntitiesTest do
                raw_body: "{broken"
              )
       @upon updating_entity("Contact", @waf_entity_id, %{"Name" => "X"}, return: :representation)
-      @then operation_failed_with(status: nil)
+      @then operation_failed_with(status: 200)
       @upon getting_field("Contact", @waf_entity_id, "Name")
-      @then operation_failed_with(status: nil)
+      @then operation_failed_with(status: 200)
 
       @given odata_updatable_entity("Contact", @waf_entity_id,
                status: 200,

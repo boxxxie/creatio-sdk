@@ -36,6 +36,7 @@ defmodule Creatio.Auth do
           |> Req.Request.delete_header("authorization")
           |> Req.Request.delete_header("cookie")
           |> Req.Request.delete_header("bpmcsrf")
+          |> Req.Request.put_header("accept", "application/json")
           |> Req.Request.put_header("content-type", "application/json; charset=utf-8")
 
         {req, req_opts} =
@@ -100,7 +101,11 @@ defmodule Creatio.Auth do
         end
 
       code != nil ->
-        msg = body["Message"] || body["message"] || "Invalid credentials"
+        msg =
+          Enum.find([body["Message"], body["message"], body["ExceptionMessage"]], fn
+            val when is_binary(val) -> String.trim(val) != ""
+            _ -> false
+          end) || "Invalid credentials"
 
         {:error,
          Error.new(
@@ -144,8 +149,10 @@ defmodule Creatio.Auth do
   end
 
   def login_oauth(%Client{} = client, opts) do
-    client_id = Util.get_opt(opts, :client_id) || client.client_id
-    client_secret = Util.get_opt(opts, :client_secret) || client.client_secret
+    client_id = normalize_non_empty(Util.get_opt(opts, :client_id)) || client.client_id
+
+    client_secret =
+      normalize_non_empty(Util.get_opt(opts, :client_secret)) || client.client_secret
 
     identity_url =
       case Util.get_opt(opts, :identity_service_url) || client.identity_service_url do
@@ -154,10 +161,12 @@ defmodule Creatio.Auth do
       end
 
     token_path =
-      Util.get_opt(opts, :token_url) || Keyword.get(client.options, :token_url) ||
-        "/connect/token"
+      (Util.get_opt(opts, :token_url) || Keyword.get(client.options, :token_url) ||
+         "/connect/token")
+      |> to_string()
+      |> String.trim()
 
-    full_token_url? = String.starts_with?(token_path, ["http://", "https://"])
+    full_token_url? = absolute_http_url?(token_path)
 
     span_meta = %{
       auth_mode: :oauth,
@@ -285,7 +294,7 @@ defmodule Creatio.Auth do
   end
 
   defp valid_health_response?(%Req.Response{body: %{} = body}) do
-    not Map.has_key?(body, "error")
+    not Util.error_payload?(body)
   end
 
   defp valid_health_response?(%Req.Response{body: body} = resp) when is_binary(body) do
@@ -339,7 +348,7 @@ defmodule Creatio.Auth do
 
         with :ok <- validate_absolute_url(effective_url, "OpenID configuration") do
           req =
-            [url: url]
+            [url: url, decode_body: false]
             |> Keyword.merge(req_opts)
             |> Req.new()
             |> Telemetry.attach_req_steps()
@@ -352,7 +361,7 @@ defmodule Creatio.Auth do
 
   defp resolve_request_url(url, base_url)
        when is_binary(base_url) and base_url != "" and is_binary(url) do
-    if String.starts_with?(url, ["http://", "https://"]) do
+    if absolute_http_url?(url) do
       url
     else
       "#{String.trim_trailing(base_url, "/")}#{if String.starts_with?(url, "/"), do: url, else: "/#{url}"}"
@@ -360,6 +369,23 @@ defmodule Creatio.Auth do
   end
 
   defp resolve_request_url(url, _base_url), do: url
+
+  defp absolute_http_url?(url) when is_binary(url) do
+    case String.downcase(url) do
+      "http://" <> _ -> true
+      "https://" <> _ -> true
+      _ -> false
+    end
+  end
+
+  defp normalize_non_empty(val) when is_binary(val) do
+    case String.trim(val) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_non_empty(_), do: nil
 
   defp validate_absolute_url(url, label) when is_binary(url) do
     case URI.parse(url) do
@@ -388,8 +414,15 @@ defmodule Creatio.Auth do
 
   defp handle_openid_response({:ok, %Req.Response{} = raw_resp}) do
     case Util.normalize_json_response(raw_resp) do
-      %{status: 200, body: %{} = body} -> {:ok, body}
-      %Req.Response{} = resp -> {:error, Error.from_response(resp)}
+      %{status: 200, body: %{} = body} = resp ->
+        if Util.error_payload?(body) do
+          {:error, Error.from_response(resp)}
+        else
+          {:ok, body}
+        end
+
+      %Req.Response{} = resp ->
+        {:error, Error.from_response(resp)}
     end
   end
 
@@ -426,40 +459,83 @@ defmodule Creatio.Auth do
   defp parse_set_cookie_raw(list) when is_list(list) do
     # Deduplicate by cookie name keeping the latest Set-Cookie header value
     # (IIS commonly clears a cookie before setting its new value in the same response),
-    # and drop cookies cleared with an empty value (e.g. `Name=; Expires=...`).
+    # and drop cookies cleared with an empty value only when targeting the same Path.
     {ordered_names, by_name} =
       list
       |> Enum.filter(&is_binary/1)
-      |> Enum.map(fn cookie_str ->
-        cookie_str
-        |> String.split(";", parts: 2)
-        |> List.first()
-        |> String.trim()
-      end)
-      |> Enum.reject(&(&1 == "" or is_nil(&1)))
-      |> Enum.reduce({[], %{}}, fn cookie, {names, acc} ->
-        case String.split(cookie, "=", parts: 2) do
-          [name, val] ->
-            trimmed_name = String.trim(name)
-            trimmed_val = String.trim(val)
-            name_key = String.downcase(trimmed_name)
+      |> Enum.reduce({[], %{}}, fn cookie_str, {names, acc} ->
+        case parse_set_cookie_entry(cookie_str) do
+          {:ok, name_key, cookie_kv, path, cleared?} ->
+            if cleared? do
+              case Map.get(acc, name_key) do
+                {_existing_kv, existing_path} when existing_path == path ->
+                  {List.delete(names, name_key), Map.delete(acc, name_key)}
 
-            if trimmed_name == "" or trimmed_val == "" do
-              {List.delete(names, name_key), Map.delete(acc, name_key)}
+                _ ->
+                  {names, acc}
+              end
             else
               names = if Map.has_key?(acc, name_key), do: names, else: [name_key | names]
-              {names, Map.put(acc, name_key, "#{trimmed_name}=#{trimmed_val}")}
+              {names, Map.put(acc, name_key, {cookie_kv, path})}
             end
 
-          _ ->
+          :ignore ->
             {names, acc}
         end
       end)
 
     ordered_names
     |> Enum.reverse()
-    |> Enum.map(&Map.fetch!(by_name, &1))
+    |> Enum.map(fn name_key ->
+      {cookie_kv, _path} = Map.fetch!(by_name, name_key)
+      cookie_kv
+    end)
   end
+
+  defp parse_set_cookie_entry(cookie_str) do
+    [kv_part | attr_parts] = String.split(cookie_str, ";")
+    trimmed_kv = String.trim(kv_part)
+
+    case String.split(trimmed_kv, "=", parts: 2) do
+      [name, val] ->
+        trimmed_name = String.trim(name)
+        trimmed_val = String.trim(val)
+
+        if trimmed_name == "" do
+          :ignore
+        else
+          name_key = String.downcase(trimmed_name)
+          attrs = parse_cookie_attrs(attr_parts)
+          path = Map.get(attrs, "path")
+          cleared? = trimmed_val == "" or max_age_expired?(attrs)
+          {:ok, name_key, "#{trimmed_name}=#{trimmed_val}", path, cleared?}
+        end
+
+      _ ->
+        :ignore
+    end
+  end
+
+  defp parse_cookie_attrs(attr_parts) do
+    Enum.reduce(attr_parts, %{}, fn part, acc ->
+      case String.split(part, "=", parts: 2) do
+        [k, v] ->
+          Map.put(acc, k |> String.trim() |> String.downcase(), String.trim(v))
+
+        _ ->
+          acc
+      end
+    end)
+  end
+
+  defp max_age_expired?(%{"max-age" => raw_age}) do
+    case Integer.parse(raw_age) do
+      {age, ""} -> age <= 0
+      _ -> false
+    end
+  end
+
+  defp max_age_expired?(_), do: false
 
   defp extract_bpmcsrf(cookies, headers) when is_list(cookies) do
     from_cookies =
