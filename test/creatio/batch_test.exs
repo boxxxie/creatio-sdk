@@ -361,5 +361,133 @@ defmodule Creatio.BatchTest do
         )
       end
     end
+
+    test "rejects external :url overrides, IIS path bypasses, and CRLF injection in method/headers" do
+      client = Creatio.Client.new(base_url: "https://test.creatio.com")
+
+      assert_raise ArgumentError, ~r/origin/, fn ->
+        Batch.execute(client, Batch.new() |> Batch.add_get("Contact"),
+          url: "https://attacker.example/0/odata/$batch"
+        )
+      end
+
+      assert_raise ArgumentError, ~r/Invalid batch endpoint URL/, fn ->
+        Batch.execute(client, Batch.new() |> Batch.add_get("Contact"),
+          url: "//attacker.example/0/odata/$batch"
+        )
+      end
+
+      for bad_url <- [
+            "Contact/..%5crest/CustomSvc/Op",
+            "Contact/.%2e/rest/CustomSvc/Op",
+            "Contact/%252e%252e/rest/CustomSvc/Op",
+            "/0/rest%2fCustomSvc/Op"
+          ] do
+        assert_raise ArgumentError, ~r/invalid batch sub-request URL/, fn ->
+          Batch.add(Batch.new(), "GET", bad_url)
+        end
+      end
+
+      assert_raise ArgumentError, ~r/invalid batch HTTP method/, fn ->
+        Batch.add(Batch.new(), "GET /evil HTTP/1.1\r\nX-Injected: 1", "Contact")
+      end
+
+      assert_raise ArgumentError, ~r/invalid batch header name/, fn ->
+        Batch.add(Batch.new(), "GET", "Contact", headers: %{"Bad\r\nHeader" => "v"})
+      end
+
+      assert_raise ArgumentError, ~r/invalid batch header value/, fn ->
+        Batch.add(Batch.new(), "GET", "Contact", headers: %{"X-Test" => "ok\r\nX-Evil: 1"})
+      end
+
+      assert_raise ArgumentError, ~r/invalid batch header value/, fn ->
+        Batch.execute(client, [%{method: "GET", url: "Contact", headers: %{"X-A" => "a\nb"}}])
+      end
+    end
+
+    test "handles non-boundary item IDs, 49-byte atomicity_group, underscore/hyphen groups, empty batch, and query opts in multipart/OData" do
+      batch =
+        Batch.new()
+        |> Batch.add_create("Contact", %{"Name" => "A"}, id: "op with spaces:1/2")
+        |> Batch.add_create("Contact", %{"Name" => "B"}, atomicity_group: "order_sync")
+        |> Batch.add_create("Contact", %{"Name" => "C"}, atomicity_group: "order-sync.v1")
+        |> Batch.add_create("Contact", %{"Name" => "D"},
+          atomicity_group: String.duplicate("g", 49)
+        )
+
+      {boundary, body} = Batch.to_multipart(batch, boundary: "b_edge")
+      assert boundary == "b_edge"
+      assert body =~ "Content-ID: op with spaces:1/2\r\n"
+      assert body =~ "boundary=changeset_order_sync_"
+      assert body =~ "boundary=changeset_order-sync.v1_"
+
+      assert_raise ArgumentError, ~r/at most 49 bytes/, fn ->
+        Batch.add_create(Batch.new(), "Contact", %{"Name" => "TooLong"},
+          atomicity_group: String.duplicate("g", 50)
+        )
+      end
+
+      assert {"b_empty", "--b_empty--\r\n"} = Batch.to_multipart(Batch.new(), boundary: "b_empty")
+
+      mixed_resp =
+        "--b_srv\r\n" <>
+          "Content-Type: multipart/mixed; boundary=changeset_order_sync_abc123\r\n\r\n" <>
+          "--changeset_order_sync_abc123\r\n" <>
+          "Content-Type: application/http\r\n\r\n" <>
+          "HTTP/1.1 204 No Content\r\n\r\n" <>
+          "--changeset_order_sync_abc123--\r\n\r\n" <>
+          "--b_srv\r\n" <>
+          "Content-Type: multipart/mixed; boundary=changeset_order-sync.v1_xyz999\r\n\r\n" <>
+          "--changeset_order-sync.v1_xyz999\r\n" <>
+          "Content-Type: application/http\r\n\r\n" <>
+          "HTTP/1.1 204 No Content\r\n\r\n" <>
+          "--changeset_order-sync.v1_xyz999--\r\n--b_srv--\r\n"
+
+      assert {:ok, [r1, r2]} = Batch.parse_multipart_response(mixed_resp, "b_srv")
+      assert r1.atomicity_group == "order_sync"
+      assert r2.atomicity_group == "order-sync.v1"
+
+      # add_get forwards OData query options and facade batch_* helpers delegate cleanly
+      q_batch =
+        Creatio.batch_new()
+        |> Creatio.batch_get("Contact", select: ["Id", "Name"], top: 5)
+        |> Creatio.batch_get("Contact", 42, select: ["Name"])
+        |> Creatio.batch_create("Account", %{"Name" => "Acme"})
+        |> Creatio.batch_update("Account", 1, %{"Name" => "Acme 2"})
+        |> Creatio.batch_delete("Account", 2)
+
+      [g1, g2 | _] = Batch.requests(q_batch)
+      assert g1["url"] =~ "Contact?"
+      assert g1["url"] =~ "%24select=Id%2CName"
+      assert g1["url"] =~ "%24top=5"
+      assert g2["url"] =~ "Contact(42)?"
+      assert g2["url"] =~ "%24select=Name"
+    end
+
+    test "returns error for top-level 200 JSON error payload and forwards :req_options in Batch.execute/3" do
+      err_client =
+        Creatio.Client.new(
+          base_url: "https://test.creatio.com",
+          req_options: [
+            plug: fn conn ->
+              Req.Test.json(conn, %{"error" => %{"code" => "BadBatch", "message" => "boom"}})
+            end
+          ]
+        )
+
+      assert {:error, %Error{code: "BadBatch", message: "boom"}} =
+               Batch.execute(err_client, Batch.new() |> Batch.add_get("Contact"))
+
+      override_plug = fn conn ->
+        Req.Test.json(conn, %{"responses" => [%{"id" => "req_1", "status" => 200, "body" => %{}}]})
+      end
+
+      client = Creatio.Client.new(base_url: "https://test.creatio.com")
+
+      assert {:ok, [%Response{status: 200}]} =
+               Batch.execute(client, Batch.new() |> Batch.add_get("Contact"),
+                 req_options: [plug: override_plug]
+               )
+    end
   end
 end
