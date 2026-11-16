@@ -47,19 +47,23 @@ contacts_stream = Creatio.stream(client, "Contact",
   expand: "Account($select=Id,Name)" # Eager-load the related Account!
 )
 
-# Process the stream
-Stream.each(contacts_stream, fn contact ->
-  # 'contact' is an individual record from the OData stream
-  # Insert or update the contact in your local DB (e.g., via Ecto)
-  # MyApp.Repo.insert_or_update!(...)
-  IO.puts("Syncing Contact: #{contact["Name"]} (Email: #{contact["Email"]})")
-  
-  # You can also handle the expanded account
-  if account = contact["Account"] do
-    IO.puts("  Belongs to Account: #{account["Name"]}")
-  end
+# Process the tuple-emitting stream (or use `Creatio.stream!/3` to raise on failure)
+Enum.reduce_while(contacts_stream, :ok, fn
+  {:ok, contact}, :ok ->
+    # Insert or update the contact in your local DB (e.g., via Ecto)
+    # MyApp.Repo.insert_or_update!(...)
+    IO.puts("Syncing Contact: #{contact["Name"]} (Email: #{contact["Email"]})")
+
+    # You can also handle the expanded account
+    if account = contact["Account"] do
+      IO.puts("  Belongs to Account: #{account["Name"]}")
+    end
+
+    {:cont, :ok}
+
+  {:error, error}, :ok ->
+    {:halt, {:error, error}}
 end)
-|> Stream.run() # Execute the lazy stream
 ```
 
 *Tip: Expanding relationships (`$expand=Account`) minimizes the number of HTTP requests, avoiding the N+1 query problem during syncs.*
@@ -94,8 +98,9 @@ defmodule MyApp.Workers.CreatioDeltaSync do
       orderby: "ModifiedOn asc"
     ]
     
-    # We can use the stream here as well in case there are many updates
-    Creatio.stream(client, "Contact", query)
+    # We can use stream!/3 here (or match {:ok, record} / {:error, error} on stream/3)
+    Creatio.stream!(client, "Contact", query)
+    |> Stream.chunk_every(100)
     |> Stream.each(fn chunk ->
       MyApp.Accounts.bulk_upsert_contacts(chunk)
     end)
