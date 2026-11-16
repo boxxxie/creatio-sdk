@@ -167,12 +167,20 @@ defmodule Creatio.Batch do
   @spec add_update(t(), String.t(), Creatio.record_id() | map() | nil, map() | Creatio.opts()) ::
           t()
   @spec add_update(t(), String.t(), Creatio.record_id() | nil, map(), Creatio.opts()) :: t()
-  def add_update(batch, entity_or_ref, id_or_attrs, attrs_or_opts \\ [], opts \\ [])
+  def add_update(%__MODULE__{} = batch, ref, attrs)
+      when is_binary(ref) and is_map(attrs) do
+    url = validate_content_id_ref!(ref, "add_update/3")
+    add(batch, "PATCH", url, Util.put_opt([], :body, attrs))
+  end
 
-  def add_update(%__MODULE__{} = batch, ref, attrs, opts, [])
+  def add_update(%__MODULE__{} = batch, ref, attrs, opts)
       when is_binary(ref) and is_map(attrs) and (is_list(opts) or is_map(opts)) do
     url = validate_content_id_ref!(ref, "add_update/4")
     add(batch, "PATCH", url, Util.put_opt(opts, :body, attrs))
+  end
+
+  def add_update(%__MODULE__{} = batch, entity, id, attrs) do
+    add_update(batch, entity, id, attrs, [])
   end
 
   def add_update(%__MODULE__{} = batch, ref, nil, attrs, opts)
@@ -196,21 +204,23 @@ defmodule Creatio.Batch do
   @spec add_delete(t(), String.t()) :: t()
   @spec add_delete(t(), String.t(), Creatio.record_id() | Creatio.opts() | nil) :: t()
   @spec add_delete(t(), String.t(), Creatio.record_id() | nil, Creatio.opts()) :: t()
-  def add_delete(batch, entity_or_ref, id_or_opts \\ [], opts \\ [])
-
-  def add_delete(%__MODULE__{} = batch, ref, [], []) when is_binary(ref) do
+  def add_delete(%__MODULE__{} = batch, ref) when is_binary(ref) do
     url = validate_content_id_ref!(ref, "add_delete/2")
     add(batch, "DELETE", url, [])
   end
 
-  def add_delete(%__MODULE__{} = batch, ref, nil, opts) when is_binary(ref) do
-    url = validate_content_id_ref!(ref, "add_delete/4")
+  def add_delete(%__MODULE__{} = batch, ref, opts)
+      when is_binary(ref) and (is_list(opts) or is_map(opts)) do
+    url = validate_content_id_ref!(ref, "add_delete/3")
     add(batch, "DELETE", url, opts)
   end
 
-  def add_delete(%__MODULE__{} = batch, ref, opts, [])
-      when is_binary(ref) and (is_list(opts) or is_map(opts)) do
-    url = validate_content_id_ref!(ref, "add_delete/3")
+  def add_delete(%__MODULE__{} = batch, entity, id) do
+    add_delete(batch, entity, id, [])
+  end
+
+  def add_delete(%__MODULE__{} = batch, ref, nil, opts) when is_binary(ref) do
+    url = validate_content_id_ref!(ref, "add_delete/4")
     add(batch, "DELETE", url, opts)
   end
 
