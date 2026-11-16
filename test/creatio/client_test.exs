@@ -4,104 +4,84 @@ defmodule Creatio.ClientTest do
   alias Creatio.Client
 
   describe "new/1" do
-    test "initializes with base_url and strips trailing slashes" do
+    test "initializes from keyword options, maps, and %Req.Request{} with normalized URLs" do
       client = Client.new(base_url: "https://mycreatio.com/")
       assert client.base_url == "https://mycreatio.com"
       assert client.req.options.base_url == "https://mycreatio.com"
       assert client.auth_mode == :none
       assert client.req.headers["accept"] == ["application/json; odata.metadata=minimal"]
+
+      map_client = Client.new(%{base_url: "https://mycreatio.com", auth_token: "token123"})
+      assert map_client.base_url == "https://mycreatio.com"
+      assert map_client.auth_token == "token123"
+      assert map_client.req.headers["forceusesession"] == ["true"]
+
+      req = Req.new(base_url: "https://mycreatio.com")
+      req_client = Client.new(req)
+      assert req_client.base_url == "https://mycreatio.com"
+      assert req_client.req.headers["forceusesession"] == ["true"]
+      assert Client.ensure_client(req) == req_client
+      assert Client.ensure_client(req_client) == req_client
+
+      with_identity =
+        Client.new(
+          base_url: "https://mycreatio.com/",
+          identity_service_url: "https://id.mycreatio.com/0/"
+        )
+
+      assert with_identity.identity_service_url == "https://id.mycreatio.com/0"
+
+      from_req_client = Client.from_req(req, identity_service_url: "https://id.mycreatio.com/0/")
+      assert from_req_client.identity_service_url == "https://id.mycreatio.com/0"
     end
 
-    test "initializes with auth_token" do
-      client = Client.new(base_url: "https://mycreatio.com", auth_token: "secret123")
-      assert client.auth_mode == :bearer
-      assert client.auth_token == "secret123"
-      assert client.req.headers["authorization"] == ["Bearer secret123"]
-    end
+    test "configures bearer and forms auth modes and forwards req_options" do
+      bearer = Client.new(base_url: "https://mycreatio.com", auth_token: "secret123")
+      assert bearer.auth_mode == :bearer
+      assert bearer.auth_token == "secret123"
+      assert bearer.req.headers["authorization"] == ["Bearer secret123"]
 
-    test "initializes with cookie and bpmcsrf" do
-      client =
+      forms =
         Client.new(
           base_url: "https://mycreatio.com",
           cookie: ".ASPXAUTH=abc; BPMCSRF=xyz",
           bpmcsrf: "xyz"
         )
 
-      assert client.auth_mode == :forms
-      assert client.cookie == ".ASPXAUTH=abc; BPMCSRF=xyz"
-      assert client.bpmcsrf == "xyz"
-      assert client.req.headers["cookie"] == [".ASPXAUTH=abc; BPMCSRF=xyz"]
-      assert client.req.headers["bpmcsrf"] == ["xyz"]
-    end
+      assert forms.auth_mode == :forms
+      assert forms.cookie == ".ASPXAUTH=abc; BPMCSRF=xyz"
+      assert forms.bpmcsrf == "xyz"
+      assert forms.req.headers["cookie"] == [".ASPXAUTH=abc; BPMCSRF=xyz"]
+      assert forms.req.headers["bpmcsrf"] == ["xyz"]
 
-    test "forwards custom req_options" do
-      client = Client.new(base_url: "https://mycreatio.com", req_options: [retry: false])
-      assert client.req.options.retry == false
-    end
-
-    test "initializes with map of options" do
-      client = Client.new(%{base_url: "https://mycreatio.com", auth_token: "token123"})
-      assert client.base_url == "https://mycreatio.com"
-      assert client.auth_token == "token123"
-      assert client.req.headers["forceusesession"] == ["true"]
-    end
-
-    test "initializes directly from %Req.Request{}" do
-      req = Req.new(base_url: "https://mycreatio.com")
-      client = Client.new(req)
-      assert client.base_url == "https://mycreatio.com"
-      assert client.req.headers["forceusesession"] == ["true"]
-      assert Client.ensure_client(req) == client
-      assert Client.ensure_client(client) == client
-    end
-
-    test "strips trailing slashes on identity_service_url in new/1 and from_req/2" do
-      client =
-        Client.new(
-          base_url: "https://mycreatio.com/",
-          identity_service_url: "https://id.mycreatio.com/0/"
-        )
-
-      assert client.identity_service_url == "https://id.mycreatio.com/0"
-
-      req = Req.new(base_url: "https://mycreatio.com")
-      from_req_client = Client.from_req(req, identity_service_url: "https://id.mycreatio.com/0/")
-      assert from_req_client.identity_service_url == "https://id.mycreatio.com/0"
+      custom = Client.new(base_url: "https://mycreatio.com", req_options: [retry: false])
+      assert custom.req.options.retry == false
     end
   end
 
-  describe "put_bearer_token/2" do
-    test "updates client and request with authorization header" do
+  describe "header and auth mutators" do
+    test "updates bearer token (rejecting blank tokens), forms auth cookies/BPMCSRF, and custom headers" do
       client = Client.new(base_url: "https://mycreatio.com")
       assert is_nil(client.req.headers["authorization"])
 
-      updated = Client.put_bearer_token(client, "new_token")
-      assert updated.auth_mode == :bearer
-      assert updated.auth_token == "new_token"
-      assert updated.req.headers["authorization"] == ["Bearer new_token"]
-    end
-  end
+      assert_raise ArgumentError, fn ->
+        Client.put_bearer_token(client, "")
+      end
 
-  describe "put_forms_auth/3" do
-    test "updates client and request with cookie and bpmcsrf headers" do
-      client = Client.new(base_url: "https://mycreatio.com")
+      bearer = Client.put_bearer_token(client, "new_token")
+      assert bearer.auth_mode == :bearer
+      assert bearer.auth_token == "new_token"
+      assert bearer.req.headers["authorization"] == ["Bearer new_token"]
 
-      updated = Client.put_forms_auth(client, "foo=bar", "csrf123")
-      assert updated.auth_mode == :forms
-      assert updated.cookie == "foo=bar"
-      assert updated.bpmcsrf == "csrf123"
-      assert updated.req.headers["cookie"] == ["foo=bar"]
-      assert updated.req.headers["bpmcsrf"] == ["csrf123"]
-    end
-  end
+      forms = Client.put_forms_auth(client, "foo=bar", "csrf123")
+      assert forms.auth_mode == :forms
+      assert forms.cookie == "foo=bar"
+      assert forms.bpmcsrf == "csrf123"
+      assert forms.req.headers["cookie"] == ["foo=bar"]
+      assert forms.req.headers["bpmcsrf"] == ["csrf123"]
 
-  describe "put_header/3" do
-    test "sets custom headers on the underlying Req client" do
-      client =
-        Client.new(base_url: "https://mycreatio.com")
-        |> Client.put_header("x-custom-header", "custom-val")
-
-      assert client.req.headers["x-custom-header"] == ["custom-val"]
+      custom = Client.put_header(client, "x-custom-header", "custom-val")
+      assert custom.req.headers["x-custom-header"] == ["custom-val"]
     end
   end
 

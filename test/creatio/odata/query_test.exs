@@ -26,8 +26,8 @@ defmodule Creatio.OData.QueryTest do
       assert params["$count"] == "true"
     end
 
-    test "omits empty select, expand, and order_by" do
-      q =
+    test "normalizes, trims, and deduplicates clauses while omitting empty ones" do
+      q_empty =
         Query.new("Contact")
         |> Query.select([])
         |> Query.select("")
@@ -35,12 +35,21 @@ defmodule Creatio.OData.QueryTest do
         |> Query.expand("")
         |> Query.order_by([])
         |> Query.order_by("")
+        |> Query.filter("")
 
-      params = Query.to_params(q)
+      assert Query.to_params(q_empty) == %{}
+      assert Query.to_query_string(q_empty) == ""
 
-      refute Map.has_key?(params, "$select")
-      refute Map.has_key?(params, "$expand")
-      refute Map.has_key?(params, "$orderby")
+      q_dedup =
+        Query.new("Contact")
+        |> Query.select("Id, Name")
+        |> Query.select(["Name", "Email"])
+        |> Query.expand("Owner, Account")
+        |> Query.expand(["Account", "City"])
+
+      params = Query.to_params(q_dedup)
+      assert params["$select"] == "Id,Name,Email"
+      assert params["$expand"] == "Owner,Account,City"
     end
 
     test "filter conditions and boolean logic" do
@@ -102,47 +111,28 @@ defmodule Creatio.OData.QueryTest do
       assert params["$filter"] =~ "day(UpdatedOn) eq 1"
     end
 
-    test "empty or_filter_in produces 1 eq 0 when filter is nil" do
-      q = Query.new("Contact") |> Query.or_filter_in("Department", [])
-      assert Query.to_params(q)["$filter"] == "1 eq 0"
-    end
+    test "handles GUID/ID helpers, query aliases, filter_not, and empty IN lists" do
+      q_empty_or = Query.new("Contact") |> Query.or_filter_in("Department", [])
+      assert Query.to_params(q_empty_or)["$filter"] == "1 eq 0"
 
-    test "filter_in_ids cleans braced and guid'-prefixed UUIDs" do
-      q =
+      q_ids =
         Query.new("Contact")
         |> Query.filter_in_ids("Id", ["{aaa-111}", "guid'bbb-222'"])
 
-      assert Query.to_params(q)["$filter"] == "(Id eq aaa-111 or Id eq bbb-222)"
-    end
+      assert Query.to_params(q_ids)["$filter"] == "(Id eq aaa-111 or Id eq bbb-222)"
 
-    test "select and expand trim comma-separated values and deduplicate" do
-      q =
-        Query.new("Contact")
-        |> Query.select("Id, Name")
-        |> Query.select(["Name", "Email"])
-        |> Query.expand("Owner, Account")
-        |> Query.expand(["Account", "City"])
-
-      params = Query.to_params(q)
-      assert params["$select"] == "Id,Name,Email"
-      assert params["$expand"] == "Owner,Account,City"
-    end
-
-    test "GUID and identifier helpers" do
-      q =
+      q_guid =
         Query.new("Contact")
         |> Query.filter_guid("Id", "c3b96696-22cf-46d4-8d4e-123456789abc")
         |> Query.or_filter_guid("AccountId", "guid'{e3b96696-22cf-46d4-8d4e-123456789abc}'")
         |> Query.filter_in_ids("CategoryId", ["id-1", "id-2"])
         |> Query.filter_not("Inactive eq true")
 
-      params = Query.to_params(q)
-      assert params["$filter"] =~ "not (Inactive eq true)"
-      assert params["$filter"] =~ "c3b96696-22cf-46d4-8d4e-123456789abc"
-    end
+      guid_params = Query.to_params(q_guid)
+      assert guid_params["$filter"] =~ "not (Inactive eq true)"
+      assert guid_params["$filter"] =~ "c3b96696-22cf-46d4-8d4e-123456789abc"
 
-    test "query aliases and empty in-filters" do
-      q =
+      q_aliases =
         Query.new("Contact")
         |> Query.where("Active eq true")
         |> Query.or_where("VIP eq true")
@@ -151,23 +141,9 @@ defmodule Creatio.OData.QueryTest do
         |> Query.or_filter_in("EmptyOrList", [])
         |> Query.filter_in_ids("EmptyIds", [])
 
-      params = Query.to_params(q)
-      assert params["$filter"] =~ "Active eq true"
-      assert params["$filter"] =~ "Department eq 'Sales'"
-    end
-
-    test "omits empty select, filter, orderby, and expand options from serialized params" do
-      q =
-        Query.new("Contact")
-        |> Query.select([])
-        |> Query.filter("")
-        |> Query.order_by([])
-        |> Query.expand([])
-
-      p = Query.to_params(q)
-
-      assert p == %{}
-      assert Query.to_query_string(q) == ""
+      alias_params = Query.to_params(q_aliases)
+      assert alias_params["$filter"] =~ "Active eq true"
+      assert alias_params["$filter"] =~ "Department eq 'Sales'"
     end
 
     test "supports atoms, keyword order_by, where, filter_in, and query string" do
@@ -382,16 +358,14 @@ defmodule Creatio.OData.QueryTest do
       assert params["$orderby"] == "Name asc,CreatedOn desc"
     end
 
-    test "expand preserves inner commas inside parentheses and splits only top-level clauses" do
+    test "handles nested expand parentheses, quoted OData strings, AND flattening, and OR precedence" do
       nested = "Account($expand=Type($select=Name);$select=Id,Name,Web,PrimaryContact)"
 
       q =
         Query.new("Contact")
         |> Query.expand("#{nested}, Owner($select=Id,Name,Title)")
 
-      params = Query.to_params(q)
-
-      assert params["$expand"] ==
+      assert Query.to_params(q)["$expand"] ==
                "#{nested},Owner($select=Id,Name,Title)"
 
       q_accumulated =
@@ -401,16 +375,14 @@ defmodule Creatio.OData.QueryTest do
 
       assert Query.to_params(q_accumulated)["$expand"] ==
                "Account($select=Id,Name,Web),City($select=Id,Name,Country)"
-    end
 
-    test "expand/2 and filter helpers ignore parens and commas inside single-quoted OData strings" do
-      q =
+      q_quoted_expand =
         Query.new("Contact")
         |> Query.expand(
           "Account($filter=Name eq 'Acme ) ''Quoted'', Inc.';$select=Id,Name), Owner($select=Id,Name)"
         )
 
-      assert Query.to_params(q)["$expand"] ==
+      assert Query.to_params(q_quoted_expand)["$expand"] ==
                "Account($filter=Name eq 'Acme ) ''Quoted'', Inc.';$select=Id,Name),Owner($select=Id,Name)"
 
       q_wrapped =
@@ -420,9 +392,23 @@ defmodule Creatio.OData.QueryTest do
 
       assert Query.to_params(q_wrapped)["$filter"] ==
                "((Name eq 'Acme ) Corp')) or (City eq 'A''s, (B)')"
-    end
 
-    test "wraps quoted-paren OR clauses, escaped quotes, uppercase OR, and whitespace OR safely" do
+      q_and_flat =
+        Query.new("Contact")
+        |> Query.filter_eq("A", 1)
+        |> Query.filter_eq("B", 2)
+        |> Query.filter_eq("C", 3)
+
+      assert Query.to_params(q_and_flat)["$filter"] == "A eq 1 and B eq 2 and C eq 3"
+
+      q_or_then_and =
+        Query.new("Contact")
+        |> Query.filter_eq("A", 1)
+        |> Query.or_filter_eq("B", 2)
+        |> Query.filter_eq("C", 3)
+
+      assert Query.to_params(q_or_then_and)["$filter"] == "((A eq 1) or (B eq 2)) and C eq 3"
+
       q_quoted_paren =
         Query.new("Contact")
         |> Query.filter("(Name eq 'a(') or (Name eq 'b)')")

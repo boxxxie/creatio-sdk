@@ -279,9 +279,64 @@ defmodule Creatio.BatchTest do
       end
     end
 
-    test "issue 10 & issue 3: drops unused :requests field and validates boundary, atomicity_group, and sub-request URLs" do
+    test "supports O(1) large builds, iodata multipart, minimal metadata/return, and multi-byte UTF-8 CRLF parsing" do
+      batch =
+        Enum.reduce(1..2_000, Batch.new(continue_on_error: true, return: :minimal), fn i, acc ->
+          Batch.add_get(acc, "Contact", "id-#{i}")
+        end)
+
+      %{"requests" => requests} = Batch.to_payload(batch)
+      assert length(requests) == 2_000
+      assert hd(requests)["id"] == "req_1"
+      assert List.last(requests)["id"] == "req_2000"
+      assert hd(requests)["headers"]["Accept"] == "application/json; odata.metadata=minimal"
+      assert hd(requests)["headers"]["Prefer"] == "continue-on-error, return=minimal"
+      refute Map.has_key?(hd(requests)["headers"], "Content-Type")
+
+      small_batch =
+        Batch.new(return: :minimal)
+        |> Batch.add_create("Contact", %{"Name" => "José 🚀"})
+
+      {boundary, iodata} = Batch.to_multipart_iodata(small_batch, boundary: "b_io")
+      assert boundary == "b_io"
+      assert is_list(iodata)
+      bin_body = IO.iodata_to_binary(iodata)
+      assert bin_body =~ "--b_io\r\n"
+      assert bin_body =~ "Prefer: return=minimal\r\n"
+      assert bin_body =~ ~s({"Name":"José 🚀"})
+      assert bin_body =~ "--b_io--\r\n"
+
+      get_only = Batch.new() |> Batch.add_get("Contact", "1")
+
+      assert Batch.to_multipart(get_only, boundary: "b_get") ==
+               {"b_get",
+                get_only
+                |> Batch.to_multipart_iodata(boundary: "b_get")
+                |> elem(1)
+                |> IO.iodata_to_binary()}
+
+      raw_utf8 =
+        "--b_utf8\r\n" <>
+          "Content-Type: application/http\r\n" <>
+          "Content-ID: req_1\r\n\r\n" <>
+          "HTTP/1.1 201 Created\r\n" <>
+          "Content-Type: application/json; odata.metadata=minimal\r\n\r\n" <>
+          ~s({"Id":"u1","Name":"José 🚀"}) <>
+          "\r\n--b_utf8--\r\n"
+
+      assert {:ok, [%Response{id: "req_1", status: 201, body: %{"Name" => "José 🚀"}}]} =
+               Batch.parse_multipart_response(raw_utf8, "b_utf8")
+    end
+
+    test "drops unused :requests field and validates IDs, boundary, atomicity_group, and sub-request URLs" do
       batch = Batch.new()
       refute Map.has_key?(batch, :requests)
+
+      for bad_id <- ["1)/../../rest/CustomService/Trigger?x=(", "../etc", "a/b", "1?x=2"] do
+        assert_raise ArgumentError, fn ->
+          Batch.add_delete(batch, "Contact", bad_id)
+        end
+      end
 
       assert_raise ArgumentError, ~r/invalid batch sub-request URL/, fn ->
         Batch.add(batch, "GET", "Contact\r\nX-Injected: yes")
@@ -297,6 +352,13 @@ defmodule Creatio.BatchTest do
 
       assert_raise ArgumentError, ~r/invalid boundary/, fn ->
         Batch.to_multipart_iodata(Batch.add_get(batch, "Contact"), boundary: "b1;\r\nbad")
+      end
+
+      assert_raise ArgumentError, fn ->
+        Batch.execute(Creatio.Client.new(base_url: "https://test.creatio.com"), "raw",
+          format: :multipart,
+          boundary: "bad;\r\nX-Injected: yes"
+        )
       end
     end
   end

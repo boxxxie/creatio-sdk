@@ -3,151 +3,63 @@ defmodule Creatio.ErrorTest do
 
   alias Creatio.Error
 
-  test "from_response with OData standard error payload" do
-    resp = %Req.Response{
-      status: 404,
-      body: %{
-        "error" => %{
-          "code" => "EntityNotFound",
-          "message" => "Item not found",
-          "innererror" => %{"trace" => "abc"}
-        }
-      }
-    }
+  test "from_response/1 extracts status, code, message, and details across OData, OAuth, Forms, DataService, and ServiceStack payloads" do
+    structured_cases = [
+      {404,
+       %{
+         "error" => %{
+           "code" => "EntityNotFound",
+           "message" => "Item not found",
+           "innererror" => %{"trace" => "abc"}
+         }
+       }, "EntityNotFound", "Item not found", %{"trace" => "abc"}},
+      {400, %{"error" => "unauthorized_client", "error_description" => "Client not authorized"},
+       "unauthorized_client", "Client not authorized", :any},
+      {401, %{"error" => "invalid_token"}, "invalid_token", "invalid_token", :any},
+      {200, %{"Code" => -1, "Message" => "User locked", "Exception" => "LockedOutException"}, -1,
+       "User locked", "LockedOutException"},
+      {400,
+       %{
+         "error" => %{
+           "code" => "1001",
+           "message" => %{
+             "lang" => "en-US",
+             "value" => "An error occurred while processing this request."
+           }
+         }
+       }, "1001", "An error occurred while processing this request.", :any},
+      {200,
+       %{
+         "success" => false,
+         "errorInfo" => %{
+           "errorCode" => "1002",
+           "message" => "Database exception in SelectQuery"
+         }
+       }, "1002", "Database exception in SelectQuery", :is_map},
+      {400,
+       %{
+         "responseStatus" => %{
+           "ErrorCode" => "ValidationError",
+           "Message" => "Field is required"
+         }
+       }, "ValidationError", "Field is required", :any}
+    ]
 
-    err = Error.from_response(resp)
-    assert err.status == 404
-    assert err.code == "EntityNotFound"
-    assert err.message == "Item not found"
-    assert err.details == %{"trace" => "abc"}
-  end
+    for {status, body, expected_code, expected_message, details_expectation} <- structured_cases do
+      err = Error.from_response(%Req.Response{status: status, body: body})
+      assert err.status == status
+      assert err.code == expected_code
+      assert err.message == expected_message
+      assert is_binary(Exception.message(err))
 
-  test "from_response with OAuth error payload" do
-    resp = %Req.Response{
-      status: 400,
-      body: %{
-        "error" => "unauthorized_client",
-        "error_description" => "Client not authorized"
-      }
-    }
+      case details_expectation do
+        :any -> :ok
+        :is_map -> assert is_map(err.details)
+        exact -> assert err.details == exact
+      end
+    end
 
-    err = Error.from_response(resp)
-    assert err.status == 400
-    assert err.code == "unauthorized_client"
-    assert err.message == "Client not authorized"
-  end
-
-  test "from_response with Forms error payload" do
-    resp = %Req.Response{
-      status: 200,
-      body: %{
-        "Code" => -1,
-        "Message" => "User locked",
-        "Exception" => "LockedOutException"
-      }
-    }
-
-    err = Error.from_response(resp)
-    assert err.status == 200
-    assert err.code == -1
-    assert err.message == "User locked"
-    assert err.details == "LockedOutException"
-  end
-
-  test "from_response with plain text body" do
-    resp = %Req.Response{
-      status: 502,
-      body: "Bad Gateway"
-    }
-
-    err = Error.from_response(resp)
-    assert err.status == 502
-    assert err.message == "Bad Gateway"
-    assert Exception.message(err) == "Bad Gateway"
-  end
-
-  test "from_response with nested OData 3 / WCF error message object" do
-    resp = %Req.Response{
-      status: 400,
-      body: %{
-        "error" => %{
-          "code" => "1001",
-          "message" => %{
-            "lang" => "en-US",
-            "value" => "An error occurred while processing this request."
-          }
-        }
-      }
-    }
-
-    err = Error.from_response(resp)
-    assert err.status == 400
-    assert err.code == "1001"
-    assert err.message == "An error occurred while processing this request."
-    assert is_binary(Exception.message(err))
-  end
-
-  test "from_response with single OAuth error without description" do
-    resp = %Req.Response{
-      status: 401,
-      body: %{"error" => "invalid_token"}
-    }
-
-    err = Error.from_response(resp)
-    assert err.status == 401
-    assert err.code == "invalid_token"
-    assert err.message == "invalid_token"
-  end
-
-  test "from_response with empty string body defaults to HTTP status" do
-    resp = %Req.Response{
-      status: 404,
-      body: ""
-    }
-
-    err = Error.from_response(resp)
-    assert err.status == 404
-    assert err.message == "HTTP 404"
-  end
-
-  test "from_response with DataService errorInfo payload" do
-    resp = %Req.Response{
-      status: 200,
-      body: %{
-        "success" => false,
-        "errorInfo" => %{
-          "errorCode" => "1002",
-          "message" => "Database exception in SelectQuery"
-        }
-      }
-    }
-
-    err = Error.from_response(resp)
-    assert err.status == 200
-    assert err.code == "1002"
-    assert err.message == "Database exception in SelectQuery"
-    assert is_map(err.details)
-  end
-
-  test "from_response with ServiceStack responseStatus payload" do
-    resp = %Req.Response{
-      status: 400,
-      body: %{
-        "responseStatus" => %{
-          "ErrorCode" => "ValidationError",
-          "Message" => "Field is required"
-        }
-      }
-    }
-
-    err = Error.from_response(resp)
-    assert err.status == 400
-    assert err.code == "ValidationError"
-    assert err.message == "Field is required"
-  end
-
-  test "from_response with legacy and alternative error payloads" do
-    cases = [
+    legacy_cases = [
       {%{"errorInfo" => %{"message" => "A", "errorCode" => "123"}}, "123", "A"},
       {%{"ErrorInfo" => %{"message" => "A", "errorCode" => "123"}}, "123", "A"},
       {%{"responseStatus" => %{"Message" => "A", "errorCode" => "123"}}, "123", "A"},
@@ -177,17 +89,37 @@ defmodule Creatio.ErrorTest do
        "NullReferenceException"}
     ]
 
-    for {body, expected_code, expected_message} <- cases do
+    for {body, expected_code, expected_message} <- legacy_cases do
       err = Error.from_response(%Req.Response{status: 400, body: body})
       assert %Error{status: 400} = err
       assert err.code == expected_code
       assert err.message == expected_message
     end
+  end
 
-    assert Exception.message(Error.new(status: 500, code: "Err")) ==
-             "Creatio error Err (HTTP 500)"
+  test "from_response/1 handles plain text, empty strings, JSON-encoded strings, non-response inputs, and Exception.message/1 fallbacks" do
+    plain = Error.from_response(%Req.Response{status: 502, body: "Bad Gateway"})
+    assert plain.status == 502
+    assert plain.message == "Bad Gateway"
+    assert Exception.message(plain) == "Bad Gateway"
 
-    assert Exception.message(Error.new([])) == "Creatio error"
+    empty = Error.from_response(%Req.Response{status: 404, body: ""})
+    assert empty.status == 404
+    assert empty.message == "HTTP 404"
+
+    assert %Error{status: 400, code: nil, message: "just a string"} =
+             Error.from_response(%Req.Response{status: 400, body: "just a string"})
+
+    numeric_msg =
+      Error.from_response(%Req.Response{status: 400, body: %{"error" => %{"message" => 123}}})
+
+    assert numeric_msg.status == 400
+    assert numeric_msg.message == "123"
+
+    json_body = Jason.encode!(%{"error" => %{"message" => "Encoded JSON error", "code" => "E1"}})
+
+    assert %Error{status: 400, code: "E1", message: "Encoded JSON error"} =
+             Error.from_response(%Req.Response{status: 400, body: json_body})
 
     assert %Error{
              status: nil,
@@ -196,16 +128,9 @@ defmodule Creatio.ErrorTest do
              response: "not a response"
            } = Error.from_response("not a response")
 
-    assert %Error{status: 400, code: nil, message: "just a string"} =
-             Error.from_response(%Req.Response{status: 400, body: "just a string"})
+    assert Exception.message(Error.new(status: 500, code: "Err")) ==
+             "Creatio error Err (HTTP 500)"
 
-    err = Error.from_response(%Req.Response{status: 400, body: %{"error" => %{"message" => 123}}})
-    assert err.status == 400
-    assert err.message == "123"
-
-    json_body = Jason.encode!(%{"error" => %{"message" => "Encoded JSON error", "code" => "E1"}})
-
-    assert %Error{status: 400, code: "E1", message: "Encoded JSON error"} =
-             Error.from_response(%Req.Response{status: 400, body: json_body})
+    assert Exception.message(Error.new([])) == "Creatio error"
   end
 end

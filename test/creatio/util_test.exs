@@ -1,7 +1,8 @@
 defmodule Creatio.UtilTest do
   use ExUnit.Case, async: true
 
-  alias Creatio.Util
+  alias Creatio.{Client, DataService, OData, OData3, Util}
+  alias Creatio.OData.Query
 
   describe "prepare_field_value_request/4 transport safety" do
     test "defaults Accept: */*, strips :method and :url, and preserves duplicate query params" do
@@ -35,7 +36,7 @@ defmodule Creatio.UtilTest do
   end
 
   describe "response_header/2" do
-    test "extracts header values case-insensitively from maps and tuple lists" do
+    test "extracts header values case-insensitively and ignores malformed or empty entries" do
       map_headers = %{
         "OData-EntityId" => ["https://crm.test/0/odata/Contact(123)"],
         "content-type" => "application/json; charset=utf-8"
@@ -56,11 +57,23 @@ defmodule Creatio.UtilTest do
                "https://crm.test/0/odata/Account(456)"
 
       assert Util.response_header(list_headers, "x-missing") == nil
+
+      weird_headers = [
+        :not_a_tuple,
+        {"X-Trace", ["", "   ", "trace-1"]},
+        {"X-Empty-List", []},
+        {"X-Non-Bin", [123]}
+      ]
+
+      assert Util.response_header(weird_headers, "x-trace") == "trace-1"
+      assert Util.response_header(weird_headers, "x-empty-list") == nil
+      assert Util.response_header(weird_headers, "x-non-bin") == nil
+      assert Util.response_header(:invalid_headers, "x-trace") == nil
     end
   end
 
-  describe "normalize_json_response/1" do
-    test "decodes JSON objects and arrays delivered with text/html or UTF-8 BOM" do
+  describe "normalize_json_response/1 and html_or_xml_response?/1" do
+    test "normalize_json_response/1 decodes JSON delivered with text/html or BOM and leaves HTML/malformed/non-JSON intact" do
       obj_resp = %Req.Response{
         status: 201,
         headers: %{"content-type" => ["text/html; charset=utf-8"]},
@@ -77,59 +90,56 @@ defmodule Creatio.UtilTest do
       }
 
       assert %Req.Response{body: [%{"Id" => "1"}]} = Util.normalize_json_response(arr_resp)
+
+      unchanged_cases = [
+        %Req.Response{status: 200, body: "<html><body>WAF</body></html>"},
+        %Req.Response{status: 200, body: "plain ok response"},
+        %Req.Response{status: 200, body: %{"ok" => true}},
+        %Req.Response{status: 200, body: "{not json"},
+        %Req.Response{status: 200, body: nil, headers: %{"content-type" => ["text/html"]}}
+      ]
+
+      for resp <- unchanged_cases do
+        assert Util.normalize_json_response(resp) == resp
+      end
     end
 
-    test "preserves HTML, non-JSON plain text, and already decoded bodies" do
-      html_resp = %Req.Response{status: 200, body: "<html><body>WAF</body></html>"}
-      assert Util.normalize_json_response(html_resp) == html_resp
+    test "html_or_xml_response?/1 detects HTML/XML interstitials and WAF pages while ignoring JSON and plain text" do
+      true_cases = [
+        %Req.Response{
+          status: 200,
+          headers: %{"content-type" => ["text/html"]},
+          body: "<iframe id=\"main-iframe\" src=\"/_Incapsula_Resource?SWUDNSAI=31\"></iframe>"
+        },
+        %Req.Response{
+          status: 200,
+          headers: %{"content-type" => ["text/plain"]},
+          body: "\uFEFF  <!DOCTYPE html><html><body>Login</body></html>"
+        },
+        %Req.Response{
+          status: 200,
+          headers: %{"content-type" => ["application/xml; charset=utf-8"]},
+          body: "plain non-json text"
+        }
+      ]
 
-      plain_resp = %Req.Response{status: 200, body: "plain ok response"}
-      assert Util.normalize_json_response(plain_resp) == plain_resp
+      false_cases = [
+        %Req.Response{
+          status: 200,
+          headers: %{"content-type" => ["text/html"]},
+          body: %{"Id" => "1"}
+        },
+        %Req.Response{
+          status: 200,
+          headers: %{"content-type" => ["text/plain"]},
+          body: "plain ok response"
+        },
+        %Req.Response{status: 200, body: nil, headers: %{"content-type" => ["text/html"]}},
+        %Req.Response{status: 200, body: "   ", headers: %{"content-type" => ["text/html"]}}
+      ]
 
-      map_resp = %Req.Response{status: 200, body: %{"ok" => true}}
-      assert Util.normalize_json_response(map_resp) == map_resp
-    end
-  end
-
-  describe "html_or_xml_response?/1" do
-    test "detects HTML/XML interstitials and Imperva Incapsula WAF pages" do
-      waf_resp = %Req.Response{
-        status: 200,
-        headers: %{"content-type" => ["text/html"]},
-        body: "<iframe id=\"main-iframe\" src=\"/_Incapsula_Resource?SWUDNSAI=31\"></iframe>"
-      }
-
-      assert Util.html_or_xml_response?(waf_resp)
-
-      doctype_resp = %Req.Response{
-        status: 200,
-        headers: %{"content-type" => ["text/plain"]},
-        body: "\uFEFF  <!DOCTYPE html><html><body>Login</body></html>"
-      }
-
-      assert Util.html_or_xml_response?(doctype_resp)
-
-      xml_resp = %Req.Response{
-        status: 200,
-        headers: %{"content-type" => ["application/xml; charset=utf-8"]},
-        body: "plain non-json text"
-      }
-
-      assert Util.html_or_xml_response?(xml_resp)
-    end
-
-    test "returns false for JSON structures and non-HTML plain text" do
-      assert Util.html_or_xml_response?(%Req.Response{
-               status: 200,
-               headers: %{"content-type" => ["text/html"]},
-               body: %{"Id" => "1"}
-             }) == false
-
-      assert Util.html_or_xml_response?(%Req.Response{
-               status: 200,
-               headers: %{"content-type" => ["text/plain"]},
-               body: "plain ok response"
-             }) == false
+      for resp <- true_cases, do: assert(Util.html_or_xml_response?(resp))
+      for resp <- false_cases, do: assert(Util.html_or_xml_response?(resp) == false)
     end
   end
 
@@ -311,49 +321,29 @@ defmodule Creatio.UtilTest do
       assert Util.get_opt(%{"top" => 30}, :missing, :fallback) == :fallback
     end
 
-    test "clean_guid/1 strips guid'...', braces, quotes, and whitespace" do
+    test "clean_guid/1 strips GUID wrappers and rejects traversal or injection characters" do
       id = "a1b2c3d4-0000-0000-0000-000000000001"
       assert Util.clean_guid(" guid'#{id}' ") == id
       assert Util.clean_guid("GUID'{#{id}}'") == id
       assert Util.clean_guid("{'#{id}'}") == id
       assert Util.clean_guid("'#{id}'") == id
       assert Util.clean_guid(id) == id
-    end
 
-    test "response_header/2 handles malformed list entries, empty values, non-binary items, and non-collections" do
-      weird_headers = [
-        :not_a_tuple,
-        {"X-Trace", ["", "   ", "trace-1"]},
-        {"X-Empty-List", []},
-        {"X-Non-Bin", [123]}
-      ]
+      assert Util.clean_guid("guid'{12345678-1234-1234-1234-123456789abc}'") ==
+               "12345678-1234-1234-1234-123456789abc"
 
-      assert Util.response_header(weird_headers, "x-trace") == "trace-1"
-      assert Util.response_header(weird_headers, "x-empty-list") == nil
-      assert Util.response_header(weird_headers, "x-non-bin") == nil
-      assert Util.response_header(:invalid_headers, "x-trace") == nil
-    end
-
-    test "normalize_json_response/1 and html_or_xml_response?/1 handle malformed JSON and empty/nil bodies" do
-      bad_json = %Req.Response{status: 200, body: "{not json"}
-      assert Util.normalize_json_response(bad_json) == bad_json
-
-      nil_resp = %Req.Response{
-        status: 200,
-        body: nil,
-        headers: %{"content-type" => ["text/html"]}
-      }
-
-      assert Util.normalize_json_response(nil_resp) == nil_resp
-      assert Util.html_or_xml_response?(nil_resp) == false
-
-      empty_html = %Req.Response{
-        status: 200,
-        body: "   ",
-        headers: %{"content-type" => ["text/html"]}
-      }
-
-      assert Util.html_or_xml_response?(empty_html) == false
+      for bad <- [
+            "",
+            "../etc",
+            "1)/../../rest/Trigger?x=(",
+            "1?foo=bar",
+            "1#frag",
+            "id with space"
+          ] do
+        assert_raise ArgumentError, fn ->
+          Util.clean_guid(bad)
+        end
+      end
     end
 
     test "normalize_odata_params/3 handles maps, count: false, and ignores unsupported orderby" do
@@ -495,22 +485,100 @@ defmodule Creatio.UtilTest do
 
       assert map_records == [{:ok, %{"Id" => "1"}}, {:ok, %{"Id" => "2"}}]
     end
+  end
 
-    test "clean_guid/1 strips GUID wrappers and rejects traversal or injection characters" do
-      assert Util.clean_guid("guid'{12345678-1234-1234-1234-123456789abc}'") ==
-               "12345678-1234-1234-1234-123456789abc"
+  describe "eager target, ID, and path-traversal validation guards" do
+    test "rejects empty/invalid targets and path-traversal IDs or segments before issuing HTTP requests" do
+      id = "00000000-0000-0000-0000-000000000003"
 
-      for bad <- [
-            "",
-            "../etc",
-            "1)/../../rest/Trigger?x=(",
-            "1?foo=bar",
-            "1#frag",
-            "id with space"
-          ] do
-        assert_raise ArgumentError, fn ->
-          Util.clean_guid(bad)
+      client =
+        Client.new(
+          base_url: "https://test.creatio.com",
+          req_options: [
+            plug: fn conn ->
+              flunk("should not issue HTTP request for invalid input: #{conn.request_path}")
+            end
+          ]
+        )
+
+      for empty_target <- ["", Query.new("")] do
+        assert_raise ArgumentError, ~r/empty/, fn -> OData.list(client, empty_target) end
+        assert_raise ArgumentError, ~r/empty/, fn -> OData.stream(client, empty_target) end
+        assert_raise ArgumentError, ~r/empty/, fn -> OData.stream!(client, empty_target) end
+
+        assert_raise ArgumentError, ~r/empty/, fn ->
+          OData.stream(client, empty_target, max_records: 0)
         end
+
+        assert_raise ArgumentError, ~r/empty/, fn -> OData3.list(client, empty_target) end
+        assert_raise ArgumentError, ~r/empty/, fn -> OData3.stream(client, empty_target) end
+        assert_raise ArgumentError, ~r/empty/, fn -> OData3.stream!(client, empty_target) end
+
+        assert_raise ArgumentError, ~r/empty/, fn ->
+          OData3.stream(client, empty_target, max_records: 0)
+        end
+      end
+
+      for bad_target <- [nil, "   ", Query.new(nil), Query.new("   "), :Contact] do
+        assert_raise ArgumentError, fn -> OData.list(client, bad_target) end
+        assert_raise ArgumentError, fn -> OData.count(client, bad_target) end
+        assert_raise ArgumentError, fn -> OData.stream(client, bad_target) end
+        assert_raise ArgumentError, fn -> OData3.list(client, bad_target) end
+        assert_raise ArgumentError, fn -> OData3.count(client, bad_target) end
+        assert_raise ArgumentError, fn -> OData3.stream(client, bad_target) end
+      end
+
+      for bad_name <- [nil, "", "   ", :Contact] do
+        assert_raise ArgumentError, fn -> OData.get(client, bad_name, id) end
+        assert_raise ArgumentError, fn -> OData.create(client, bad_name, %{"Name" => "X"}) end
+        assert_raise ArgumentError, fn -> OData.update(client, bad_name, id, %{"Name" => "X"}) end
+        assert_raise ArgumentError, fn -> OData.delete(client, bad_name, id) end
+        assert_raise ArgumentError, fn -> OData.get_field(client, bad_name, id, "Name") end
+        assert_raise ArgumentError, fn -> OData.get_field_value(client, bad_name, id, "Photo") end
+
+        assert_raise ArgumentError, fn ->
+          OData.update_field(client, bad_name, id, "Name", "X")
+        end
+
+        assert_raise ArgumentError, fn -> OData.delete_field(client, bad_name, id, "Name") end
+
+        assert_raise ArgumentError, fn ->
+          OData.get_navigation(client, bad_name, id, "Account")
+        end
+
+        assert_raise ArgumentError, fn -> OData3.get(client, bad_name, id) end
+        assert_raise ArgumentError, fn -> OData3.create(client, bad_name, %{"Name" => "X"}) end
+
+        assert_raise ArgumentError, fn ->
+          OData3.update(client, bad_name, id, %{"Name" => "X"})
+        end
+
+        assert_raise ArgumentError, fn -> OData3.delete(client, bad_name, id) end
+        assert_raise ArgumentError, fn -> OData3.get_field(client, bad_name, id, "Name") end
+
+        assert_raise ArgumentError, fn ->
+          OData3.get_field_value(client, bad_name, id, "Photo")
+        end
+      end
+
+      for bad_id <- ["1)/../../rest/CustomService/Trigger?x=(", "../etc", "a/b", "1?x=2"] do
+        assert_raise ArgumentError, fn -> OData.get(client, "Contact", bad_id) end
+        assert_raise ArgumentError, fn -> OData.delete(client, "Contact", bad_id) end
+        assert_raise ArgumentError, fn -> OData3.get(client, "Contact", bad_id) end
+      end
+
+      assert_raise ArgumentError, fn -> OData.get(client, "Contact/../rest", "1") end
+
+      assert_raise ArgumentError, fn ->
+        OData.get_field(client, "Contact", "1", "Name/../$value")
+      end
+
+      assert_raise ArgumentError, fn ->
+        OData.get_navigation(client, "Contact", "1", "Account/../Secret")
+      end
+
+      assert_raise ArgumentError, fn ->
+        DataService.custom_service(client, "Svc/..", "Op", %{})
       end
     end
   end
